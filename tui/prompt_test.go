@@ -185,8 +185,14 @@ func TestHistory(t *testing.T) {
 	}
 	hs.command("svc")
 	hs.command("svc")
-	if got := strings.Join(hs.root().hist.entries, ","); got != "pods,deploy,svc,svc" && got != "pods,deploy,svc" {
-		t.Errorf("the history is %s", got)
+	if got := strings.Join(hs.root().hist.entries, ","); got != "pods,deploy,svc" {
+		t.Errorf("after svc twice the history is %s", got)
+	}
+	hs.command("po")
+	hs.command("po")
+	hs.command("svc")
+	if got := strings.Join(hs.root().hist.entries, ","); got != "pods,deploy,svc,po,svc" {
+		t.Errorf("after po twice and svc the history is %s", got)
 	}
 	// Beyond the ends nothing happens.
 	hs = newHarness(t, newSession(), 100, 30)
@@ -256,6 +262,18 @@ func TestTheStartCanFailAndTheCommandsWork(t *testing.T) {
 	hs.command("svc")
 	if l := hs.line("│the API is down"); l == "" {
 		t.Errorf("the body lost the error of the start:\n%s", hs.frame())
+	}
+	// The help and the names leave on esc even as the only view, back to
+	// the error.
+	for _, keys := range [][]string{{"?", "esc"}, {"?", "q"}, {"?", "?"}, {"ctrl+a", "esc"}} {
+		hs.press(keys[0])
+		if hs.title() == "" {
+			t.Errorf("%s opened nothing", keys[0])
+		}
+		hs.press(keys[1])
+		if len(hs.root().stack) != 0 || hs.line("│the API is down") == "" {
+			t.Errorf("%s then %s leaves %d views:\n%s", keys[0], keys[1], len(hs.root().stack), hs.frame())
+		}
 	}
 	delete(sess.Errs, "Resolve")
 	hs.command("deploy")

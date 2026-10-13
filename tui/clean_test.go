@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"charm.land/lipgloss/v2"
@@ -124,5 +125,56 @@ func TestFit(t *testing.T) {
 	// The styles stay.
 	if got := fit(red.Render("abcdefgh"), 5); !strings.Contains(got, "\x1b[") {
 		t.Errorf("fit dropped the style: %q", got)
+	}
+}
+
+// clean and fit take time in proportion to their input, whatever it
+// holds: cluster text can be a megabyte on one line. A megabyte takes
+// about a tenth of a second; were clean quadratic in anything, as it once
+// was in tabs, it would take hours.
+func TestCleanAndFitAreLinear(t *testing.T) {
+	const size = 1 << 20
+	for _, tt := range []struct {
+		name string
+		in   string
+	}{
+		{"tabs", strings.Repeat("a\t", size/2)},
+		{"wide characters and tabs", strings.Repeat("名\t", size/4)},
+		{"no tabs", strings.Repeat("abcdefgh", size/8)},
+		{"escape sequences", strings.Repeat("\x1b[31m", size/5)},
+		{"an OSC string without its end", "\x1b]0;" + strings.Repeat("x", size)},
+		{"OSC strings", strings.Repeat("\x1b]0;x\x07", size/6)},
+		{"invalid UTF-8", strings.Repeat("\xff", size)},
+		{"control characters", strings.Repeat("\x00\r", size/2)},
+		{"line feeds and tabs", strings.Repeat("ab\tc\n", size/5)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			start := time.Now()
+			out := clean(tt.in)
+			fit(out, 200)
+			fit(tt.in, 1<<19)
+			if d := time.Since(start); d > slowdown*time.Second {
+				t.Errorf("cleaning and fitting a megabyte of %s took %v", tt.name, d)
+			}
+		})
+	}
+	// The tab stops are where they were: a tab goes to the next multiple
+	// of 8 of its line.
+	if got := clean(strings.Repeat("a\t", 1000)); got != strings.Repeat("a       ", 1000) {
+		t.Errorf("tabs after one cell are not stops of 8: %q", got[:40])
+	}
+	if got := clean(strings.Repeat("名\t", 1000)); got != strings.Repeat("名      ", 1000) {
+		t.Errorf("tabs after a wide character are not stops of 8: %q", got[:40])
+	}
+	for _, tt := range []struct{ in, want string }{
+		{"abcdefgh\tx", "abcdefgh        x"},
+		{"abc\x1b[31m\tx", "abc     x"},
+		{"\tx\n\ty", "        x\n        y"},
+		{"ab\x00\tx", "ab\u2400     x"},
+		{"e\u0301\tx", "e\u0301       x"},
+	} {
+		if got := clean(tt.in); got != tt.want {
+			t.Errorf("clean(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

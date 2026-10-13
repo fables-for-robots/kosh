@@ -560,6 +560,47 @@ func TestWatchErrorIsShown(t *testing.T) {
 	}
 }
 
+// Every view draws exactly the lines it is given, none wider than its
+// width, whatever it shows: rows, none, an error, the help, the names.
+func TestViewsAreExactlyTheirSize(t *testing.T) {
+	sess := newSession()
+	sess.SetTable(query("pods", "default"), podsNamed("web-1", "web-2"))
+	sess.SetTable(query("pods", "empty"), podTable())
+	sess.SetTable(query("pods", "broken"), kube.Table{Err: errors.New("forbidden\nand more")})
+	hs := newHarness(t, sess, 100, 30)
+	views := map[string]view{
+		"rows":  newTableView(hs.root().e, query("pods", "default"), ""),
+		"none":  newTableView(hs.root().e, query("pods", "empty"), ""),
+		"error": newTableView(hs.root().e, query("pods", "broken"), ""),
+		"names": newNamesView(hs.root().e),
+	}
+	unread := newTableView(hs.root().e, query("pods", "never"), "")
+	for _, v := range views {
+		hs.send(pushViewMsg{v})
+	}
+	views["unread"] = unread
+	hs.press("?")
+	views["help"] = hs.root().top()
+	sess.Errs["Watch"] = errors.New("watch refused")
+	broken := newTableView(hs.root().e, query("pods", "x"), "")
+	hs.send(pushViewMsg{broken})
+	views["watch error"] = broken
+	for name, v := range views {
+		for _, size := range [][2]int{{1, 1}, {10, 1}, {10, 2}, {80, 1}, {80, 3}, {98, 20}} {
+			out := v.View(size[0], size[1])
+			lines := strings.Split(out, "\n")
+			if len(lines) != size[1] {
+				t.Errorf("%s at %dx%d draws %d lines", name, size[0], size[1], len(lines))
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w > size[0] {
+					t.Errorf("%s at %dx%d: line %d is %d wide", name, size[0], size[1], i, w)
+				}
+			}
+		}
+	}
+}
+
 func TestCoveredViewsStillGetTheirMessages(t *testing.T) {
 	sess := newSession()
 	q := query("pods", "default")
@@ -677,9 +718,14 @@ func TestEscClearsTheFilterThenPops(t *testing.T) {
 func TestCellsFromTheClusterAreCleaned(t *testing.T) {
 	sess := newSession()
 	evil := "\x1b]0;x\x07\x1b[2J"
-	sess.SetTable(query("pods", "default"), podTable(pod{name: "web-1", status: evil + "Running"}))
+	pods := podTable(pod{name: "web-1", status: evil + "Running"})
+	pods.Columns[len(pods.Columns)-1].Name = "AGE" + evil + "\nX"
+	sess.SetTable(query("pods", "default"), pods)
 	sess.SetTable(query("deployments", "default"), kube.Table{Err: errors.New("denied " + evil)})
 	hs := newHarness(t, sess, 100, 30)
+	if h := hs.tableHeader(); !strings.HasSuffix(h, "AGE X") {
+		t.Errorf("the header is %q, want the column name cleaned and on one line", h)
+	}
 	for _, f := range []string{hs.drawn(), func() string { hs.command("deploy"); return hs.drawn() }()} {
 		for _, bad := range []string{"\x1b]0;", "\x1b[2J", "\x07"} {
 			if strings.Contains(f, bad) {

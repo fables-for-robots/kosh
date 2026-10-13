@@ -194,8 +194,17 @@ func (r *root) render() string {
 	}
 	top := r.top()
 	if top != nil && top.Fullscreen() {
-		lines := block(top.View(r.w, r.h), r.w, r.h)
-		r.overlayDialog(lines, 0, r.h)
+		// The view has the whole window, less the last line while the
+		// prompt is open.
+		h := r.h
+		if r.prompt.open() {
+			h--
+		}
+		lines := block(top.View(r.w, h), r.w, h)
+		r.overlayDialog(lines, 0, h)
+		if r.prompt.open() {
+			lines = append(lines, r.prompt.line(r.w))
+		}
 		return strings.Join(lines, "\n")
 	}
 	var lines []string
@@ -220,12 +229,12 @@ func (r *root) body(h int) []string {
 	var title string
 	var inner []string
 	if top := r.top(); top != nil {
-		title = clean(top.Title())
+		title = cleanLine(top.Title())
 		inner = block(top.View(iw, ih), iw, ih)
 	} else {
 		var text string
 		if r.startErr != nil {
-			text = styleError.Render(fit(clean(r.startErr.Error()), iw))
+			text = styleError.Render(fit(cleanLine(r.startErr.Error()), iw))
 		}
 		inner = block(text, iw, ih)
 	}
@@ -327,6 +336,14 @@ type waiter struct{ fn func() tea.Msg }
 func (w waiter) run() tea.Msg { return w.fn() }
 
 // waitCmd returns a command that waits, as fn does.
+//
+// The rule: every command that waits for something outside the program,
+// or that re-arms itself, is made with waitCmd. That includes a timer
+// and a refresh: do not return tea.Tick or tea.Every, but a waitCmd that
+// sleeps or selects on a timer. The tests' harness leaves a waitCmd
+// running and takes its message when a test awaits it; any other
+// command it runs to its end at once, and a test whose commands do not
+// come to an end fails. A waitCmd is not put into a tea.Sequence.
 func waitCmd(fn func() tea.Msg) tea.Cmd { return waiter{fn}.run }
 
 // lastID numbers the views, which put their numbers into their

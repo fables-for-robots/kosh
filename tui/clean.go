@@ -29,7 +29,10 @@ func clean(s string) string {
 	}
 	var b strings.Builder
 	b.Grow(len(s))
-	lineStart := 0 // where the line that is being written starts in b
+	// col is the width of the line in b up to measured; what was written
+	// after measured is measured at the next tab, so that every byte is
+	// measured once.
+	col, measured := 0, 0
 	i := 0
 	for i < len(s) {
 		r, size := utf8.DecodeRuneInString(s[i:])
@@ -45,11 +48,14 @@ func clean(s string) string {
 			i = skipString(s, i+size)
 		case r == '\n':
 			b.WriteByte('\n')
-			lineStart = b.Len()
+			col, measured = 0, b.Len()
 			i += size
 		case r == '\t':
-			col := ansi.StringWidth(b.String()[lineStart:])
-			b.WriteString(strings.Repeat(" ", tabWidth-col%tabWidth))
+			col += ansi.StringWidth(b.String()[measured:])
+			n := tabWidth - col%tabWidth
+			b.WriteString(strings.Repeat(" ", n))
+			col += n
+			measured = b.Len()
 			i += size
 		case r < 0x20:
 			b.WriteRune(0x2400 + r)

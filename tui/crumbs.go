@@ -7,7 +7,7 @@ import "strings"
 func (r *root) crumbs() string {
 	parts := make([]string, len(r.stack))
 	for i, v := range r.stack {
-		c := "<" + strings.ReplaceAll(clean(v.Crumb()), "\n", " ") + ">"
+		c := "<" + cleanLine(v.Crumb()) + ">"
 		if i == len(r.stack)-1 {
 			parts[i] = styleTitle.Render(c)
 		} else {

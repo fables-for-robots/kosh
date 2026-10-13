@@ -8,6 +8,16 @@ package tui
 // its own, and its message is taken only when the test awaits it, with a
 // deadline. Everything else the harness does is in the order the test
 // does it, so that a frame is the same at every run.
+//
+// A command that waits, or that re-arms itself (tea.Tick, tea.Every),
+// must be made with waitCmd. One that is not would keep a settle going
+// for ever; settle fails the test instead, after maxSettle commands or
+// settleFor, whichever comes first, naming that rule.
+//
+// A tea.Sequence runs in order, as Bubble Tea runs it: each command runs
+// and its message is delivered before the next one starts. A waitCmd in
+// a Sequence fails the test at once: the harness does not wait in the
+// middle of a sequence.
 
 import (
 	"flag"
@@ -33,9 +43,15 @@ import (
 
 var update = flag.Bool("update", false, "rewrite the golden frames in testdata")
 
-// deadline is how long the harness waits for a command, or for a message
-// a test awaits.
+// deadline is how long the harness waits for a command, for a message a
+// test awaits, and for a settle to end.
 const deadline = 10 * time.Second
+
+// maxSettle is how many commands one settle runs at most.
+const maxSettle = 10000
+
+// ruleOfWaiting is what a test that keeps the harness busy is told.
+const ruleOfWaiting = "a command that waits or re-arms itself (tea.Tick, tea.Every, a loop of commands) must be made with waitCmd"
 
 // t0 is when every test starts.
 var t0 = time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
@@ -68,7 +84,7 @@ func (c *clock) advance(d time.Duration) {
 
 // harness holds a model under test.
 type harness struct {
-	t     *testing.T
+	t     testing.TB
 	clock *clock
 	m     tea.Model
 	w, h  int
@@ -76,6 +92,8 @@ type harness struct {
 	async chan tea.Msg
 	done  chan struct{}
 	quit  bool
+	// settleFor bounds a settle.
+	settleFor time.Duration
 }
 
 // newHarness starts the program of sess in a window of w by h: it runs
@@ -84,11 +102,12 @@ func newHarness(t *testing.T, sess kube.Session, w, h int) *harness {
 	t.Helper()
 	c := &clock{at: t0}
 	hs := &harness{
-		t:     t,
-		clock: c,
-		m:     New(sess, Options{Version: "v0.1.0", Now: c.now}),
-		async: make(chan tea.Msg, 64),
-		done:  make(chan struct{}),
+		t:         t,
+		clock:     c,
+		m:         New(sess, Options{Version: "v0.1.0", Now: c.now}),
+		async:     make(chan tea.Msg, 64),
+		done:      make(chan struct{}),
+		settleFor: deadline,
 	}
 	t.Cleanup(func() { close(hs.done) })
 	hs.queue = append(hs.queue, hs.m.Init())
@@ -187,11 +206,7 @@ func (hs *harness) deliver(msg tea.Msg) {
 		return
 	}
 	if v := reflect.ValueOf(msg); v.Kind() == reflect.Slice && v.Type().Elem() == reflect.TypeOf(tea.Cmd(nil)) {
-		// tea.Sequence: its commands one after the other, which the
-		// queue does.
-		for i := range v.Len() {
-			hs.queue = append(hs.queue, v.Index(i).Interface().(tea.Cmd))
-		}
+		hs.sequence(v)
 		return
 	}
 	m, cmd := hs.m.Update(msg)
@@ -199,11 +214,32 @@ func (hs *harness) deliver(msg tea.Msg) {
 	hs.queue = append(hs.queue, cmd)
 }
 
+// sequence runs the commands of a tea.Sequence, held in v, in order:
+// each one's message is delivered before the next one runs.
+func (hs *harness) sequence(v reflect.Value) {
+	hs.t.Helper()
+	for i := range v.Len() {
+		cmd := v.Index(i).Interface().(tea.Cmd)
+		if cmd == nil {
+			continue
+		}
+		if isWait(cmd) {
+			hs.t.Fatalf("a waitCmd is in a tea.Sequence, which the harness does not run: it cannot wait in the middle of a sequence")
+		}
+		hs.deliver(hs.run(cmd))
+	}
+}
+
 // settle runs the pending commands, and the commands they lead to, until
-// none is left but those that wait.
+// none is left but those that wait. It fails the test when that does not
+// end within maxSettle commands or settleFor.
 func (hs *harness) settle() {
 	hs.t.Helper()
-	for len(hs.queue) > 0 {
+	end := time.Now().Add(hs.settleFor)
+	for n := 0; len(hs.queue) > 0; n++ {
+		if n >= maxSettle || time.Now().After(end) {
+			hs.t.Fatalf("the commands did not settle after %d of them in %v: %s", n, hs.settleFor, ruleOfWaiting)
+		}
 		cmd := hs.queue[0]
 		hs.queue = hs.queue[1:]
 		if cmd == nil {
@@ -219,14 +255,22 @@ func (hs *harness) settle() {
 			}()
 			continue
 		}
-		got := make(chan tea.Msg, 1)
-		go func() { got <- cmd() }()
-		select {
-		case msg := <-got:
-			hs.deliver(msg)
-		case <-time.After(deadline):
-			hs.t.Fatalf("a command did not return in %v", deadline)
-		}
+		hs.deliver(hs.run(cmd))
+	}
+}
+
+// run runs a command that does not wait and returns its message. It fails
+// the test when the command takes longer than deadline.
+func (hs *harness) run(cmd tea.Cmd) tea.Msg {
+	hs.t.Helper()
+	got := make(chan tea.Msg, 1)
+	go func() { got <- cmd() }()
+	select {
+	case msg := <-got:
+		return msg
+	case <-time.After(deadline):
+		hs.t.Fatalf("a command did not return in %v: %s", deadline, ruleOfWaiting)
+		return nil
 	}
 }
 

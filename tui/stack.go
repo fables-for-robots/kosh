@@ -50,8 +50,17 @@ func (r *root) push(v view) tea.Cmd {
 }
 
 // pop takes the top view off the stack and closes it, and asks the view
-// below to read again. The last view stays.
+// below to read again. The last view stays, unless it is the help or the
+// names, which leave the body empty, as it was when the start failed.
 func (r *root) pop() tea.Cmd {
+	if len(r.stack) == 1 {
+		switch r.stack[0].(type) {
+		case *helpView, *namesView:
+			r.stack[0].Close()
+			r.stack = nil
+		}
+		return nil
+	}
 	if len(r.stack) < 2 {
 		return nil
 	}
