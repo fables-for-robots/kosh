@@ -571,8 +571,9 @@ func serverGoroutines() []string {
 	}
 	var found []string
 	for i, g := range strings.Split(string(buf), "\n\n") {
-		if i == 0 {
-			continue // the caller
+		// The caller, and a parent test waiting for its subtest.
+		if i == 0 || strings.Contains(g, "testing.(*T).Run(") {
+			continue
 		}
 		for _, m := range serverGoroutineMarkers {
 			if strings.Contains(g, m) {

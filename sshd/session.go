@@ -2,9 +2,12 @@ package sshd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -56,6 +59,10 @@ type session struct {
 	// srv.mu, before the session is in srv.sessions, and not changed.
 	grant keys.Grant
 
+	// stopped is set when kosh ends the session; the model is given no
+	// message after that.
+	stopped atomic.Bool
+
 	mu sync.Mutex
 	// reason is why kosh ends the session; "" while it does not.
 	reason string
@@ -76,8 +83,17 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	log := s.log.With("transport", c.transport, "remote", c.remote,
 		"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "read_only", sess.grant.ReadOnly)
 
+	panicked := func(in string, value any, stack []byte) {
+		log.Error("session's program panicked", "in", in, "panic", fmt.Sprint(value), "stack", string(stack))
+		sess.end(MsgCrashed)
+	}
+	var m tea.Model
 	if sess.ending() == "" {
-		m := s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote})
+		m = makeModel(func() tea.Model {
+			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote})
+		}, &sess.stopped, panicked)
+	}
+	if m != nil {
 		opts := append(bm.MakeOptions(ss),
 			// The program ends with the session, however it ends.
 			tea.WithContext(ctx),
@@ -93,7 +109,13 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			began := time.Now()
 
 			go forwardWindow(ctx, ss, p)
-			_, _ = p.Run()
+			_, err := p.Run()
+			if errors.Is(err, tea.ErrProgramPanic) {
+				// A command's goroutine panicked, and Bubble Tea caught
+				// it and printed the stack to the standard error.
+				log.Error("session's program panicked in a command", "err", err)
+				sess.end(MsgCrashed)
+			}
 
 			s.mu.Lock()
 			s.running--
@@ -138,6 +160,7 @@ func (sess *session) end(msg string) bool {
 		return false
 	}
 	sess.reason = msg
+	sess.stopped.Store(true)
 	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() {
 		sess.srv.log.Warn("session did not end in time: its connection is closed",
 			"transport", sess.conn.transport, "remote", sess.conn.remote, "key", sess.grant.Name, "reason", msg)
