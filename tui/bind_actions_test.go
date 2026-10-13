@@ -98,6 +98,7 @@ func TestReadOnlyHasNoActionKeys(t *testing.T) {
 func TestActionKeysByKind(t *testing.T) {
 	full := keys.Grant{Name: "alice"}
 	del := binding{Key: "ctrl+d", Hint: hint{"ctrl-d", "Delete"}, Order: 30}
+	edit := binding{Key: "e", Hint: hint{"e", "Edit"}, Order: 31}
 	kill := binding{Key: "ctrl+k", Hint: hint{"ctrl-k", "Kill"}, Order: 32}
 	scale := binding{Key: "s", Hint: hint{"s", "Scale"}, Order: 33}
 	restart := binding{Key: "r", Hint: hint{"r", "Restart"}, Order: 34}
@@ -118,18 +119,18 @@ func TestActionKeysByKind(t *testing.T) {
 		res  kube.Resource
 		want []binding
 	}{
-		{kubetest.Resource("pods"), []binding{del, kill}},
-		{kubetest.Resource("deployments"), []binding{del, scale, restart, image}},
-		{kubetest.Resource("statefulsets"), []binding{del, scale, restart, image}},
-		{kubetest.Resource("daemonsets"), []binding{del, restart, image}},
-		{kubetest.Resource("replicasets"), []binding{del, scale, rollback}},
-		{kubetest.Resource("cronjobs"), []binding{del, trigger, suspend}},
-		{kubetest.Resource("nodes"), []binding{del, cordon, uncordon, drain}},
-		{kubetest.Resource("configmaps"), []binding{del}},
-		{kubetest.Resource("widgets"), []binding{del}},
+		{kubetest.Resource("pods"), []binding{del, edit, kill}},
+		{kubetest.Resource("deployments"), []binding{del, edit, scale, restart, image}},
+		{kubetest.Resource("statefulsets"), []binding{del, edit, scale, restart, image}},
+		{kubetest.Resource("daemonsets"), []binding{del, edit, restart, image}},
+		{kubetest.Resource("replicasets"), []binding{del, edit, scale, rollback}},
+		{kubetest.Resource("cronjobs"), []binding{del, edit, trigger, suspend}},
+		{kubetest.Resource("nodes"), []binding{del, edit, cordon, uncordon, drain}},
+		{kubetest.Resource("configmaps"), []binding{del, edit}},
+		{kubetest.Resource("widgets"), []binding{del, edit}},
 		{kube.Containers, nil},
 		{kube.Rules, nil},
-		{noDelete, nil},
+		{noDelete, []binding{edit}},
 		{noUpdate, []binding{del}},
 	} {
 		got := actionOwn(bindingsFor(c.res, full))

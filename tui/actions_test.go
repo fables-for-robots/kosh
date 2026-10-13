@@ -332,7 +332,13 @@ func TestNothingIsCalledInUpdate(t *testing.T) {
 	dialogFocusOn(hs, "Set")
 	hs.press("enter")
 	hs.awaitFrame("Set the images of deployments/default/web")
-	if got := sess.entered(); !slices.Equal(got, []string{"Images", "Kill", "Replicas", "Scale", "SetImages"}) {
+	sess.YAMLs["configmaps/default/cfg"] = "a: b\n"
+	actionOpen(hs, sess.Session, "configmaps", simpleTable("cfg"))
+	hs.press("e")
+	hs.typeText("x")
+	hs.press("ctrl+s")
+	hs.awaitFrame("Updated configmaps/default/cfg")
+	if got := sess.entered(); !slices.Equal(got, []string{"Images", "Kill", "Replicas", "Scale", "SetImages", "Update", "YAML"}) {
 		t.Errorf("the session was called for %v", got)
 	}
 	if got := sess.calledInUpdate(); len(got) > 0 {

@@ -18,6 +18,7 @@ import (
 // actionBindings are the keys of the actions, which init binds.
 var actionBindings = []binding{
 	{Key: "ctrl+d", Hint: hint{"ctrl-d", "Delete"}, Order: 30, Applies: actionApplies(actionCan("delete")), Run: actionGuard(actionDelete)},
+	{Key: "e", Hint: hint{"e", "Edit"}, Order: 31, Applies: actionApplies(actionCan("update")), Run: actionGuard(editorOpen)},
 	{Key: "ctrl+k", Hint: hint{"ctrl-k", "Kill"}, Order: 32, Applies: actionApplies(actionIs("", "pods")), Run: actionGuard(actionKill)},
 	{Key: "s", Hint: hint{"s", "Scale"}, Order: 33, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "replicasets")), Run: actionGuard(actionScale)},
 	{Key: "r", Hint: hint{"r", "Restart"}, Order: 34, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "daemonsets")), Run: actionGuard(actionRestart)},

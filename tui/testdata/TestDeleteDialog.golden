@@ -1,6 +1,6 @@
 Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <ctrl-d> Delete
-Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter        <ctrl-k> Kill
-kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter        <e> Edit
+kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark      <ctrl-k> Kill
                                       <shift-o> Sort Column   <shift-j> Owner
                                       <ctrl-w> Wide           <?> Help
 
