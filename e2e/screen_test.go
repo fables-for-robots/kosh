@@ -44,6 +44,8 @@ type screen struct {
 	saved    [2]int
 	last     rune // for REP
 	all      bytes.Buffer
+	watched  []string          // texts to look for after every write
+	seenAt   map[string]string // where each watched text was first seen
 }
 
 // newScreen returns a blank screen of w by h.
@@ -67,6 +69,7 @@ func (s *screen) Write(p []byte) (int, error) {
 	for _, b := range p {
 		s.p.Advance(b)
 	}
+	s.look()
 	return len(p), nil
 }
 
@@ -94,6 +97,62 @@ func (s *screen) String() string {
 		lines[i] = strings.TrimRight(lines[i], " ")
 	}
 	return strings.Join(lines, "\n")
+}
+
+// watch makes the screen look, after every write, for each of texts on
+// the screen and in the bytes written so far without their escape
+// sequences: a text that a frame shows, or sends broken up by cursor
+// moves, is seen even when it is painted over before anybody looks.
+func (s *screen) watch(texts ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.watched = append(s.watched, texts...)
+	s.look()
+}
+
+// seen returns the watched texts that were seen, each followed by where
+// it was seen first.
+func (s *screen) seen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, t := range s.watched {
+		if where, ok := s.seenAt[t]; ok {
+			out = append(out, t+" "+where)
+		}
+	}
+	return out
+}
+
+// look records which watched texts are on the screen or in the bytes.
+func (s *screen) look() {
+	if len(s.watched) == 0 {
+		return
+	}
+	if s.seenAt == nil {
+		s.seenAt = map[string]string{}
+	}
+	var screen strings.Builder
+	for _, row := range s.cells {
+		for _, r := range row {
+			if r != 0 {
+				screen.WriteRune(r)
+			}
+		}
+		screen.WriteByte('\n')
+	}
+	stripped := ansi.Strip(s.all.String())
+	for _, t := range s.watched {
+		if _, ok := s.seenAt[t]; ok {
+			continue
+		}
+		switch {
+		case strings.Contains(screen.String(), t):
+			s.seenAt[t] = fmt.Sprintf("on the screen, after %d bytes:\n%s", s.all.Len(), screen.String())
+		case strings.Contains(stripped, t):
+			s.seenAt[t] = fmt.Sprintf("in the bytes, after %d bytes", s.all.Len())
+		}
+	}
 }
 
 // raw returns every byte written so far.
@@ -154,6 +213,15 @@ func (s *screen) print(r rune) {
 	row := s.cells[s.y]
 	if s.insert {
 		copy(row[s.x+wd:], row[s.x:])
+	}
+	// A wide character of which one half is overwritten is gone whole.
+	for x := s.x; x < s.x+wd; x++ {
+		if row[x] == 0 && x > 0 {
+			row[x-1] = ' '
+		}
+		if x+1 < s.w && row[x+1] == 0 && row[x] != 0 {
+			row[x+1] = ' '
+		}
 	}
 	row[s.x] = r
 	if wd == 2 {
@@ -541,6 +609,46 @@ func TestScreenIgnoresWhatDrawsNothing(t *testing.T) {
 		"seen",
 	)
 	wantLines(t, s, "seen")
+}
+
+// A narrow character written over either half of a wide one takes the
+// whole wide character away: its other half becomes a blank.
+func TestScreenOverwritesHalfOfAWideCharacter(t *testing.T) {
+	s := feed(6, 1, "a界b", "\x1b[1;2Hx") // over the first half
+	wantLines(t, s, "ax b")
+	s = feed(6, 1, "a界b", "\x1b[1;3Hx") // over the second half
+	wantLines(t, s, "a xb")
+	if got := []rune(s.lines()[0]); len(got) != 6 {
+		t.Errorf("the line has %d cells, want 6: %q", len(got), string(got))
+	}
+}
+
+// A watched text is seen when it is on the screen, or in the bytes
+// written with their escape sequences taken out, even when it is painted
+// over before anybody looks.
+func TestScreenWatches(t *testing.T) {
+	s := newScreen(20, 3)
+	s.watch("secret", "c2VjcmV0")
+	_, _ = s.Write([]byte("nothing here"))
+	if seen := s.seen(); len(seen) != 0 {
+		t.Fatalf("seen %q in %q", seen, s.raw())
+	}
+	// Written cell by cell with cursor moves between, then erased.
+	_, _ = s.Write([]byte("\x1b[2;1Hsec\x1b[1C\x1b[1Dret"))
+	_, _ = s.Write([]byte("\x1b[2;1H\x1b[2K"))
+	if strings.Contains(s.String(), "secret") {
+		t.Fatalf("the screen still shows it:\n%s", s)
+	}
+	if seen := s.seen(); len(seen) != 1 || !strings.HasPrefix(seen[0], "secret ") {
+		t.Errorf("seen %q, want secret", seen)
+	}
+	// Painted on the screen out of order: only the screen has it.
+	s = newScreen(20, 3)
+	s.watch("c2VjcmV0")
+	_, _ = s.Write([]byte("\x1b[1;5HcmV0\x1b[1;1Hc2Vj"))
+	if seen := s.seen(); len(seen) != 1 || !strings.Contains(seen[0], "on the screen") {
+		t.Errorf("seen %q, want c2VjcmV0 on the screen", seen)
+	}
 }
 
 func TestScreenResizes(t *testing.T) {
