@@ -83,4 +83,53 @@ count secret PersistentVolumeClaim 0
 count secret ServiceAccount 1
 count secret ConfigMap 1
 
+# --- loadbalancer
+render loadbalancer
+eq loadbalancer Service .spec.type LoadBalancer "Service is a LoadBalancer"
+eq loadbalancer Service '.metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]' nlb "Service annotation"
+eq loadbalancer Service '.spec.loadBalancerSourceRanges | join(",")' "203.0.113.0/24,198.51.100.7/32" "source ranges"
+eq loadbalancer Service .spec.externalTrafficPolicy Local "externalTrafficPolicy Local"
+eq loadbalancer Service '.spec.ports | length' 1 "Service carries nothing of iroh"
+
+# --- persistence
+render persistence
+eq persistence PersistentVolumeClaim .spec.resources.requests.storage 16Mi "PVC of 16Mi"
+eq persistence PersistentVolumeClaim .spec.storageClassName fast "PVC storage class"
+eq persistence Deployment "$D.volumes[] | select(.name == \"state\") | .persistentVolumeClaim.claimName" kosh "state is the claim"
+eq persistence Deployment "$D.volumes[] | select(.name == \"state\") | .secret" null "no Secret volume"
+eq persistence Deployment "$C.volumeMounts[] | select(.name == \"state\") | .mountPath" /var/lib/kosh "state mounted"
+eq persistence Deployment "$C.volumeMounts[] | select(.name == \"state\") | .readOnly" null "state read-write"
+
+# --- hostnetwork
+render hostnetwork
+eq hostnetwork Deployment "$D.hostNetwork" true "host network"
+eq hostnetwork Deployment "$D.dnsPolicy" ClusterFirstWithHostNet "DNS policy"
+eq hostnetwork Deployment "$C.args[] | select(test(\"^--iroh-bind\"))" "--iroh-bind=0.0.0.0:4436" "iroh bind"
+eq hostnetwork Deployment "$C.ports[] | select(.name == \"iroh\") | .protocol" UDP "UDP container port"
+eq hostnetwork Deployment "$C.ports[] | select(.name == \"iroh\") | .containerPort" 4436 "UDP container port number"
+
+# --- no-ssh
+render no-ssh
+count no-ssh Service 0
+eq no-ssh Deployment "$C.readinessProbe" null "no readiness probe"
+eq no-ssh Deployment "$C.livenessProbe" null "no liveness probe"
+eq no-ssh Deployment "$C.args[] | select(test(\"^--ssh-listen\"))" "--ssh-listen=" "ssh listen off"
+eq no-ssh Deployment "$C.ports" null "no container ports"
+
+# --- no-iroh
+render no-iroh
+eq no-iroh Deployment "$C.args[] | select(test(\"^--iroh=\"))" "--iroh=false" "iroh off"
+
+# --- keys
+render keys
+want=$(yq '.authorizedKeys' "$CI/keys-values.yaml")
+got=$(yq 'select(.kind == "ConfigMap") | .data.authorized_keys' "$OUT/keys.yaml")
+[ "$got" = "$want" ] || fail "keys: authorized_keys differs from authorizedKeys"
+echo "ok   authorized_keys is exactly the text"
+eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("^read-only "))) | length' 1 "one read-only line"
+
+# --- narrow-rbac
+render narrow-rbac
+eq narrow-rbac ClusterRoleBinding .roleRef.name view "binds view"
+
 echo "all checks passed"

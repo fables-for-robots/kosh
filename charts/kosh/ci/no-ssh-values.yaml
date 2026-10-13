@@ -1,0 +1,4 @@
+state:
+  existingSecret: kosh-state
+ssh:
+  enabled: false
