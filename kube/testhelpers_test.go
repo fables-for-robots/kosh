@@ -28,8 +28,12 @@ import (
 	"github.com/fables-for-robots/kosh/render"
 )
 
+// failRender is a label that makes the test renderers fail.
+const failRender = "test.kosh/fail-render"
+
 // testRenderer renders pods or jobs with the columns NAMESPACE, NAME and
-// AGE, and remembers what it was given.
+// AGE, and remembers what it was given. An object with the label
+// failRender is an error.
 type testRenderer struct {
 	gvr schema.GroupVersionResource
 
@@ -58,6 +62,9 @@ func (r *testRenderer) Row(obj runtime.Object, now time.Time) (render.Row, error
 	m, err := meta.Accessor(obj)
 	if err != nil {
 		return render.Row{}, err
+	}
+	if m.GetLabels()[failRender] != "" {
+		return render.Row{}, fmt.Errorf("%s does not render", m.GetName())
 	}
 	age := now.Sub(m.GetCreationTimestamp().Time)
 	return render.Row{
@@ -363,4 +370,11 @@ func toUnstructured(t *testing.T, obj runtime.Object) *unstructured.Unstructured
 		t.Fatal(err)
 	}
 	return &unstructured.Unstructured{Object: m}
+}
+
+// running reports whether the informer of gvr runs.
+func (c *Cluster) running(gvr schema.GroupVersionResource) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.caches[gvr] != nil
 }
