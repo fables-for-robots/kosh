@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
-
 	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
 )
@@ -35,8 +33,11 @@ type actionSpySession struct {
 	fail map[string]error
 }
 
-func newActionSpySession() *actionSpySession {
-	return &actionSpySession{Session: newSession(), hold: map[string]chan struct{}{}, left: map[string][]time.Duration{}}
+func newActionSpySession() *actionSpySession { return newActionSpyOf(newSession()) }
+
+// newActionSpyOf returns a spy over sess.
+func newActionSpyOf(sess *kubetest.Session) *actionSpySession {
+	return &actionSpySession{Session: sess, hold: map[string]chan struct{}{}, left: map[string][]time.Duration{}}
 }
 
 // holdCalls makes the calls of method wait, and returns what lets them
@@ -162,20 +163,8 @@ func actionInUpdate() bool {
 	return strings.Contains(stack, "tui.(*root).Update(") || strings.Contains(stack, "tui.(*root).View(")
 }
 
-// actionKill is the key of the tests that kills.
-const actionKill = "z"
-
-// withActionKill binds actionKill to an action that kills, as a binding
-// of this part of the UI does.
-func withActionKill(t *testing.T) {
-	t.Helper()
-	var runs []ran
-	withBindings(t, &runs, binding{Key: actionKill, Hint: hint{"z", "Zap"}, Run: actionGuard(
-		func(e env, q kube.Query, refs []kube.ObjectRef) tea.Cmd {
-			return actionAsk(e, refs, actionWords{ask: "Kill", button: "Kill", done: "Killed"}, apiTimeout,
-				func(ctx context.Context, ref kube.ObjectRef) (string, error) { return "", e.sess.Kill(ctx, ref) })
-		})})
-}
+// actionKillKey is the key that kills.
+const actionKillKey = "ctrl+k"
 
 // actionPods returns the names web-01 to web-<n>.
 func actionPods(n int) []string {
@@ -203,13 +192,12 @@ func actionMarkAll(hs *harness) {
 }
 
 func TestConfirmListsMarkedRows(t *testing.T) {
-	withActionKill(t)
 	sess := newSession()
 	names := actionPods(14)
 	sess.SetTable(query("pods", "default"), podsNamed(names...))
 	hs := newHarness(t, sess, 100, 30)
 	actionMarkAll(hs)
-	hs.press(actionKill)
+	hs.press(actionKillKey)
 	hs.wantFrame("Kill 14 pods?", "… and 4 more")
 	for i, n := range names {
 		shown := strings.Contains(hs.frame(), "default/"+n)
@@ -225,13 +213,12 @@ func TestConfirmListsMarkedRows(t *testing.T) {
 }
 
 func TestActionGoesOnAfterAnError(t *testing.T) {
-	withActionKill(t)
 	sess := newSession()
 	sess.Errs["Kill"] = errors.New("pods \"web-01\" is forbidden: \x1b[2Jno")
 	sess.SetTable(query("pods", "default"), podsNamed(actionPods(3)...))
 	hs := newHarness(t, sess, 100, 30)
 	actionMarkAll(hs)
-	hs.press(actionKill, "right", "enter")
+	hs.press(actionKillKey, "right", "enter")
 	hs.awaitFrame("Killed 0 of 3 pods")
 	if got := actionKilled(sess); len(got) != 3 {
 		t.Errorf("Kill was called for %v", got)
@@ -247,7 +234,7 @@ func TestActionGoesOnAfterAnError(t *testing.T) {
 
 	// One row: the error as the session worded it.
 	sess.Errs["Kill"] = errors.New("boom")
-	hs.press("ctrl+\\", actionKill, "right", "enter")
+	hs.press("ctrl+\\", actionKillKey, "right", "enter")
 	hs.awaitFrame("boom")
 	if !strings.Contains(hs.drawnLine("boom"), sgr(styleError)) {
 		t.Error("the error of one row is not in the error style")
@@ -256,7 +243,6 @@ func TestActionGoesOnAfterAnError(t *testing.T) {
 
 // Some rows fail: the flash counts those done and gives the first error.
 func TestActionFailsForSomeRows(t *testing.T) {
-	withActionKill(t)
 	sess := newActionSpySession()
 	sess.fail = map[string]error{
 		"pods/default/web-02": errors.New("first"),
@@ -265,7 +251,7 @@ func TestActionFailsForSomeRows(t *testing.T) {
 	sess.SetTable(query("pods", "default"), podsNamed(actionPods(4)...))
 	hs := newHarness(t, sess, 100, 30)
 	actionMarkAll(hs)
-	hs.press(actionKill, "right", "enter")
+	hs.press(actionKillKey, "right", "enter")
 	hs.awaitFrame("Killed 2 of 4 pods: first")
 	if !strings.Contains(hs.drawnLine("Killed 2 of 4 pods"), sgr(styleError)) {
 		t.Error("the flash is not in the error style")
@@ -276,20 +262,19 @@ func TestActionFailsForSomeRows(t *testing.T) {
 }
 
 func TestFlashAfterAnAction(t *testing.T) {
-	withActionKill(t)
 	sess := newCountingSession()
 	q := query("pods", "default")
 	sess.SetTable(q, podsNamed("web-1", "web-2", "web-3"))
 	hs := newHarness(t, sess, 100, 30)
 	reads := len(sess.readsOf(q))
-	hs.press(actionKill, "right", "enter")
+	hs.press(actionKillKey, "right", "enter")
 	hs.awaitFrame("Killed pods/default/web-1")
 	if got := len(sess.readsOf(q)); got <= reads {
 		t.Error("the table did not read again after the action")
 	}
 	reads = len(sess.readsOf(q))
 	actionMarkAll(hs)
-	hs.press(actionKill, "right", "enter")
+	hs.press(actionKillKey, "right", "enter")
 	hs.awaitFrame("Killed 3 pods")
 	if got := len(sess.readsOf(q)); got <= reads {
 		t.Error("the table did not read again after the action over three rows")
@@ -297,15 +282,14 @@ func TestFlashAfterAnAction(t *testing.T) {
 }
 
 func TestNoSecondActionWhileOneRuns(t *testing.T) {
-	withActionKill(t)
 	sess := newActionSpySession()
 	release := sess.holdCalls("Kill")
 	t.Cleanup(release)
 	sess.SetTable(query("pods", "default"), podsNamed("web-1", "web-2"))
 	hs := newHarness(t, sess, 100, 30)
-	hs.press(actionKill, "right", "enter")
+	hs.press(actionKillKey, "right", "enter")
 	// The call is held; a second key opens nothing.
-	hs.press("down", actionKill)
+	hs.press("down", actionKillKey)
 	hs.wantFrame("an action is still running")
 	if hs.root().dlg != nil {
 		t.Error("a dialog opened while an action runs")
@@ -318,8 +302,8 @@ func TestNoSecondActionWhileOneRuns(t *testing.T) {
 	t.Cleanup(releaseOther)
 	other.SetTable(query("pods", "default"), podsNamed("web-1"))
 	hs2 := newHarness(t, other, 100, 30)
-	hs2.press(actionKill, "right", "enter")
-	hs.press(actionKill)
+	hs2.press(actionKillKey, "right", "enter")
+	hs.press(actionKillKey)
 	if hs.root().dlg == nil {
 		t.Error("an action of another session held this one up")
 	}
@@ -328,14 +312,28 @@ func TestNoSecondActionWhileOneRuns(t *testing.T) {
 }
 
 func TestNothingIsCalledInUpdate(t *testing.T) {
-	withActionKill(t)
 	sess := newActionSpySession()
 	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
 	hs := newHarness(t, sess, 100, 30)
-	hs.press(actionKill, "right", "enter")
+	hs.press(actionKillKey, "right", "enter")
 	hs.awaitFrame("Killed pods/default/web-1")
 	if len(sess.Called("Kill")) != 1 {
 		t.Fatalf("Kill was called %d times", len(sess.Called("Kill")))
+	}
+	// The reads before a dialog, and the actions after them.
+	sess.ImagesOf["deployments/default/web"] = []kube.ContainerImage{{Name: "app", Image: "nginx:1"}}
+	actionOpen(hs, sess.Session, "deployments", simpleTable("web"))
+	hs.press("s")
+	dialogFocusOn(hs, "Scale")
+	hs.press("enter")
+	hs.awaitFrame("Scaled deployments/default/web")
+	hs.press("i", "ctrl+u")
+	hs.typeText("nginx:2")
+	dialogFocusOn(hs, "Set")
+	hs.press("enter")
+	hs.awaitFrame("Set the images of deployments/default/web")
+	if got := sess.entered(); !slices.Equal(got, []string{"Images", "Kill", "Replicas", "Scale", "SetImages"}) {
+		t.Errorf("the session was called for %v", got)
 	}
 	if got := sess.calledInUpdate(); len(got) > 0 {
 		t.Errorf("called in Update: %v", got)
@@ -349,11 +347,10 @@ func TestNothingIsCalledInUpdate(t *testing.T) {
 }
 
 func TestDialogNamesAreCleaned(t *testing.T) {
-	withActionKill(t)
 	sess := newSession()
 	sess.SetTable(query("pods", "default"), podsNamed("web\x1b[2J-1", "web-2"))
 	hs := newHarness(t, sess, 100, 30)
-	hs.press(actionKill)
+	hs.press(actionKillKey)
 	if strings.Contains(hs.drawn(), "\x1b[2J") {
 		t.Error("the dialog draws the escape sequence of a name")
 	}
@@ -366,7 +363,7 @@ func TestDialogNamesAreCleaned(t *testing.T) {
 	} {
 		var b binding
 		for _, x := range bindings {
-			if x.Key == actionKill {
+			if x.Key == actionKillKey {
 				b = x
 			}
 		}

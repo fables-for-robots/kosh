@@ -1,0 +1,30 @@
+Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <ctrl-d> Delete
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter        <ctrl-k> Kill
+kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark
+                                      <shift-o> Sort Column   <shift-j> Owner
+                                      <ctrl-w> Wide           <?> Help
+
+┌──────────────────────────────────────── Pods(default)[1] ────────────────────────────────────────┐
+│NAME↑  READY  STATUS   RESTARTS  AGE                                                              │
+│web-1  1/1    Running         0   1h                                                              │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                 ╭──────────────────────────────────────────────────────────────╮                 │
+│                 │                                                              │                 │
+│                 │ Delete pods/default/web-1?                                   │                 │
+│                 │                                                              │                 │
+│                 │ ▸ Propagation  (•) Background  ( ) Foreground  ( ) Orphan    │                 │
+│                 │   Force        [ ]                                           │                 │
+│                 │                                                              │                 │
+│                 │                      Cancel      Delete                      │                 │
+│                 │                                                              │                 │
+│                 ╰──────────────────────────────────────────────────────────────╯                 │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods>
+

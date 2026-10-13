@@ -1,0 +1,30 @@
+Key:     alice@laptop   <0> all       <shift-n> Sort Name     </> Filter        <s> Scale
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      <space> Mark      <r> Restart
+kosh:    v0.1.0                       <shift-o> Sort Column   <shift-j> Owner   <i> Set Image
+                                      <ctrl-w> Wide           <?> Help
+                                      <ctrl-z> Faults         <ctrl-d> Delete
+
+┌──────────────────────────────────── Deployments(default)[1] ─────────────────────────────────────┐
+│NAME↑  AGE                                                                                        │
+│web     1h                                                                                        │
+│                                                                                                  │
+│                                                                                                  │
+│                 ╭──────────────────────────────────────────────────────────────╮                 │
+│                 │                                                              │                 │
+│                 │ Set the images of deployments/default/web?                   │                 │
+│                 │                                                              │                 │
+│                 │ ▸ setup (init)  busybox:1.36                                 │                 │
+│                 │   app           nginx:1.27                                   │                 │
+│                 │   sidecar       envoyproxy/envoy:v1.31                       │                 │
+│                 │                                                              │                 │
+│                 │                       Cancel      Set                        │                 │
+│                 │                                                              │                 │
+│                 ╰──────────────────────────────────────────────────────────────╯                 │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<deployments>
+
