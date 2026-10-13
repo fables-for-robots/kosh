@@ -755,8 +755,11 @@ func TestCloseClosesEverything(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if d := time.Since(start); d >= closeLinger/2 {
-		t.Fatalf("Close took %v: it waited for the peer of a closed connection", d)
+	// The connection the server closed is given the rest of its linger,
+	// and its client does not close it: Close waits for the linger, and
+	// not longer.
+	if d := time.Since(start); d > closeLinger+closeLinger/2 {
+		t.Fatalf("Close took %v: longer than the linger of a closed connection", d)
 	}
 	if _, err := s.Read(make([]byte, 8)); err == nil {
 		t.Error("the accepted connection reads after Close")
@@ -845,5 +848,76 @@ func TestAcceptLoopBacksOff(t *testing.T) {
 	case <-done:
 	case <-time.After(wait):
 		t.Fatal("the accept loop did not end with the listener's context")
+	}
+}
+
+// A connection its owner closed finishes its grace when the listener is
+// closed right after; one its owner did not close is cut at once.
+func TestListenerCloseLetsAGraceFinish(t *testing.T) {
+	const grace = 300 * time.Millisecond
+	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: grace})
+	c := dial(t, l)
+	s := accept(t, l, c, "hello")
+	open := dial(t, l)
+	accept(t, l, open, "hello") // its owner does not close it
+
+	// The server writes more than the stream's window holds, closes the
+	// connection right after the last Write, and the listener right
+	// after that, while the client is still reading.
+	big := strings.Repeat("kosh", 1<<18)
+	type result struct {
+		start time.Time
+		took  time.Duration
+		err   error
+	}
+	closed := make(chan result, 1)
+	go func() {
+		if _, err := io.WriteString(s, big); err != nil {
+			closed <- result{err: err}
+			return
+		}
+		if err := s.Close(); err != nil {
+			closed <- result{err: err}
+			return
+		}
+		start := time.Now()
+		err := l.Close()
+		closed <- result{start, time.Since(start), err}
+	}()
+	readExactly(t, c, big)
+	readEnds(t, c)
+	readEnds(t, open)
+	var r result
+	select {
+	case r = <-closed:
+	case <-time.After(wait):
+		t.Fatal("the server's Write, Close and the listener's Close did not return")
+	}
+	if r.err != nil {
+		t.Fatalf("write or close: %v", r.err)
+	}
+	if r.took > grace+grace/2 {
+		t.Errorf("Close took %v, more than the grace of %v", r.took, grace)
+	}
+}
+
+// When the listener is closed, a connection its owner did not close is
+// cut at once.
+func TestListenerCloseCutsAnOpenConnection(t *testing.T) {
+	const grace = time.Minute
+	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: grace})
+	open := dial(t, l)
+	accept(t, l, open, "hello") // its owner does not close it
+	start := time.Now()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("Close took %v", d)
+	}
+	select {
+	case <-open.(*conn).qc.Context().Done():
+	case <-time.After(time.Second):
+		t.Error("the connection its owner did not close is still open")
 	}
 }

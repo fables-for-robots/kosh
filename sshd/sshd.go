@@ -109,8 +109,8 @@ type Server struct {
 	handshakes atomic.Int64 // connections in the handshake, over every listener
 
 	mu        sync.Mutex
-	closing   bool // Shutdown has been called
-	listeners map[net.Listener]struct{}
+	closing   bool                    // Shutdown has been called
+	listeners map[net.Listener]string // the transport of each
 	conns     map[*conn]struct{}
 	sessions  map[*session]struct{}
 	windows   map[ssh.Session]*window // of session channels that asked for a terminal
@@ -152,7 +152,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		endTimeout: 2 * time.Second,
-		listeners:  map[net.Listener]struct{}{},
+		listeners:  map[net.Listener]string{},
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},
 		windows:    map[ssh.Session]*window{},
@@ -258,7 +258,7 @@ func (s *Server) Serve(l net.Listener, transport string) error {
 		_ = l.Close()
 		return nil
 	}
-	s.listeners[l] = struct{}{}
+	s.listeners[l] = transport
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -348,24 +348,22 @@ func (s *Server) waitFor(ctx context.Context, cond func() bool) error {
 	return nil
 }
 
-// Shutdown closes every listener Serve was given, tells every session
-// MsgShuttingDown and closes it, and returns when all connections are
-// closed or ctx is done, whichever is first.
+// Shutdown stops the server: from now on Serve closes every connection
+// it accepts; every session is told MsgShuttingDown and ended, and
+// Shutdown waits for the sessions to end; then every connection is
+// closed, and only then every listener Serve was given, the iroh ones
+// last. A session over iroh would lose its transport with the listener,
+// before it was told. Shutdown returns when all connections are closed
+// and the listeners too, or when ctx is done, whichever is first; when
+// ctx is done first, every connection and listener is closed at once.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.closing = true
-	var listeners []net.Listener
-	for l := range s.listeners {
-		listeners = append(listeners, l)
-	}
 	var sessions []*session
 	for sess := range s.sessions {
 		sessions = append(sessions, sess)
 	}
 	s.mu.Unlock()
-	for _, l := range listeners {
-		_ = l.Close()
-	}
 
 	// A session that begins from now on is ended as it begins.
 	for _, sess := range sessions {
@@ -378,10 +376,30 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// the others are closed here.
 	_ = s.ssh.Close()
 	s.closeConns()
-	if err != nil {
-		return err
+	if err == nil {
+		err = s.waitFor(ctx, func() bool { return len(s.conns) == 0 && len(s.sessions) == 0 })
 	}
-	return s.waitFor(ctx, func() bool { return len(s.conns) == 0 && len(s.sessions) == 0 })
+	s.closeListeners()
+	return err
+}
+
+// closeListeners closes every listener Serve was given: those over iroh
+// last, whose Close waits for the connections it carried to finish their
+// last bytes.
+func (s *Server) closeListeners() {
+	s.mu.Lock()
+	var first, last []net.Listener
+	for l, transport := range s.listeners {
+		if transport == "iroh" {
+			last = append(last, l)
+		} else {
+			first = append(first, l)
+		}
+	}
+	s.mu.Unlock()
+	for _, l := range append(first, last...) {
+		_ = l.Close()
+	}
 }
 
 // closeConns closes every connection.

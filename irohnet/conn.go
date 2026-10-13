@@ -25,9 +25,11 @@ type conn struct {
 	// linger is how long, after the stream is closed, the peer is given
 	// to close the connection before it is closed from this side:
 	// closing it at once would drop what was written last and is not
-	// yet acknowledged. stop ends the wait early. spawn runs the wait
-	// in a goroutine its owner counts. Without spawn the connection is
-	// closed at once.
+	// yet acknowledged. spawn runs the wait in a goroutine its owner
+	// counts. stop is done once the listener is closing: a Close after
+	// that, and one without spawn, closes the connection at once. A wait
+	// that has begun goes on when the listener closes, which waits for
+	// it; only closeNow ends it early.
 	linger time.Duration
 	stop   <-chan struct{}
 	spawn  func(func())
@@ -44,6 +46,17 @@ type conn struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	// now is closed by closeNow, and ends a wait for the peer.
+	nowOnce   sync.Once
+	now       chan struct{}
+	closeNowO sync.Once
+}
+
+// nowChan returns now, made the first time.
+func (c *conn) nowChan() chan struct{} {
+	c.nowOnce.Do(func() { c.now = make(chan struct{}) })
+	return c.now
 }
 
 // Write is the stream's. After Close it fails with net.ErrClosed.
@@ -90,9 +103,23 @@ func (c *conn) setDeadline(set func(time.Time) error, t time.Time) error {
 // Close closes the stream; a Read or a Write that is blocked returns at
 // once. A connection of a Listener is closed after the peer has closed
 // it or the linger has passed, in a goroutine, so that Close does not
-// wait; one of DialLocal is closed at once, with its endpoint. Only the
-// first call does anything; every call returns its result.
+// wait; one of DialLocal, and one whose listener is closing, is closed
+// at once, the former with its endpoint. Only the first call of Close
+// or closeNow does anything; every call returns its result.
 func (c *conn) Close() error {
+	return c.close(c.spawn != nil && !isClosed(c.stop))
+}
+
+// closeNow closes the connection at once, without a wait for the peer,
+// and ends such a wait that has begun. The listener's Close closes the
+// connections their owners have not closed with it.
+func (c *conn) closeNow() error {
+	c.closeNowO.Do(func() { close(c.nowChan()) })
+	return c.close(false)
+}
+
+// close is Close, with the wait for the peer or without.
+func (c *conn) close(linger bool) error {
 	c.closeOnce.Do(func() {
 		// A Write that is blocked returns at once with a timeout; what
 		// Writes have handed the stream so far is still sent, and the
@@ -107,7 +134,7 @@ func (c *conn) Close() error {
 		if c.onClose != nil {
 			c.onClose(c)
 		}
-		if c.spawn == nil {
+		if !linger {
 			err := c.qc.CloseWithError(0, "closed")
 			if c.ep != nil {
 				err = errors.Join(err, c.ep.Shutdown(context.Background()))
@@ -121,13 +148,14 @@ func (c *conn) Close() error {
 }
 
 // lingerAndClose gives the peer the linger to close the connection, and
-// then closes it.
+// then closes it. The listener's closing does not cut it short: the
+// listener waits for it.
 func (c *conn) lingerAndClose() {
 	t := time.NewTimer(c.linger)
 	defer t.Stop()
 	select {
 	case <-c.qc.Context().Done():
-	case <-c.stop:
+	case <-c.nowChan():
 	case <-t.C:
 	}
 	c.qc.CloseWithError(0, "closed")
