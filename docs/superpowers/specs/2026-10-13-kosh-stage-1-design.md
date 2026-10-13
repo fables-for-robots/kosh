@@ -243,7 +243,9 @@ kosh reads the cluster in four ways.
 ### 8.1 Informers, for the typed kinds
 
 Each typed kind has one informer for the whole cluster and the whole
-process: client-go's typed shared informers.
+process: a shared informer over client-go's dynamic client, which turns
+each object into its typed form as it stores it. One informer per kind,
+and not a factory of typed ones, is what lets a single kind be stopped.
 
 - An informer is started the first time a session opens its kind, and
   all sessions share it. That is sound because all sessions have the
