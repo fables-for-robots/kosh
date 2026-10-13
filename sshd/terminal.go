@@ -70,6 +70,21 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 	}
 }
 
+// minTurn is how long a turn lasts at least: Run does not return sooner,
+// however soon the command does.
+//
+// Bubble Tea v2.0.10 has one ticker for its renderer. When it releases
+// the terminal it tells the renderer's goroutine to go, and that
+// goroutine stops the ticker on its way out; when it takes the terminal
+// back it resets the ticker and starts a new goroutine. Nothing makes
+// the first wait for the second: after a command that returns before
+// the old goroutine has run, the old goroutine stops the ticker the new
+// one draws by, and the program draws nothing from then on, though it
+// still takes its keys. The old goroutine has only to be scheduled once,
+// which waiting here lets happen: this is time for it, not a guarantee,
+// and it costs a command that lasts longer than this nothing.
+const minTurn = 10 * time.Millisecond
+
 // turn is the time one command has the terminal, as a tea.ExecCommand:
 // Bubble Tea calls Run in the program's event loop when it has released
 // the terminal, and takes the terminal back when Run has returned.
@@ -102,6 +117,14 @@ func (t *turn) SetStderr(io.Writer) {}
 // is not called.
 func (t *turn) Run() error {
 	sess := t.sess
+	began := time.Now()
+	defer func() {
+		// See minTurn. The command has returned, and what it left
+		// unread waits for the program.
+		if rest := minTurn - time.Since(began); rest > 0 {
+			time.Sleep(rest)
+		}
+	}()
 	defer sess.in.takeBack(t.in)
 	out := &gate{w: sess.raw}
 	defer out.close()

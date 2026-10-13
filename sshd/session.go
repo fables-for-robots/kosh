@@ -252,6 +252,11 @@ func (sess *session) end(msg string) bool {
 func (sess *session) over() bool {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	return sess.overLocked()
+}
+
+// overLocked is over with sess.mu held.
+func (sess *session) overLocked() bool {
 	return sess.reason != "" || sess.finished || sess.ctx.Err() != nil
 }
 
@@ -261,7 +266,7 @@ func (sess *session) over() bool {
 func (sess *session) beginCommand(cancel context.CancelFunc) bool {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if sess.reason != "" || sess.finished || sess.ctx.Err() != nil {
+	if sess.overLocked() {
 		return false
 	}
 	sess.cancelCommand = cancel

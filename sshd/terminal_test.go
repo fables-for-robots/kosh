@@ -1133,11 +1133,12 @@ func TestSessionEndsDuringACommand(t *testing.T) {
 			case <-time.After(longWait):
 				t.Fatal("the command has not returned")
 			}
+
+			rec := h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" })
+			// The turn is over, and not only the command.
 			if n, err := io.WriteString(run.t.Out, "LATEWRITE"); n != 0 || err != io.ErrClosedPipe {
 				t.Errorf("a write of the command after the session's end: %d, %v; want 0, io.ErrClosedPipe", n, err)
 			}
-
-			rec := h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" })
 			// A connection that is closed closes its channels: which of
 			// the two the session saw first is the scheduler's choice,
 			// with a command and without.
@@ -1174,9 +1175,9 @@ func TestCommandThatDoesNotReturn(t *testing.T) {
 	stuck := make(chan struct{})
 	unstick := sync.OnceFunc(func() { close(stuck) })
 	defer unstick()
-	runs := make(chan context.Context, 1)
-	hv := newHandover(func(ctx context.Context, _ Terminal) error {
-		runs <- ctx
+	runs := make(chan held, 1)
+	hv := newHandover(func(ctx context.Context, tt Terminal) error {
+		runs <- held{ctx: ctx, t: tt}
 		<-stuck
 		return nil
 	})
@@ -1185,19 +1186,25 @@ func TestCommandThatDoesNotReturn(t *testing.T) {
 	tm := openTerm(t, cl)
 	tm.waitFor("LASTLINE")
 	tm.press("!")
-	var ctx context.Context
+	var run held
 	select {
-	case ctx = <-runs:
+	case run = <-runs:
 	case <-time.After(longWait):
 		t.Fatal("the command was not given the terminal")
 	}
 
 	setKeys(t, h.list)
 	select {
-	case <-ctx.Done():
+	case <-run.ctx.Done():
 	case <-time.After(longWait):
 		t.Fatal("the command's context is not done")
 	}
+	// The command still has its turn, and nothing of the terminal.
+	wantRead(t, "the command's Read after the session was ended", readOnce(run.t.In), "", io.EOF)
+	eventually(t, "the command's writes are refused", func() bool {
+		_, err := run.t.Out.Write(nil)
+		return err == io.ErrClosedPipe
+	})
 	rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
 		return strings.HasPrefix(r.Msg, "session did not end in time")
 	})
@@ -1380,5 +1387,32 @@ func TestHandoverWaitsForAReaderThatIsHeldUp(t *testing.T) {
 	defer hv.mu.Unlock()
 	if got := strings.Join(hv.keys, ""); got != "%xy"+typed || string(hv.cmd) != "AB"+endMark || hv.marks != 0 {
 		t.Errorf("the model was given %q and %d mode reports, the command %q", got, hv.marks, hv.cmd)
+	}
+}
+
+// TestScreenAfterACommandThatReturnsAtOnce hands the terminal to a
+// command that returns without waiting for anything, as a command that
+// is refused does: the program draws after every one of them.
+//
+// Bubble Tea stops its renderer's goroutine when it releases the
+// terminal and starts another when it takes the terminal back, and the
+// first, when it is slow to go, stops the ticker of the second: after a
+// command that returned too soon the program would draw nothing more.
+func TestScreenAfterACommandThatReturnsAtOnce(t *testing.T) {
+	const cycles = 100
+	for _, procs := range []int{0, 1} {
+		t.Run(fmt.Sprintf("GOMAXPROCS=%d", procs), func(t *testing.T) {
+			if procs != 0 {
+				before := runtime.GOMAXPROCS(procs)
+				defer runtime.GOMAXPROCS(before)
+			}
+			hv := newHandover(func(context.Context, Terminal) error { return nil })
+			_, tm := startHandover(t, hv)
+			for i := 1; i <= cycles; i++ {
+				tm.press("!")
+				hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == i })
+				tm.waitFor(fmt.Sprintf("done:%d ", i))
+			}
+		})
 	}
 }
