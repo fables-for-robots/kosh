@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
@@ -288,6 +289,16 @@ func TestEditorRefusesWhatItCannotHold(t *testing.T) {
 	if !editorClosed(hs) {
 		t.Error("an editor opened")
 	}
+
+	// Nor one of more bytes than it takes, in few lines.
+	sess = newSession()
+	sess.YAMLs[editorRef.String()] = "a: " + strings.Repeat("b", editorMaxBytes) + "\n"
+	hs = editorStart(t, sess, false)
+	hs.press("e")
+	hs.wantFrame("more bytes")
+	if !editorClosed(hs) {
+		t.Error("an editor opened for a YAML of more bytes than it holds")
+	}
 }
 
 func TestEditorWhileSaving(t *testing.T) {
@@ -316,5 +327,41 @@ func TestEditorWhileSaving(t *testing.T) {
 	}
 	if !editorClosed(hs) {
 		t.Error("the editor is open")
+	}
+}
+
+// editorLargest returns the largest YAMLs the editor opens: as many
+// lines as it holds, and as many lines as its bytes allow that each
+// wrap into two rows at 80 columns.
+func editorLargest() []string {
+	short := strings.Repeat("a: b\n", editorMaxLines-1)
+	long := strings.Repeat("a", 72) + "\n"
+	n := min(editorMaxLines-1, editorMaxBytes/len(long))
+	return []string{short, strings.Repeat(long, n)}
+}
+
+func TestEditorKeyPressIsFast(t *testing.T) {
+	bound := 150 * time.Millisecond * slowdown
+	for i, yaml := range editorLargest() {
+		sess := newSession()
+		sess.YAMLs[editorRef.String()] = yaml
+		hs := newHarness(t, sess, 80, 24)
+		actionOpen(hs, sess, "configmaps", simpleTable("cfg"))
+		hs.press("e")
+		editorShown(hs)
+		hs.frame()
+		// The fastest of a few, so that a pause of the machine is not
+		// counted.
+		best := time.Hour
+		for range 3 {
+			start := time.Now()
+			hs.press("x")
+			hs.frame()
+			best = min(best, time.Since(start))
+		}
+		t.Logf("YAML %d, %d lines, %d bytes: a key and its frame in %v", i, strings.Count(yaml, "\n"), len(yaml), best)
+		if best > bound {
+			t.Errorf("YAML %d, %d lines, %d bytes: a key and its frame take %v, more than %v", i, strings.Count(yaml, "\n"), len(yaml), best, bound)
+		}
 	}
 }

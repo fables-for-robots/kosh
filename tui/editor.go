@@ -16,9 +16,18 @@ import (
 // in kosh, with the YAML as it was read; ctrl+s sends it as an update,
 // esc leaves and asks first when the text was changed.
 
-// editorMaxLines is the most lines the editor holds. Its line numbers
-// are as wide as this number.
-const editorMaxLines = 9999
+// The largest YAML the editor opens: editorMaxLines lines and
+// editorMaxBytes bytes. The text area of bubbles draws all its text, in
+// every update and every frame, and costs about 25µs a row it draws: a
+// row a line, and a row more for each width of the window a long line
+// wraps over. These keep a key and its frame under 50ms on an Apple M4
+// Pro, in the worst case (lines of 73 cells, two rows each at 80
+// columns) as well (TestEditorKeyPressIsFast). The line numbers are as
+// wide as editorMaxLines.
+const (
+	editorMaxLines = 1000
+	editorMaxBytes = 48 << 10
+)
 
 // editorView is the editor of one object's YAML.
 type editorView struct {
@@ -49,7 +58,7 @@ type editorSavedMsg struct {
 // The flashes of a YAML the editor will not open.
 const (
 	editorTextCannotKeep = "this object holds characters the editor cannot keep (a tab or a control character outside a quoted string): edit it with kubectl"
-	editorTextCannotHold = "this object's YAML has more lines than the editor holds, or characters it cannot hold: edit it with kubectl"
+	editorTextCannotHold = "this object's YAML has more lines than the editor holds, more bytes, or characters it cannot hold: edit it with kubectl"
 )
 
 // editorOpen reads the YAML of the first row in a command and opens the
@@ -77,9 +86,12 @@ func editorOpen(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 // read and what the user typed, so it returns why instead when it could
 // not keep the text as it is: a line that clean would change (a raw tab,
 // a control character, an escape sequence, bytes that are not UTF-8),
-// more lines than editorMaxLines, or anything the text area would not
-// hold.
+// more lines than editorMaxLines or bytes than editorMaxBytes, or
+// anything the text area would not hold.
 func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why string) {
+	if len(yaml) > editorMaxBytes {
+		return nil, editorTextCannotHold
+	}
 	lines := strings.Split(yaml, "\n")
 	if len(lines) > editorMaxLines {
 		return nil, editorTextCannotHold
