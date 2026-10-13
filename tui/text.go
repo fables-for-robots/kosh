@@ -248,13 +248,14 @@ func (v *textView) SetFilter(text string) tea.Cmd {
 	if rows := v.layout(); v.top < len(rows) {
 		line = rows[v.top].line
 	}
-	v.goTo(0)
+	first := 0
 	for i, m := range v.matches {
 		if m.line >= line {
-			v.goTo(i)
+			first = i
 			break
 		}
 	}
+	v.goTo(first)
 	return nil
 }
 
