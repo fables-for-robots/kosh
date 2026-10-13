@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests the image that `nix build .#image` makes, once it is loaded into
 # Docker: that it is kosh, runs as kosh's user on a read-only root, and
-# holds kosh and nothing else. Stops at the first check that
+# holds kosh, its certificates, its user and the licence texts, and
+# nothing else. Stops at the first check that
 # does not hold. With VERSION, kosh version has to print exactly that.
 #
 #   nix build .#image --option allow-unsafe-native-code-during-evaluation true
@@ -64,11 +65,12 @@ echo "ok   kosh id as 65532 on a read-only root"
 # the image holds exactly the files and directories below, of which
 # bin/kosh is the one program, and the certificates are there.
 echo "== contents"
-# What the image holds: kosh, the certificates, its user, and the
-# directories the flake makes.
+# What the image holds: kosh, the certificates, its user, the licence
+# texts, and the directories the flake makes.
 image_files=(
   bin bin/kosh
   etc etc/group etc/passwd etc/kosh etc/ssl etc/ssl/certs etc/ssl/certs/ca-certificates.crt
+  licenses licenses/LICENSE licenses/COPYING licenses/NOTICE licenses/Apache-2.0.txt
   tmp var var/lib var/lib/kosh
 )
 # What Docker adds to the file system of every container, whatever its
@@ -86,7 +88,7 @@ extra=$(comm -23 "$OUT/files" "$OUT/want" | tr '\n' ' ')
 [ -z "$extra" ] || fail "contents: the image has what it should not: $extra"
 missing=$(comm -13 "$OUT/files" "$OUT/want" | tr '\n' ' ')
 [ -z "$missing" ] || fail "contents: the image lacks: $missing"
-echo "ok   exactly kosh, its certificates, its user and its directories"
+echo "ok   exactly kosh, its certificates, its user, the licences and its directories"
 # Docker's files are empty placeholders with the execute bit; of the
 # image's own, only bin/kosh is a program.
 printf '%s\n' "${docker_files[@]}" >"$OUT/docker"

@@ -97,8 +97,9 @@
           #   nix build .#image && docker load < result
           #
           # kosh, the certificates it reaches the relays and number0's DNS
-          # with over HTTPS, and the user it runs as; no shell and no
-          # other program. The program and the certificates are copied to
+          # with over HTTPS, the user it runs as, and in /licenses the
+          # licences of kosh and of the k9s it derives from; no shell and
+          # no other program. The program and the certificates are copied to
           # where an image has them, which works because both are files
           # that need no other.
           #
@@ -123,6 +124,15 @@
 
               cp ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-certificates.crt
               chmod 0444 etc/ssl/certs/ca-certificates.crt
+
+              # kosh's licence, and that of k9s, which parts of kosh derive
+              # from: both ask that their text go with the program.
+              mkdir licenses
+              cp ${./LICENSE} licenses/LICENSE
+              cp ${./COPYING} licenses/COPYING
+              cp ${./NOTICE} licenses/NOTICE
+              cp ${./LICENSES/Apache-2.0.txt} licenses/Apache-2.0.txt
+              chmod 0444 licenses/LICENSE licenses/COPYING licenses/NOTICE licenses/Apache-2.0.txt
 
               # The user kosh runs as, which the chart's securityContext
               # names by its number.
