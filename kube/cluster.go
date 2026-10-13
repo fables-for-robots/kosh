@@ -3,9 +3,14 @@ package kube
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	"github.com/fables-for-robots/kosh/keys"
@@ -39,9 +44,101 @@ type Options struct {
 // Cluster is the cluster for the whole process.
 type Cluster struct {
 	_ noCopy
+
+	cfg     *rest.Config // nil in unit tests
+	typed   kubernetes.Interface
+	dyn     dynamic.Interface
+	log     *slog.Logger
+	opts    Options // with every zero value replaced by its default
+	version string
+
+	disc discovery.DiscoveryInterface // nil when the resources were given
+	// zeroOf returns a new, empty object of a typed kind, which the
+	// informers convert what the API sends into: render.Zero.
+	zeroOf func(schema.GroupVersionResource) (runtime.Object, bool)
+	tables tableLister // nil without cfg, until a test sets its fake
+
+	// ctx is done when Close is called; everything the Cluster runs
+	// ends with it, and wg waits for it to have ended.
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	resMu     sync.RWMutex
+	resources []Resource // sorted, as Resources returns them
+
+	missMu   sync.Mutex
+	lastMiss time.Time // of the last discovery that Resolve asked for
+
+	mu     sync.Mutex
+	caches map[schema.GroupVersionResource]*kindCache
+	closed bool
 }
 
 type noCopy struct{}
+
+// The defaults of Options.
+const (
+	defaultIdleStop       = 10 * time.Minute
+	defaultTablePoll      = 2 * time.Second
+	defaultDiscoveryEvery = 5 * time.Minute
+	defaultUserAgent      = "kosh"
+)
+
+func (o Options) withDefaults() Options {
+	if o.Log == nil {
+		o.Log = slog.Default()
+	}
+	if o.IdleStop <= 0 {
+		o.IdleStop = defaultIdleStop
+	}
+	if o.TablePoll <= 0 {
+		o.TablePoll = defaultTablePoll
+	}
+	if o.DiscoveryEvery <= 0 {
+		o.DiscoveryEvery = defaultDiscoveryEvery
+	}
+	if o.Renderers == nil {
+		o.Renderers = render.For
+	}
+	if o.UserAgent == "" {
+		o.UserAgent = defaultUserAgent
+	}
+	return o
+}
+
+// newCluster makes a Cluster from clients, without connecting: what New
+// is made of, and what unit tests use with client-go's fakes. resources
+// is what discovery would have found; nil means it is read from disc,
+// which may be nil only when resources is not.
+func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interface, disc discovery.DiscoveryInterface, resources []Resource, opts Options) *Cluster {
+	opts = opts.withDefaults()
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Cluster{
+		cfg:    cfg,
+		typed:  typed,
+		dyn:    dyn,
+		log:    opts.Log,
+		opts:   opts,
+		disc:   disc,
+		zeroOf: render.Zero,
+		ctx:    ctx,
+		cancel: cancel,
+		caches: map[schema.GroupVersionResource]*kindCache{},
+	}
+	if resources == nil {
+		c.refresh(ctx)
+	} else {
+		rr := append([]Resource(nil), resources...)
+		sortResources(rr)
+		c.setResources(rr)
+	}
+	if disc != nil {
+		c.wg.Add(1)
+		go c.discoverEvery()
+	}
+	return c
+}
 
 // RESTConfig returns how to reach the API: from the kubeconfig at path,
 // or, when path is empty, from the ServiceAccount of the pod kosh runs
@@ -61,10 +158,11 @@ func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) 
 // Session returns the handle of one SSH session. Everything it opens
 // ends when ctx is done.
 func (c *Cluster) Session(ctx context.Context, grant keys.Grant) Session {
-	panic("not implemented")
+	return &session{c: c, ctx: ctx, grant: grant}
 }
 
 // Close stops every informer and everything else the Cluster runs.
 func (c *Cluster) Close() {
-	panic("not implemented")
+	c.cancel()
+	c.wg.Wait()
 }
