@@ -170,6 +170,11 @@ func TestResolvePrefersTypedThenCore(t *testing.T) {
 func TestResolveRediscoversOnceOnAMiss(t *testing.T) {
 	e := newEnv(t, envConfig{})
 	s := e.session(t)
+	// How often one discovery reads the groups.
+	n := e.disc.discoveries()
+	e.c.refresh(context.Background())
+	perDiscovery := e.disc.discoveries() - n
+
 	e.disc.addResources(&metav1.APIResourceList{GroupVersion: "late.example.com/v1", APIResources: []metav1.APIResource{
 		{Name: "latecomers", SingularName: "latecomer", Namespaced: true, Kind: "Latecomer", Verbs: allVerbs},
 	}})
@@ -186,8 +191,8 @@ func TestResolveRediscoversOnceOnAMiss(t *testing.T) {
 		t.Error("the new resource is not among the resources")
 	}
 	once := e.disc.discoveries()
-	if once == before {
-		t.Fatal("no discovery on a miss")
+	if once-before != perDiscovery {
+		t.Fatalf("a miss read the groups %d times, want %d: one discovery", once-before, perDiscovery)
 	}
 
 	for _, name := range []string{"nothing", "nothing-either"} {
