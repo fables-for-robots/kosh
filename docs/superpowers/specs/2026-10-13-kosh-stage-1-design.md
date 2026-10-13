@@ -351,7 +351,7 @@ most twice a second, and at least every 2 seconds so that ages move.
 **Where the logic comes from.** kosh's renderers are written for kosh;
 k9s's are the reference for what a column holds. Where kosh's code
 follows k9s's closely the file says so, and a `NOTICE` file credits k9s
-(Apache-2.0, which may be used in a program under LGPL-3.0).
+(Apache-2.0, which may be used in a program under the BSD licence).
 
 ## 10. The TUI
 
@@ -622,8 +622,8 @@ ClusterRole; kosh then shows the API's refusal wherever it lacks a right
 ## 16. Build, image and releases
 
 - **Module** `github.com/fables-for-robots/kosh`, packages at the top
-  level of the module, none under `internal/`. Licence LGPL-3.0-only, as
-  the siblings.
+  level of the module, none under `internal/`. Licence BSD-3-Clause
+  (LGPL-3.0-only, as the siblings, until the first release).
 - **Flake** as great-machine's: nixpkgs `nixos-26.05`, the program built
   by `draganm/gonixgo` without cgo, a development shell with Go, Helm,
   kind and kubectl. The kube-apiserver and etcd that the tests of §19
@@ -760,6 +760,52 @@ colours and a change of the window's size arrive as over TCP.
   metrics-server, xray, "used by", and what else of k9s is missed.
 
 Each gets a design of its own when its turn comes.
+
+## 23. What changed while it was built
+
+Sections 4 to 6, 8 and 16 were amended in place while stage 1 was built,
+and say what is built. What follows was decided after kosh first ran in a
+real cluster and was read as a whole; it adds to the sections named, and
+where it differs from them, this section is what is built. The plan's
+"Departures" and its ledger have the reasons.
+
+- **§4.2.** kosh's side does not start a QUIC key update early in a
+  connection (a defect of the iroh library with connections that use
+  several paths). The mDNS announcer joins only interfaces that have an
+  address it announces.
+- **§5.** A session channel takes `pty-req`, `shell`, `exec`,
+  `window-change` and a bounded amount of `env`, and refuses every other
+  request, agent forwarding among them. A key that leaves the list loses
+  its connections as well as its sessions.
+- **§6.** A full key's comment that holds `read-only`, `readonly`,
+  `read_only` or `read only` anywhere rejects its line.
+- **§8, §12.** The session refuses a query whose namespace is not a name
+  or whose resource discovery did not find, as it refuses such a
+  reference; no API path is built from an unchecked string. An action
+  ends with its session, and is refused once the session has ended.
+  AGE of a generic table sorts by the object's creation time.
+- **§10.** A dialog is laid over the whole screen and always shows its
+  buttons; on a screen too small for it the action is refused. An error
+  is wrapped onto up to four lines of the flash and stays until a key is
+  pressed. The header shows only whole columns of hints. The help lists
+  every key and scrolls sideways when it does not fit. `:kind all` and
+  `:kind -A` mean every namespace; a word that is no namespace's name is
+  refused. At most 32 views are open, and a view that is covered does
+  not read. The editor opens objects of up to 1,000 lines and 48 KiB,
+  and its text may grow to 64 KiB; other inputs take 1,024 characters.
+  A log view holds at most 5,000 lines and 16 MiB. Bidirectional
+  controls are cleaned like other control characters.
+- **§13.** A read that a read-only key is refused is logged like a
+  refused action. A connection that ends without having sent a byte is
+  logged at debug level. What libraries print through Go's standard
+  logger is part of the log, at warn level.
+- **§15.** The ClusterRoleBinding is named for the release and its role,
+  so that the role can be changed by an upgrade. The host network is
+  used only with iroh on.
+- **§16.** The image also holds `/licenses`. A release tag must be a
+  SemVer version.
+- **§18.** A stop tells the sessions before it closes what carries them,
+  on both transports; the whole stop takes 10 seconds at most.
 
 ## Appendix A: the columns
 
