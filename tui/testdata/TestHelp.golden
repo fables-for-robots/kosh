@@ -1,0 +1,30 @@
+Key:     alice@laptop   <esc> Back
+Cluster: v1.33.1
+kosh:    v0.1.0
+
+
+
+┌────────────────────────────────────────────── Help ──────────────────────────────────────────────┐
+│PODS                    GENERAL                                                                   │
+│<shift-n> Sort Name     <:>      Command                                                          │
+│<shift-a> Sort Age      </>      Filter                                                           │
+│<shift-s> Sort Status   <?>      Help                                                             │
+│<shift-o> Sort Column   <ctrl-a> Aliases                                                          │
+│<ctrl-w>  Wide          <ctrl-e> Toggle Header                                                    │
+│<ctrl-z>  Faults        <[>      History Back                                                     │
+│</>       Filter        <]>      History Forward                                                  │
+│<space>   Mark          <->      Last View                                                        │
+│<shift-j> Owner         <esc>    Back                                                             │
+│<?>       Help          <ctrl-c> Quit                                                             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <help>
+

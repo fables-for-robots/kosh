@@ -340,6 +340,9 @@ func TestBindings(t *testing.T) {
 	sess.SetTable(q, podsNamed("a", "b", "c"))
 	hs := newHarness(t, sess, 100, 30)
 	hs.wantFrame("<z> Zap", "<shift-z> Zap Hard")
+	hs.press("?")
+	hs.wantFrame("<z>", "Zap", "<shift-z>", "Zap Hard")
+	hs.press("esc")
 	if l := hs.line("<shift-z>"); strings.Index(l, "<shift-z>") > strings.Index(l, "<z>") && strings.Contains(l, "<z>") {
 		t.Errorf("the hints are not by Order: %q", l)
 	}
@@ -374,6 +377,9 @@ func TestBindings(t *testing.T) {
 	hs = newHarness(t, ro, 100, 30)
 	hs.wantFrame("<z> Zap")
 	hs.notFrame("Zap Hard")
+	hs.press("?")
+	hs.notFrame("Zap Hard")
+	hs.press("esc")
 	hs.press("Z")
 	if len(runs) != 0 {
 		t.Errorf("Z ran for a read-only key: %+v", runs)
