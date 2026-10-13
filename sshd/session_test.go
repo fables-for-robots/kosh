@@ -214,9 +214,11 @@ func TestReplaceDoesNotBlockOnSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Stalled: nothing more arrives for 200 ms, after more than the
-	// channel's window of 2 MB.
+	// channel's window of 2 MB. Drawing 2 MB of screens is work: with the
+	// race detector it takes seconds on a fast machine and more than the
+	// usual wait on a shared runner, so this wait is a long one.
 	last, since := cc.read.Load(), time.Now()
-	eventually(t, "the output to stall", func() bool {
+	eventuallyWithin(t, time.Minute, "the output to stall", func() bool {
 		if n := cc.read.Load(); n != last {
 			last, since = n, time.Now()
 		}

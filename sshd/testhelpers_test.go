@@ -33,10 +33,17 @@ const waitTime = 5 * time.Second
 // within waitTime.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(waitTime)
+	eventuallyWithin(t, waitTime, what, cond)
+}
+
+// eventuallyWithin is eventually with a wait of its own, for what takes
+// the machine real work and not only a turn of the scheduler.
+func eventuallyWithin(t *testing.T, wait time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(wait)
 	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("waited %v: %s", waitTime, what)
+			t.Fatalf("waited %v: %s", wait, what)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
