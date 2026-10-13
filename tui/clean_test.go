@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,9 +28,77 @@ func forbidden(s string) string {
 			return "DEL"
 		case r >= 0x80 && r <= 0x9f:
 			return "a C1 control character"
+		case slices.Contains(bidiControls, r):
+			return "a bidirectional control"
 		}
 	}
 	return ""
+}
+
+// bidiControls are the characters that change the order a terminal
+// draws text in.
+var bidiControls = []rune{
+	0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+	0x2066, 0x2067, 0x2068, 0x2069,
+	0x200e, 0x200f, 0x061c,
+}
+
+// A name from the cluster is drawn in its own order: no bidirectional
+// control passes clean.
+func TestCleanReplacesBidiControls(t *testing.T) {
+	for _, r := range bidiControls {
+		c := string(r)
+		for _, tt := range []struct{ in, want string }{
+			{c, "\ufffd"},
+			{"web-" + c + "1-dc", "web-\ufffd1-dc"},
+			{c + "cod.exe" + c + "txt", "\ufffdcod.exe\ufffdtxt"},
+			{"ab" + c + "\tx", "ab\ufffd     x"},
+		} {
+			got := clean(tt.in)
+			if got != tt.want {
+				t.Errorf("clean(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if f := forbidden(got); f != "" {
+				t.Errorf("clean(%q) = %q holds %s", tt.in, got, f)
+			}
+			if again := clean(got); again != got {
+				t.Errorf("clean is not idempotent on %q: %q, then %q", tt.in, got, again)
+			}
+			// What is drawn is as wide as fit measures it: a cell for
+			// every character.
+			n := utf8.RuneCountInString(strings.SplitN(got, "\n", 2)[0])
+			if w := ansi.StringWidth(got); w != n {
+				t.Errorf("clean(%q) = %q is %d cells wide, not %d", tt.in, got, w, n)
+			}
+			if fitted := fit(got, n); fitted != got {
+				t.Errorf("fit(%q, %d) = %q", got, n, fitted)
+			}
+		}
+	}
+	// Text without them is as it was: right-to-left letters, the joiner
+	// of emoji, and the characters next to the controls.
+	for _, in := range []string{"مرحبا", "שלום-web", "a\u200db", "a\u200cb", "a\u061bb", "a\u202fb", "a\u2070b", "a\u2065b", "名前"} {
+		if got := clean(in); got != in {
+			t.Errorf("clean(%q) = %q", in, got)
+		}
+	}
+	// A megabyte of them is cleaned in linear time.
+	const size = 1 << 20
+	for _, in := range []string{
+		strings.Repeat("\u202e", size/3),
+		strings.Repeat("\u2066a\t", size/5),
+		strings.Repeat("\u061c\u200f", size/4),
+	} {
+		start := time.Now()
+		out := clean(in)
+		fit(out, 200)
+		if d := time.Since(start); d > slowdown*time.Second {
+			t.Errorf("cleaning a megabyte of bidirectional controls took %v", d)
+		}
+		if f := forbidden(out); f != "" {
+			t.Errorf("a megabyte of bidirectional controls cleaned holds %s", f)
+		}
+	}
 }
 
 func TestClean(t *testing.T) {

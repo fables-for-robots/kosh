@@ -121,6 +121,31 @@ func logKeepLast[T any](s []T, n int) []T {
 	return s[:k]
 }
 
+// logBufferBytes is the most text a log view keeps, besides
+// kube.LogBufferLines lines: a line of the log is up to 64 KiB, and 5,000
+// of them would be 320 MB for one view.
+const logBufferBytes = 16 << 20
+
+// logSize is what l counts against logBufferBytes: its text and where it
+// is from.
+func logSize(l *logLine) int { return len(l.text) + len(l.src) }
+
+// logFit keeps the last of lines that the buffer holds, at most
+// kube.LogBufferLines of them and logBufferBytes, as logKeepLast does,
+// and returns their size.
+func logFit(lines []logLine) ([]logLine, int) {
+	n, size := 0, 0
+	for i := len(lines) - 1; i >= 0 && n < kube.LogBufferLines; i-- {
+		s := logSize(&lines[i])
+		if size+s > logBufferBytes {
+			break
+		}
+		size += s
+		n++
+	}
+	return logKeepLast(lines, n), size
+}
+
 // logCopyMax is the most c copies: the lines from the end that fit in
 // it.
 const logCopyMax = 1 << 20
@@ -205,6 +230,7 @@ type logView struct {
 	skipped int
 
 	lines []logLine
+	size  int   // of lines, by logSize
 	shown []int // the lines shown, as indexes of lines
 	// first is the pod and container the first line came from; multi
 	// is set once a line came from another one, and then each line shows
@@ -294,7 +320,8 @@ func (v *logView) Init() tea.Cmd { return v.read() }
 // read waits for the next lines of the stream, in a command: for the
 // first batch that comes, and then for every batch that comes until
 // every has passed since the last lines were taken. It holds no more
-// than the buffer would keep.
+// than twice what the buffer would keep, by count and by size, and
+// gives no more than the buffer keeps.
 func (v *logView) read() tea.Cmd {
 	if v.stream == nil || v.closed {
 		return nil
@@ -303,14 +330,19 @@ func (v *logView) read() tea.Cmd {
 	return waitCmd(func() tea.Msg {
 		lines := s.Lines()
 		var got []logLine
+		size := 0
 		take := func(b []kube.LogLine) {
-			got = append(got, logPrepare(b)...)
-			if len(got) > 2*kube.LogBufferLines {
-				got = logKeepLast(got, kube.LogBufferLines)
+			p := logPrepare(b)
+			for i := range p {
+				size += logSize(&p[i])
+			}
+			got = append(got, p...)
+			if len(got) > 2*kube.LogBufferLines || size > 2*logBufferBytes {
+				got, size = logFit(got)
 			}
 		}
 		msg := func(ended bool) tea.Msg {
-			got = logKeepLast(got, kube.LogBufferLines)
+			got, _ = logFit(got)
 			m := logReadMsg{id: id, gen: gen, lines: got, ended: ended, skipped: s.Skipped(), at: time.Now()}
 			if ended && s.Err() != nil {
 				m.err = cleanLine(s.Err().Error())
@@ -392,15 +424,23 @@ func (v *logView) Update(msg tea.Msg) (view, tea.Cmd) {
 	return v, nil
 }
 
-// add puts lines at the end of the buffer, and drops the oldest beyond
-// kube.LogBufferLines first, so that the buffer never holds more.
+// add puts lines at the end of the buffer, and drops the oldest first
+// until they fit in kube.LogBufferLines and logBufferBytes, so that the
+// buffer never holds more.
 func (v *logView) add(lines []logLine) {
-	if n := len(lines) - kube.LogBufferLines; n > 0 {
-		lines = lines[n:]
+	lines, size := logFit(lines)
+	n := max(len(v.lines)+len(lines)-kube.LogBufferLines, 0)
+	held := v.size
+	for i := range n {
+		held -= logSize(&v.lines[i])
 	}
-	v.drop(len(v.lines) + len(lines) - kube.LogBufferLines)
+	for ; n < len(v.lines) && held+size > logBufferBytes; n++ {
+		held -= logSize(&v.lines[n])
+	}
+	v.drop(n)
 	for _, l := range lines {
 		v.lines = append(v.lines, l)
+		v.size += logSize(&l)
 		if v.passes(&l) {
 			v.shown = append(v.shown, len(v.lines)-1)
 		}
@@ -420,6 +460,9 @@ func (v *logView) drop(n int) {
 		return
 	}
 	n = min(n, len(v.lines))
+	for i := range n {
+		v.size -= logSize(&v.lines[i])
+	}
 	v.lines = logKeepLast(v.lines, len(v.lines)-n)
 	d := 0
 	for d < len(v.shown) && v.shown[d] < n {
@@ -569,7 +612,7 @@ func (v *logView) key(k tea.KeyPressMsg) tea.Cmd {
 
 // clear empties the buffer.
 func (v *logView) clear() {
-	v.lines, v.shown, v.pos = nil, nil, logPos{}
+	v.lines, v.shown, v.pos, v.size = nil, nil, logPos{}, 0
 }
 
 // copy gives the clipboard the lines shown, as they are drawn but
