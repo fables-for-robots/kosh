@@ -35,6 +35,18 @@ func (s *session) maySee(ref ObjectRef) error {
 	return nil
 }
 
+// bound returns a context that ends when ctx ends or when the session
+// does, with errSessionEnded as its cause then, and the function that
+// releases it, which the caller defers.
+func (s *session) bound(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(s.ctx, func() { cancel(errSessionEnded) })
+	return ctx, func() {
+		stop()
+		cancel(nil)
+	}
+}
+
 func (s *session) Grant() keys.Grant { return s.grant }
 
 func (s *session) ClusterVersion() string { return s.c.version }

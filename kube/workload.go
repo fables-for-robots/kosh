@@ -13,6 +13,8 @@ import (
 // client and returns the containers of its pod template, init
 // containers first. Any other kind is an error.
 func (s *session) Images(ctx context.Context, ref ObjectRef) ([]ContainerImage, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return nil, err
 	}
@@ -53,6 +55,8 @@ func (s *session) Images(ctx context.Context, ref ObjectRef) ([]ContainerImage, 
 // Replicas returns spec.replicas of the scale subresource of a
 // deployment, statefulset or replicaset. Any other kind is an error.
 func (s *session) Replicas(ctx context.Context, ref ObjectRef) (int32, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return 0, err
 	}

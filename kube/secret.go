@@ -14,6 +14,8 @@ import (
 // whatever the grant; a read-only grant gets ErrReadOnly for a Secret,
 // before anything is read, and the refusal is logged.
 func (s *session) SecretData(ctx context.Context, ref ObjectRef) ([]SecretEntry, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return nil, err
 	}

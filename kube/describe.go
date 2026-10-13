@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -32,6 +35,8 @@ var errNoConfig = errors.New("describe needs a connection to the API server, and
 // their requests, not the describe as a whole, is bounded as
 // describeConfig says.
 func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}
@@ -70,10 +75,12 @@ func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
 // one, and cfg's own timeout when it has one. The timeout bounds each
 // request of the describe, not the describe as a whole, which may make
 // several. The describers take no context, so this is what bounds a
-// request that hangs.
+// request that hangs; and every request's transport ends it when ctx
+// ends, which ends the describe with the session.
 func describeConfig(ctx context.Context, cfg *rest.Config) *rest.Config {
 	own := cfg.Timeout
 	cfg = rest.CopyConfig(cfg)
+	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper { return ctxTransport{rt: rt, ctx: ctx} })
 	cfg.Timeout = describeTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		cfg.Timeout = min(cfg.Timeout, max(time.Until(deadline), time.Millisecond))
@@ -82,4 +89,44 @@ func describeConfig(ctx context.Context, cfg *rest.Config) *rest.Config {
 		cfg.Timeout = min(cfg.Timeout, own)
 	}
 	return cfg
+}
+
+// ctxTransport sends each request with a context that ends when the
+// request's own does or when ctx does, for clients that take none. The
+// response's body holds it until it is closed.
+type ctxTransport struct {
+	rt  http.RoundTripper
+	ctx context.Context
+}
+
+func (t ctxTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(t.ctx, cancel)
+	release := func() {
+		stop()
+		cancel()
+	}
+	resp, err := t.rt.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		release()
+		return nil, err
+	}
+	resp.Body = &releasingBody{ReadCloser: resp.Body, release: release}
+	return resp, nil
+}
+
+// releasingBody calls release once, when it is closed.
+type releasingBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (b *releasingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
 }

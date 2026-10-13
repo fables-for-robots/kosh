@@ -13,6 +13,8 @@ import (
 // first. ErrNoOwner when it has none; an error that names the kind when
 // the owner's kind is not a resource of the cluster.
 func (s *session) Owner(ctx context.Context, ref ObjectRef) (ObjectRef, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return ObjectRef{}, err
 	}

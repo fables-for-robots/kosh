@@ -19,6 +19,8 @@ import (
 // managedFields unless they are asked for. A Secret is refused to a
 // read-only grant before anything is read, and the refusal is logged.
 func (s *session) YAML(ctx context.Context, ref ObjectRef, managedFields bool) (string, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}

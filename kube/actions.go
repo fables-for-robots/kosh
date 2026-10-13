@@ -78,9 +78,11 @@ func (opts DeleteOptions) propagation() Propagation {
 }
 
 func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions) (err error) {
-	if err := s.begin(ctx, actDelete, ref); err != nil {
+	ctx, release, err := s.begin(ctx, actDelete, ref)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() {
 		logged := err
 		if ref.Resource.Is("", "secrets") {
@@ -112,9 +114,11 @@ func (s *session) delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 }
 
 func (s *session) Kill(ctx context.Context, pod ObjectRef) (err error) {
-	if err := s.begin(ctx, actKill, pod); err != nil {
+	ctx, release, err := s.begin(ctx, actKill, pod)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, actKill, pod, err) }()
 	if err := s.c.checkRef(pod); err != nil {
 		return err
@@ -126,9 +130,11 @@ func (s *session) Kill(ctx context.Context, pod ObjectRef) (err error) {
 }
 
 func (s *session) Update(ctx context.Context, ref ObjectRef, text string) (err error) {
-	if err := s.begin(ctx, actUpdate, ref); err != nil {
+	ctx, release, err := s.begin(ctx, actUpdate, ref)
+	if err != nil {
 		return err
 	}
+	defer release()
 	// The log gets what kind of error it was: its text may quote the edit.
 	defer func() { s.logAction(ctx, actUpdate, ref, loggableError(actUpdate, err)) }()
 	if err := s.c.checkRef(ref); err != nil {
@@ -226,9 +232,11 @@ type scaleClient interface {
 }
 
 func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) (err error) {
-	if err := s.begin(ctx, actScale, ref); err != nil {
+	ctx, release, err := s.begin(ctx, actScale, ref)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, actScale, ref, err, slog.Int("replicas", int(replicas))) }()
 	if err := s.c.checkRef(ref); err != nil {
 		return err
@@ -263,9 +271,11 @@ func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) (err
 const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
 
 func (s *session) Restart(ctx context.Context, ref ObjectRef) (err error) {
-	if err := s.begin(ctx, actRestart, ref); err != nil {
+	ctx, release, err := s.begin(ctx, actRestart, ref)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, actRestart, ref, err) }()
 	if err := s.c.checkRef(ref); err != nil {
 		return err
@@ -298,9 +308,11 @@ func (s *session) patchTemplate(ctx context.Context, ref ObjectRef, resourceVers
 }
 
 func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[string]string) (err error) {
-	if err := s.begin(ctx, actSetImages, ref); err != nil {
+	ctx, release, err := s.begin(ctx, actSetImages, ref)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, actSetImages, ref, err, slog.Any("images", imagePairs(images))) }()
 	if err := s.c.checkRef(ref); err != nil {
 		return err
@@ -357,9 +369,11 @@ func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[strin
 }
 
 func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error) {
-	if err := s.begin(ctx, actRollback, replicaSet); err != nil {
+	ctx, release, err := s.begin(ctx, actRollback, replicaSet)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, actRollback, replicaSet, err) }()
 	if err := s.c.checkRef(replicaSet); err != nil {
 		return err
@@ -416,9 +430,11 @@ const rollbackSkipped = "skipped rollback"
 const revisionAnnotation = "deployment.kubernetes.io/revision"
 
 func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (job string, err error) {
-	if err := s.begin(ctx, actTrigger, cronJob); err != nil {
+	ctx, release, err := s.begin(ctx, actTrigger, cronJob)
+	if err != nil {
 		return "", err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, actTrigger, cronJob, err, slog.String("job", job)) }()
 	if err := s.c.checkRef(cronJob); err != nil {
 		return "", err
@@ -479,9 +495,11 @@ func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended
 	if suspended {
 		action = actSuspend
 	}
-	if err := s.begin(ctx, action, cronJob); err != nil {
+	ctx, release, err := s.begin(ctx, action, cronJob)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, action, cronJob, err) }()
 	if err := s.c.checkRef(cronJob); err != nil {
 		return err
