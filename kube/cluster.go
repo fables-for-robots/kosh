@@ -176,6 +176,7 @@ func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) 
 	opts = opts.withDefaults()
 	cfg = rest.CopyConfig(cfg)
 	cfg.UserAgent = opts.UserAgent
+	quietWarnings(cfg, opts.Log)
 	// An interactive tool, not a controller.
 	cfg.QPS = 50
 	cfg.Burst = 100
