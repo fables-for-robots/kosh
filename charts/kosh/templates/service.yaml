@@ -1,0 +1,30 @@
+{{- if .Values.ssh.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kosh.fullname" . }}
+  labels:
+    {{- include "kosh.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if or (eq .Values.service.type "LoadBalancer") (eq .Values.service.type "NodePort") }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  ports:
+    - name: ssh
+      port: {{ .Values.service.port }}
+      targetPort: ssh
+      protocol: TCP
+  selector:
+    {{- include "kosh.selectorLabels" . | nindent 4 }}
+{{- end }}

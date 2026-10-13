@@ -1,0 +1,129 @@
+name: Release
+
+# A tag v* is a release: the image is built by Nix on a runner of each
+# platform and pushed to ghcr.io under the tag and the platform, the two
+# are joined under the tag, and then the chart is pushed with the tag as
+# its version, naming that image.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/fables-for-robots/kosh
+
+jobs:
+  # A tag v* that is not a version would get the images pushed before
+  # Helm refused it as the chart's version: nothing is published for it.
+  # The pattern is SemVer's for a version without build metadata: no
+  # leading zero in a number, no empty identifier in the pre-release.
+  validate:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: The tag is a version
+        run: |
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$TAG" =~ $re ]]; then
+            echo "::error::'$TAG' is not a release tag: a release tag is v and a SemVer version without build metadata, as v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+        env:
+          TAG: ${{ github.ref_name }}
+
+  image:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      # The flake takes the version from the environment, which Nix reads
+      # with --impure alone. gonixgo runs a program while Nix evaluates,
+      # which Nix allows only when asked.
+      - name: Build the image
+        run: |
+          nix build .#image --impure \
+            --option allow-unsafe-native-code-during-evaluation true
+        env:
+          KOSH_VERSION: ${{ github.ref_name }}
+      # Nix names the image $IMAGE:nix. It passes the checks of every
+      # push, and says the tag it was built as, before it is pushed.
+      - name: Test the image
+        run: |
+          docker load < result
+          scripts/test-image.sh "$IMAGE:nix" "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+      # The registry's token is written to disk only now, after the build,
+      # in which gonixgo runs a program outside Nix's sandbox.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the image
+        run: |
+          docker tag "$IMAGE:nix" "$IMAGE:$TAG-$ARCH"
+          docker push "$IMAGE:$TAG-$ARCH"
+        env:
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+
+  manifest:
+    runs-on: ubuntu-24.04
+    needs: [validate, image]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch manifest
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$TAG" \
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+
+  # The chart's version is the tag without its v, and its appVersion, the
+  # image tag it deploys, is the tag: it is pushed once that image is
+  # there.
+  chart:
+    runs-on: ubuntu-24.04
+    needs: [validate, manifest]
+    defaults:
+      run:
+        shell: nix develop .#bare --command bash -e {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      # The registry's token is given only to the step that logs in and
+      # pushes.
+      - name: Package the chart
+        run: helm package charts/kosh --version "${TAG#v}" --app-version "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+      - name: Push the chart
+        run: |
+          echo "$TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          helm push "kosh-${TAG#v}.tgz" oci://ghcr.io/fables-for-robots/charts
+        env:
+          TAG: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,30 @@
+Key:     alice@laptop   <esc> Back
+Cluster: v1.33.1
+kosh:    v0.1.0
+
+
+
+┌────────────────────────────────────────────── Help ──────────────────────────────────────────────┐
+│PODS                                                         GENERAL                              │
+│<j/down>        Down          <enter>  Go Into               <:>      Command                     │
+│<k/up>          Up            <ctrl-r> Read Again            </>      Filter                      │
+│<ctrl-f/pgdown> Page Down     <esc>    Clear Filter / Back   <?>      Help                        │
+│<ctrl-b/pgup>   Page Up       <0-9>    Namespace Shortcut    <ctrl-a> Aliases                     │
+│<g/home>        Top           <d>      Describe              <ctrl-e> Toggle Header               │
+│<shift-g/end>   Bottom        <y>      YAML                  <[>      History Back                │
+│<left/right>    Column        <l>      Logs                  <]>      History Forward             │
+│<shift-n>       Sort Name     <p>      Logs Previous         <->      Last View                   │
+│<shift-a>       Sort Age      <ctrl-d> Delete                <esc>    Back                        │
+│<shift-s>       Sort Status   <e>      Edit                  <ctrl-c> Quit                        │
+│<shift-o>       Sort Column   <ctrl-k> Kill                                                       │
+│<ctrl-w>        Wide                                                                              │
+│<ctrl-z>        Faults                                                                            │
+│</>             Filter                                                                            │
+│<space>         Mark                                                                              │
+│<shift-j>       Owner                                                                             │
+│<?>             Help                                                                              │
+│<ctrl-space>    Mark Range                                                                        │
+│<ctrl-\>        Clear Marks                                                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <help>
+

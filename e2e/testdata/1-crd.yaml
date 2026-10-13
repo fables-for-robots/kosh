@@ -1,0 +1,30 @@
+# A custom resource, for kosh to show with the columns the API server's
+# table has for it. Applied, and waited for, before 2-objects.yaml.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.e2e.kosh.test
+spec:
+  group: e2e.kosh.test
+  scope: Namespaced
+  names:
+    plural: widgets
+    singular: widget
+    kind: Widget
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                color:
+                  type: string
+      additionalPrinterColumns:
+        - name: Color
+          type: string
+          jsonPath: .spec.color

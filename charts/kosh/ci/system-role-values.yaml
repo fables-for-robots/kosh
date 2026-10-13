@@ -1,0 +1,4 @@
+state:
+  existingSecret: kosh-state
+rbac:
+  clusterRole: system:aggregate-to-view

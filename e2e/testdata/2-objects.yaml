@@ -1,0 +1,62 @@
+# What the end-to-end tests look at, in the namespace default. The
+# images are pulled into the kind node by scripts/test-e2e.sh before
+# this is applied, so that nothing is pulled while the tests run; both
+# are Kubernetes' own, from registry.k8s.io, which has no pull limit as
+# Docker Hub has and answered where Docker Hub timed out.
+
+# marker prints a numbered line every second, for the tests of the logs.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: marker
+  namespace: default
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: marker
+      image: registry.k8s.io/e2e-test-images/busybox:1.37.0-2@sha256:690925c6f3493b235eb590113f8c481564dcd4f1962cf7d5b321f185980721ef
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - 'i=0; while true; do echo "kosh-e2e-marker $i"; i=$((i+1)); sleep 1; done'
+---
+# web is scaled and its pod killed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          imagePullPolicy: IfNotPresent
+---
+# hidden holds a value no read-only key may see.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hidden
+  namespace: default
+type: Opaque
+stringData:
+  password: kosh-e2e-secret-value
+---
+apiVersion: e2e.kosh.test/v1
+kind: Widget
+metadata:
+  name: gizmo
+  namespace: default
+spec:
+  color: teal

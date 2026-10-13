@@ -1,0 +1,5 @@
+state:
+  existingSecret: kosh-state
+iroh:
+  hostNetwork: true
+  port: 4436

@@ -90,8 +90,10 @@ stream and SSH runs in it.
   most, and gives it to the SSH server as a connection
   (`Conn.AcceptStreamConn`, then `Server.HandleConn`). The SSH client
   speaks first, which is what makes the stream visible to kosh.
-- When the SSH connection ends kosh closes the iroh connection. Further
-  streams of the same connection are not accepted.
+- When the SSH connection ends kosh closes the iroh connection, after
+  giving the client up to 2 seconds to close it first, so that the last
+  bytes are not cut off. Further streams of the same connection are not
+  accepted.
 - `--iroh=false` switches this transport off. With both transports off
   kosh refuses to start.
 
@@ -104,7 +106,14 @@ two ways, each with a flag that is on by default:
   reachable from anywhere, through a relay or directly when a path can
   be made.
 - `--iroh-mdns`: mDNS on the local network, under `_irohv1._udp.local.`,
-  the service name `iroh-ssh` asks for.
+  the service name `iroh-ssh` asks for, by an announcer of kosh's own:
+  the one go-iroh has is not found by `iroh-ssh` (§20). Of `iroh-ssh`,
+  only a build from its repository looks anything up by mDNS at the
+  time of writing; the released 0.2.12 does not.
+
+Neither announces the address of a tunnel: only addresses of interfaces
+that are up, broadcast, multicast and not point-to-point. A tunnel's
+address in an announcement was seen to make connections time out.
 
 With `--iroh` on, at least one of the two has to be on. kosh does not
 publish to the mainline DHT.
@@ -121,9 +130,12 @@ dependency tree kosh has no other use for.
 
 ## 5. The SSH server
 
-The server is `charm.land/wish/v2` over `charm.land/ssh`, with wish's
-Bubble Tea middleware: one Bubble Tea v2 program per session, on the
-session's terminal, in kosh's process.
+The server is `charm.land/wish/v2` over `charm.land/ssh`: one Bubble
+Tea v2 program per session, on the session's terminal, in kosh's
+process. kosh runs the program itself, with the options wish makes for a
+session, and not through wish's Bubble Tea middleware: the middleware
+drops the program's error, which is how a panic is known, and leaves the
+program listening for the process's signals.
 
 - **Authentication** is by public key and nothing else. A key is
   accepted when the key list holds it at that moment. The user name is
@@ -141,7 +153,20 @@ session's terminal, in kosh's process.
 - **Keepalive.** kosh sends an SSH keepalive request on every connection
   every 30 seconds. After three in a row without an answer it closes the
   connection, and with it the sessions and what they had open.
-- **No idle limit.** A session that only shows a log may stay.
+- **A connection without a session is closed** after 5 seconds, counted
+  from its authentication and from the end of its last session. A client
+  of `iroh-ssh` that exits often sends no close, and the connection
+  would otherwise linger until QUIC's idle timeout.
+- **A key may have 16 connections open at once, and a connection 10
+  session channels.** More are refused. The handshake's limit bounds
+  peers that have not authenticated; these two bound what one key, a
+  read-only one included, can make kosh hold: every channel lets its
+  client send two megabytes that nothing reads.
+- **Twenty tries to authenticate**, not the library's six: `iroh-ssh`
+  lets `ssh` offer every key of the user's agent before the one it was
+  given.
+- **No idle limit for a session.** A session that only shows a log may
+  stay.
 
 ## 6. The key list
 
@@ -164,7 +189,14 @@ read-only ssh-ed25519 AAAAC3Nza...  guest@laptop
   it has none.
 - **A key that is listed twice** is read-only if any of its lines says
   so, and has the name of its first line.
-- Every key type `golang.org/x/crypto/ssh` reads is accepted.
+- **A comment that holds `read-only`** (or `readonly`, `read_only`,
+  `read only`, anywhere, in any case, whatever dash or invisible
+  character it is written with) rejects a line without the option:
+  `ssh-ed25519 AAAA… read-only guest` is how a read-only key is written
+  wrongly, and as the format stands it would be a full key.
+- Every key type `golang.org/x/crypto/ssh` reads is accepted, **except
+  certificates**: kosh checks no certificate's validity, principals or
+  authority, so a line that holds one is rejected.
 
 **Reloading.** kosh reads the file again every 2 seconds and takes it
 over when its content has changed. That follows the way a ConfigMap is
@@ -221,7 +253,9 @@ kosh reads the cluster in four ways.
 ### 8.1 Informers, for the typed kinds
 
 Each typed kind has one informer for the whole cluster and the whole
-process: client-go's typed shared informers.
+process: a shared informer over client-go's dynamic client, which turns
+each object into its typed form as it stores it. One informer per kind,
+and not a factory of typed ones, is what lets a single kind be stopped.
 
 - An informer is started the first time a session opens its kind, and
   all sessions share it. That is sound because all sessions have the
@@ -317,7 +351,7 @@ most twice a second, and at least every 2 seconds so that ages move.
 **Where the logic comes from.** kosh's renderers are written for kosh;
 k9s's are the reference for what a column holds. Where kosh's code
 follows k9s's closely the file says so, and a `NOTICE` file credits k9s
-(Apache-2.0, which may be used in a program under LGPL-3.0).
+(Apache-2.0, which may be used in a program under the BSD licence).
 
 ## 10. The TUI
 
@@ -588,12 +622,14 @@ ClusterRole; kosh then shows the API's refusal wherever it lacks a right
 ## 16. Build, image and releases
 
 - **Module** `github.com/fables-for-robots/kosh`, packages at the top
-  level of the module, none under `internal/`. Licence LGPL-3.0-only, as
-  the siblings.
+  level of the module, none under `internal/`. Licence BSD-3-Clause
+  (LGPL-3.0-only, as the siblings, until the first release).
 - **Flake** as great-machine's: nixpkgs `nixos-26.05`, the program built
   by `draganm/gonixgo` without cgo, a development shell with Go, Helm,
-  kind, kubectl, and the kube-apiserver and etcd that the tests of §19
-  start. `.envrc` with `use flake`.
+  kind and kubectl. The kube-apiserver and etcd that the tests of §19
+  start are not in the shell: `scripts/envtest-assets.sh` fetches them
+  on first use, the same ones on Linux and on a Mac, where nixpkgs has
+  no kube-apiserver. `.envrc` with `use flake`.
 - **Image** `ghcr.io/fables-for-robots/kosh`, built by Nix: the program,
   the CA certificates (the relays and number0's DNS are reached over
   HTTPS), and a `passwd` with the user it runs as. No shell and no other
@@ -666,6 +702,13 @@ Linux machine by hand. Those over the relays need the internet.
 
 ## 20. Settled first
 
+*What the probe found is in the plan's
+[`task-00-probe.md`](../plans/2026-10-13-kosh-stage-1/task-00-probe.md):
+the relay path holds, a Bubble Tea program runs over the stream as over
+TCP, and go-iroh's mDNS is not found by `iroh-ssh`, so `irohnet`
+announces by itself. §4.2 and §5 above say what followed from it. The
+section below is as it was written before the probe.*
+
 Two things this design rests on have not been tried. The plan's first
 task tries them with a throwaway program, before anything of kosh is
 built, and the plan records what it found.
@@ -717,6 +760,52 @@ colours and a change of the window's size arrive as over TCP.
   metrics-server, xray, "used by", and what else of k9s is missed.
 
 Each gets a design of its own when its turn comes.
+
+## 23. What changed while it was built
+
+Sections 4 to 6, 8 and 16 were amended in place while stage 1 was built,
+and say what is built. What follows was decided after kosh first ran in a
+real cluster and was read as a whole; it adds to the sections named, and
+where it differs from them, this section is what is built. The plan's
+"Departures" and its ledger have the reasons.
+
+- **§4.2.** kosh's side does not start a QUIC key update early in a
+  connection (a defect of the iroh library with connections that use
+  several paths). The mDNS announcer joins only interfaces that have an
+  address it announces.
+- **§5.** A session channel takes `pty-req`, `shell`, `exec`,
+  `window-change` and a bounded amount of `env`, and refuses every other
+  request, agent forwarding among them. A key that leaves the list loses
+  its connections as well as its sessions.
+- **§6.** A full key's comment that holds `read-only`, `readonly`,
+  `read_only` or `read only` anywhere rejects its line.
+- **§8, §12.** The session refuses a query whose namespace is not a name
+  or whose resource discovery did not find, as it refuses such a
+  reference; no API path is built from an unchecked string. An action
+  ends with its session, and is refused once the session has ended.
+  AGE of a generic table sorts by the object's creation time.
+- **§10.** A dialog is laid over the whole screen and always shows its
+  buttons; on a screen too small for it the action is refused. An error
+  is wrapped onto up to four lines of the flash and stays until a key is
+  pressed. The header shows only whole columns of hints. The help lists
+  every key and scrolls sideways when it does not fit. `:kind all` and
+  `:kind -A` mean every namespace; a word that is no namespace's name is
+  refused. At most 32 views are open, and a view that is covered does
+  not read. The editor opens objects of up to 1,000 lines and 48 KiB,
+  and its text may grow to 64 KiB; other inputs take 1,024 characters.
+  A log view holds at most 5,000 lines and 16 MiB. Bidirectional
+  controls are cleaned like other control characters.
+- **§13.** A read that a read-only key is refused is logged like a
+  refused action. A connection that ends without having sent a byte is
+  logged at debug level. What libraries print through Go's standard
+  logger is part of the log, at warn level.
+- **§15.** The ClusterRoleBinding is named for the release and its role,
+  so that the role can be changed by an upgrade. The host network is
+  used only with iroh on.
+- **§16.** The image also holds `/licenses`. A release tag must be a
+  SemVer version.
+- **§18.** A stop tells the sessions before it closes what carries them,
+  on both transports; the whole stop takes 10 seconds at most.
 
 ## Appendix A: the columns
 

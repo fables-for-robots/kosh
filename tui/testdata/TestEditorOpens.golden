@@ -1,0 +1,30 @@
+Key:     alice@laptop   <ctrl-s> Save
+Cluster: v1.33.1        <esc> Back
+kosh:    v0.1.0
+
+
+
+┌────────────────────────────────── Edit(configmaps/default/cfg) ──────────────────────────────────┐
+│    1 apiVersion: v1                                                                              │
+│    2 data:                                                                                       │
+│    3   greeting: hello                                                                           │
+│    4 kind: ConfigMap                                                                             │
+│    5 metadata:                                                                                   │
+│    6   name: cfg                                                                                 │
+│    7   namespace: default                                                                        │
+│    8                                                                                             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<configmaps> <edit>
+

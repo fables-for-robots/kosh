@@ -1,0 +1,35 @@
+kosh {{ .Chart.AppVersion }} is installed as {{ include "kosh.fullname" . }}.
+
+Its endpoint ID:
+
+  kubectl --namespace {{ .Release.Namespace }} logs deploy/{{ include "kosh.fullname" . }} | head
+  kosh id --state-dir DIR     (on the state directory, or the Secret's files)
+
+Connect:
+{{- if .Values.ssh.enabled }}
+{{- if eq .Values.service.type "LoadBalancer" }}
+
+  ssh -t <address of the load balancer>{{ if ne (int .Values.service.port) 22 }} -p {{ .Values.service.port }}{{ end }}
+  kubectl --namespace {{ .Release.Namespace }} get service {{ include "kosh.fullname" . }}
+{{- else if eq .Values.service.type "NodePort" }}
+
+  ssh -t -p <node port> <address of a node>
+  kubectl --namespace {{ .Release.Namespace }} get service {{ include "kosh.fullname" . }}
+{{- else }}
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward service/{{ include "kosh.fullname" . }} 2222:{{ .Values.service.port }}
+  ssh -t -p 2222 localhost
+{{- end }}
+{{- end }}
+{{- if .Values.iroh.enabled }}
+
+  iroh-ssh kosh@<endpoint ID>
+{{- end }}
+{{- if and .Values.iroh.enabled .Values.iroh.hostNetwork .Values.ssh.enabled }}
+
+iroh.hostNetwork puts the pod on the node's network: SSH listens on port {{ .Values.ssh.port }} of every address of the node, whatever service.type is.
+{{- end }}
+
+authorizedKeys is the list of who may connect; a key with the option
+read-only is read-only. A full key is as powerful as the ClusterRole
+{{ .Values.rbac.clusterRole }}.

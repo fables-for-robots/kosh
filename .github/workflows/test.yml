@@ -1,0 +1,86 @@
+name: Test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  # The Go module, with the Go that go.mod names. The tests that start an
+  # API server get kube-apiserver and etcd from scripts/envtest-assets.sh,
+  # which fetches them on first use.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: |
+          go vet ./...
+          # The end-to-end tests are built only with their tag.
+          go vet -tags e2e ./e2e/
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: test
+        run: KUBEBUILDER_ASSETS="$(scripts/envtest-assets.sh)" go test -race ./...
+
+  # The Helm chart: lint, render, schemas and refusals, with the helm,
+  # kubeconform and yq of the flake's bare shell.
+  chart:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: nix develop .#bare --command bash -e {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: chart
+        run: scripts/test-chart.sh
+
+  # The program and the image as a release builds them. gonixgo runs a
+  # program while Nix evaluates, which Nix allows only when asked.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: nix build
+        run: |
+          nix build --option allow-unsafe-native-code-during-evaluation true
+          ./result/bin/kosh version
+      - name: image
+        run: |
+          nix build .#image --option allow-unsafe-native-code-during-evaluation true
+          docker load < result
+          # Without KOSH_VERSION the flake names the build by its commit:
+          # its first seven characters, which is what Nix's shortRev is.
+          scripts/test-image.sh ghcr.io/fables-for-robots/kosh:nix "$(git rev-parse HEAD | cut -c1-7)"
+
+  # kosh as its users meet it: the image in a kind cluster, installed with
+  # the chart, reached with ssh and with iroh-ssh over the relays; then
+  # kosh as a process, found by iroh-ssh through mDNS alone. Both scripts
+  # run themselves in the bare shell, and build what they need.
+  e2e:
+    needs: nix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: end to end
+        run: scripts/test-e2e.sh
+      - name: mDNS
+        # Needs neither the image nor the chart: it says what it says
+        # whatever the step before found.
+        if: ${{ !cancelled() }}
+        run: scripts/test-mdns.sh
