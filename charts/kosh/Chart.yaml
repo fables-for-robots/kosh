@@ -2,9 +2,10 @@ apiVersion: v2
 name: kosh
 description: kosh serves a terminal UI for the cluster it runs in, over SSH and over iroh, to whoever holds an accepted key.
 type: application
-# A release sets both of these.
-version: 0.0.0
-appVersion: "0.0.0"
+# A release sets both of these from its tag: the chart's version without
+# the v, and the image's tag with it.
+version: 0.1.0
+appVersion: "v0.1.0"
 home: https://github.com/fables-for-robots/kosh
 sources:
   - https://github.com/fables-for-robots/kosh

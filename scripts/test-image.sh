@@ -70,7 +70,7 @@ echo "== contents"
 image_files=(
   bin bin/kosh
   etc etc/group etc/passwd etc/kosh etc/ssl etc/ssl/certs etc/ssl/certs/ca-certificates.crt
-  licenses licenses/LICENSE licenses/COPYING licenses/NOTICE licenses/Apache-2.0.txt
+  licenses licenses/LICENSE licenses/NOTICE licenses/Apache-2.0.txt
   tmp var var/lib var/lib/kosh
 )
 # What Docker adds to the file system of every container, whatever its

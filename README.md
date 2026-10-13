@@ -50,7 +50,7 @@ the same whatever happens to the pod:
 ```sh
 mkdir kosh-state
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/kosh-state:/state" \
-  ghcr.io/fables-for-robots/kosh:VERSION id --state-dir /state
+  ghcr.io/fables-for-robots/kosh:v0.1.0 id --state-dir /state
 kubectl create namespace kosh
 kubectl --namespace kosh create secret generic kosh-state --from-file=kosh-state
 ```
@@ -68,15 +68,16 @@ Then install the chart, with the list of keys that may connect
 (`authorized_keys` below, in the format of [Keys](#keys)):
 
 ```sh
-helm install kosh ./charts/kosh --namespace kosh \
-  --set image.tag=VERSION \
+helm install kosh oci://ghcr.io/fables-for-robots/charts/kosh --version 0.1.0 \
+  --namespace kosh \
   --set state.existingSecret=kosh-state \
   --set-file authorizedKeys=authorized_keys
 ```
 
-A release publishes the image as `ghcr.io/fables-for-robots/kosh` and the
-chart as `oci://ghcr.io/fables-for-robots/charts/kosh`, both with the
-release's tag as their version.
+A release publishes the image as `ghcr.io/fables-for-robots/kosh:vX.Y.Z`
+and the chart as `oci://ghcr.io/fables-for-robots/charts/kosh` in version
+`X.Y.Z`; the chart runs the image of its own release unless `image.tag`
+says otherwise. From a checkout, `./charts/kosh` installs the same way.
 
 kosh also logs its endpoint ID, once it serves:
 
@@ -131,8 +132,9 @@ network, without the relays, when kosh runs on the host's network
 (`--set iroh.hostNetwork=true`). That puts the pod on the node's network:
 the SSH port then listens on every address of the node, whatever
 `service.type` is, and the pod is outside every NetworkPolicy. kosh was
-seen on the host network of a kind node, found by mDNS from the same
-network and reached through the relays.
+seen on the host network of a kind node: found by mDNS from the same
+network, and, with the relays on, found through its published record
+and reached directly.
 
 ## Keys
 
@@ -294,7 +296,6 @@ the plan of the first stage in [`docs/superpowers/plans/`](docs/superpowers/plan
 
 ## Licence
 
-kosh is free software under the GNU Lesser General Public License,
-version 3 only (`LGPL-3.0-only`); see [`LICENSE`](LICENSE) and
-[`COPYING`](COPYING). Its UI follows k9s, by the Authors of K9s, under
+kosh is free software under the BSD 3-Clause License (`BSD-3-Clause`);
+see [`LICENSE`](LICENSE). Its UI follows k9s, by the Authors of K9s, under
 the Apache License 2.0; [`NOTICE`](NOTICE) says where.

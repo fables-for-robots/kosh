@@ -1,5 +1,4 @@
-kosh is free software under the GNU Lesser General Public License,
-version 3 only. See LICENSE and COPYING.
+kosh is free software under the BSD 3-Clause License. See LICENSE.
 
 kosh's terminal UI behaves like k9s (https://github.com/derailed/k9s),
 and the columns of its tables, what their cells hold and what makes a

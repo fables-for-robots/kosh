@@ -88,7 +88,7 @@
             CGO_ENABLED = 0;
             ldflags =
               [ "-X github.com/fables-for-robots/kosh/cli.Version=${version}" ];
-            meta.license = pkgs.lib.licenses.lgpl3Only;
+            meta.license = pkgs.lib.licenses.bsd3;
           };
         in {
           default = kosh;
@@ -129,10 +129,9 @@
               # from: both ask that their text go with the program.
               mkdir licenses
               cp ${./LICENSE} licenses/LICENSE
-              cp ${./COPYING} licenses/COPYING
               cp ${./NOTICE} licenses/NOTICE
               cp ${./LICENSES/Apache-2.0.txt} licenses/Apache-2.0.txt
-              chmod 0444 licenses/LICENSE licenses/COPYING licenses/NOTICE licenses/Apache-2.0.txt
+              chmod 0444 licenses/LICENSE licenses/NOTICE licenses/Apache-2.0.txt
 
               # The user kosh runs as, which the chart's securityContext
               # names by its number.
@@ -150,6 +149,17 @@
               Entrypoint = [ "/bin/kosh" ];
               User = "65532:65532";
               Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" ];
+              # What a registry shows of the image, and what ties the
+              # package on ghcr.io to its repository.
+              Labels = {
+                "org.opencontainers.image.title" = "kosh";
+                "org.opencontainers.image.description" =
+                  "A terminal UI for the Kubernetes cluster it runs in, over SSH and over iroh";
+                "org.opencontainers.image.source" =
+                  "https://github.com/fables-for-robots/kosh";
+                "org.opencontainers.image.licenses" = "BSD-3-Clause";
+                "org.opencontainers.image.version" = version;
+              };
             };
           };
         });
