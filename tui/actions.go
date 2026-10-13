@@ -35,9 +35,20 @@ type actionDo func(ctx context.Context, ref kube.ObjectRef) (note string, err er
 // actionRunFunc is a binding's Run.
 type actionRunFunc = func(e env, q kube.Query, refs []kube.ObjectRef) tea.Cmd
 
-// actionsRunning holds the sessions that have an action running. A
-// session is in it from the confirmation of an action until its last
-// call has returned.
+// actionsRunning holds the sessions that have an action running, or a
+// read before an action's dialog or the editor. A session is in it from
+// the confirmation of an action until its last call has returned, and
+// from the key of a read until what it read has opened or the read has
+// failed.
+//
+// It is keyed by the kube.Session value, and relies on each SSH session
+// having a Session value of its own that is comparable: the real one is
+// a pointer made for each session, and kubetest's is a pointer too. Two
+// sessions that shared a value would hold up each other's actions; a
+// value that is not comparable would make the map panic. An entry that
+// leaks, as when the program ends between the Update that adds it and
+// the command that removes it, costs one map entry for as long as the
+// process runs, and nothing else: no session uses that value again.
 var actionsRunning = struct {
 	sync.Mutex
 	m map[kube.Session]bool
@@ -127,8 +138,8 @@ func actionAsk(e env, refs []kube.ObjectRef, w actionWords, timeout time.Duratio
 
 // actionStart starts an action over refs: it marks the session as
 // running one, and returns the command that calls do for each row, one
-// after the other, each with a context of timeout (none when it is
-// zero), and then says what came of it and has the table read again.
+// after the other, each with a context of timeout, and then says what
+// came of it and has the table read again.
 // When an action of the session is running already, it says so instead.
 func actionStart(e env, refs []kube.ObjectRef, done string, timeout time.Duration, do actionDo) tea.Cmd {
 	if !actionBegin(e.sess) {
@@ -157,15 +168,46 @@ func actionStart(e env, refs []kube.ObjectRef, done string, timeout time.Duratio
 	})
 }
 
-// actionCall calls fn with a context of timeout, or without a deadline
-// when timeout is zero.
+// actionCall calls fn with a context of timeout.
 func actionCall(timeout time.Duration, fn func(ctx context.Context) (string, error)) (string, error) {
-	ctx, cancel := context.Background(), context.CancelFunc(func() {})
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return fn(ctx)
+}
+
+// actionRead starts the read before an action's dialog or the editor. It
+// holds the session's keys of actions as an action does, and returns the
+// command that calls read with a context of apiTimeout. read returns the
+// message that opens what it read, which calls opened from its Init to
+// free the keys; or an error, which is flashed and frees them at once.
+// When an action of the session is running already, it says so instead.
+func actionRead(e env, read func(ctx context.Context, opened func()) (tea.Msg, error)) tea.Cmd {
+	if !actionBegin(e.sess) {
+		return flash(actionTextBusy)
+	}
+	sess := e.sess
+	var once sync.Once
+	opened := func() { once.Do(func() { actionEnd(sess) }) }
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		msg, err := read(ctx, opened)
+		if err != nil {
+			opened()
+			return flashMsg{text: err.Error(), err: true}
+		}
+		return msg
+	}
+}
+
+// actionFirstOf is what a dialog or the editor that is for the first of
+// several marked rows adds to its question or title: " (the first of 3
+// marked)", or nothing for one row.
+func actionFirstOf(refs []kube.ObjectRef) string {
+	if len(refs) < 2 {
+		return ""
+	}
+	return fmt.Sprintf(" (the first of %d marked)", len(refs))
 }
 
 // actionOutcome is the flash of an action over refs, of which ok

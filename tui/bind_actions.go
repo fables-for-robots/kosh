@@ -132,18 +132,16 @@ func actionDelete(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 }
 
 // actionScale reads the replicas of the first row in a command, and then
-// asks for the number to scale the rows to.
+// asks for the number to scale every row to.
 func actionScale(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 	sess := e.sess
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
-		defer cancel()
+	return actionRead(e, func(ctx context.Context, opened func()) (tea.Msg, error) {
 		n, err := sess.Replicas(ctx, refs[0])
 		if err != nil {
-			return flashMsg{text: err.Error(), err: true}
+			return nil, err
 		}
 		field := formNumberField("Replicas", strconv.Itoa(int(n)), false)
-		return openDialogMsg{dialogForm(actionQuestion("Scale", refs), actionNames(refs), []*formField{field}, formButton{
+		d := dialogForm(actionQuestion("Scale", refs), actionNames(refs), []*formField{field}, formButton{
 			label: "Scale",
 			press: func(*formDialog) (tea.Cmd, string) {
 				replicas, err := strconv.ParseInt(field.value(), 10, 32)
@@ -154,20 +152,21 @@ func actionScale(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 					return "", sess.Scale(ctx, ref, int32(replicas))
 				}), ""
 			},
-		})}
-	}
+		})
+		d.onOpen = opened
+		return openDialogMsg{d}, nil
+	})
 }
 
 // actionSetImage reads the containers of the first row in a command, and
-// then asks for their images; it sends only those that were changed.
+// then asks for their images; it sends only those that were changed. Its
+// question says when the row is the first of several marked.
 func actionSetImage(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 	sess, ref := e.sess, refs[0]
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
-		defer cancel()
+	return actionRead(e, func(ctx context.Context, opened func()) (tea.Msg, error) {
 		containers, err := sess.Images(ctx, ref)
 		if err != nil {
-			return flashMsg{text: err.Error(), err: true}
+			return nil, err
 		}
 		fields := make([]*formField, len(containers))
 		was := make([]string, len(containers))
@@ -179,7 +178,8 @@ func actionSetImage(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 			fields[i] = formTextField(label, cleanLine(c.Image))
 			was[i] = fields[i].value()
 		}
-		return openDialogMsg{dialogForm(actionQuestion("Set the images of", refs[:1]), nil, fields, formButton{
+		question := "Set the images of " + ref.String() + actionFirstOf(refs) + "?"
+		d := dialogForm(question, nil, fields, formButton{
 			label: "Set",
 			press: func(*formDialog) (tea.Cmd, string) {
 				images := map[string]string{}
@@ -195,13 +195,22 @@ func actionSetImage(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 					return "", sess.SetImages(ctx, ref, images)
 				}), ""
 			},
-		})}
-	}
+		})
+		d.onOpen = opened
+		return openDialogMsg{d}, nil
+	})
 }
 
+// actionDrainMaxTimeout is the longest timeout a drain may be given. A
+// drain cannot be stopped once it runs, and holds the session's keys of
+// actions while it does: one that a PodDisruptionBudget blocked forever
+// would hold them for the rest of the session.
+const actionDrainMaxTimeout = time.Hour
+
 // actionDrain asks how to drain, starting from kubectl's defaults, and
-// drains. A drain's call may take the dialog's timeout and apiTimeout
-// besides; without a timeout it may take as long as it takes.
+// drains. The timeout must be above zero and at most
+// actionDrainMaxTimeout; a drain's call may take it and apiTimeout
+// besides.
 func actionDrain(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 	def := kube.DefaultDrainOptions()
 	grace := formNumberField("Grace Period", strconv.Itoa(def.GracePeriod), true)
@@ -219,8 +228,11 @@ func actionDrain(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 				return nil, "Grace Period must be a number of seconds, or -1 for each pod's own"
 			}
 			t, err := time.ParseDuration(timeout.value())
-			if err != nil || t < 0 {
-				return nil, "Timeout must be a duration such as 5s or 2m30s, or 0 for none"
+			if err != nil {
+				return nil, "Timeout must be a duration such as 5s or 2m30s"
+			}
+			if t <= 0 || t > actionDrainMaxTimeout {
+				return nil, "a drain cannot be stopped once it runs: give it a timeout, at most 1h"
 			}
 			opts := kube.DrainOptions{
 				GracePeriod:        g,
@@ -230,11 +242,7 @@ func actionDrain(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 				Force:              force.on,
 				DisableEviction:    noEvict.on,
 			}
-			limit := time.Duration(0)
-			if t != 0 {
-				limit = t + apiTimeout
-			}
-			return actionStart(e, refs, "Drained", limit, func(ctx context.Context, ref kube.ObjectRef) (string, error) {
+			return actionStart(e, refs, "Drained", t+apiTimeout, func(ctx context.Context, ref kube.ObjectRef) (string, error) {
 				return "", e.sess.Drain(ctx, ref, opts)
 			}), ""
 		},

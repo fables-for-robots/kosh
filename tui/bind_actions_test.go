@@ -351,11 +351,28 @@ func TestDrainDialog(t *testing.T) {
 	hs.wantFrame("Timeout must be a duration")
 	hs.press("esc")
 
-	// Two boxes, a grace period of 30, and no timeout.
+	// A drain cannot be stopped once it runs: no timeout, or one above
+	// an hour, says why and stays.
+	for _, bad := range []string{"0", "0s", "61m", "2h"} {
+		hs.press("r", "tab", "ctrl+u")
+		hs.typeText(bad)
+		dialogFocusOn(hs, "Drain")
+		hs.press("enter")
+		if dialogOpen(hs) == nil {
+			t.Fatalf("a timeout of %s closed the dialog", bad)
+		}
+		if why := dialogOpen(hs).why; why != "a drain cannot be stopped once it runs: give it a timeout, at most 1h" {
+			t.Errorf("a timeout of %s: the dialog says %q", bad, why)
+		}
+		hs.wantFrame("a drain cannot be stopped once it runs:", "at most 1h")
+		hs.press("esc")
+	}
+
+	// Two boxes, a grace period of 30, and a timeout of an hour.
 	hs.press("r", "ctrl+u")
 	hs.typeText("30")
 	hs.press("tab", "ctrl+u")
-	hs.typeText("0")
+	hs.typeText("1h")
 	hs.press("tab", "space", "tab", "space")
 	dialogFocusOn(hs, "Drain")
 	hs.press("enter")
@@ -364,7 +381,7 @@ func TestDrainDialog(t *testing.T) {
 	calls := sess.Called("Drain")
 	want := []kube.DrainOptions{
 		kube.DefaultDrainOptions(),
-		{GracePeriod: 30, IgnoreDaemonSets: true, DeleteEmptyDirData: true},
+		{GracePeriod: 30, Timeout: time.Hour, IgnoreDaemonSets: true, DeleteEmptyDirData: true},
 	}
 	if len(calls) != len(want) {
 		t.Fatalf("Drain was called %d times", len(calls))
@@ -374,9 +391,10 @@ func TestDrainDialog(t *testing.T) {
 			t.Errorf("Drain %d: %v, want %v", i, c.Args, want[i])
 		}
 	}
-	// The context: the timeout and apiTimeout, or none.
+	// The context: the timeout and apiTimeout.
 	left := sess.leftOf("Drain")
-	if len(left) != 2 || left[0] <= apiTimeout || left[0] > apiTimeout+5*time.Second || left[1] != -1 {
+	if len(left) != 2 || left[0] <= apiTimeout || left[0] > apiTimeout+5*time.Second ||
+		left[1] <= time.Hour+apiTimeout-5*time.Second || left[1] > time.Hour+apiTimeout {
 		t.Errorf("Drain's contexts had %v left", left)
 	}
 }
@@ -460,5 +478,108 @@ func TestActionOverMarkedRowsOfAKind(t *testing.T) {
 	}
 	if !slices.Equal(got, []string{"a", "b", "c"}) {
 		t.Errorf("Scale was called for %v", got)
+	}
+}
+
+// The keys whose dialog or editor is for the first row say so when more
+// rows are marked; scale acts on them all and lists them.
+func TestFirstOfTheMarkedRows(t *testing.T) {
+	sess := newSession()
+	sess.ImagesOf["deployments/default/a"] = []kube.ContainerImage{{Name: "app", Image: "nginx:1"}}
+	sess.YAMLs["deployments/default/a"] = "a: b\n"
+	hs := newHarness(t, sess, 100, 30)
+	actionOpen(hs, sess, "deployments", simpleTable("a", "b", "c"))
+	hs.press("i")
+	hs.wantFrame("Set the images of deployments/default/a?")
+	hs.notFrame("the first of")
+	hs.press("esc")
+	actionMarkAll(hs)
+	hs.press("i")
+	if q := dialogOpen(hs).question; q != "Set the images of deployments/default/a (the first of 3 marked)?" {
+		t.Errorf("the question is %q", q)
+	}
+	hs.wantFrame("Set the images of deployments/default/a (the first of 3", "marked)?")
+	hs.press("esc", "e")
+	if got := hs.title(); got != "Edit(deployments/default/a) (the first of 3 marked)" {
+		t.Errorf("the editor's title is %q", got)
+	}
+	hs.typeText("x")
+	if got := hs.title(); got != "Edit(deployments/default/a) (the first of 3 marked) [modified]" {
+		t.Errorf("the editor's title is %q", got)
+	}
+	hs.press("esc", "right", "enter", "s")
+	hs.wantFrame("Scale 3 deployments?")
+	hs.notFrame("the first of")
+	hs.press("esc", "ctrl+\\", "e")
+	if got := hs.title(); got != "Edit(deployments/default/c)" {
+		t.Errorf("the editor's title is %q", got)
+	}
+}
+
+// The read before a dialog or the editor holds the session's keys of
+// actions as an action does, until the dialog or editor has opened or
+// the read has failed.
+func TestReadBeforeADialogIsAnAction(t *testing.T) {
+	for _, c := range []struct {
+		key, plural, method string
+	}{
+		{"s", "deployments", "Replicas"},
+		{"i", "deployments", "Images"},
+		{"e", "deployments", "YAML"},
+	} {
+		t.Run(c.key, func(t *testing.T) {
+			sess := newSession()
+			ref := kubetest.Ref(c.plural, "default", "web")
+			sess.ReplicasOf[ref.String()] = 2
+			sess.ImagesOf[ref.String()] = []kube.ContainerImage{{Name: "app", Image: "nginx:1"}}
+			sess.YAMLs[ref.String()] = "a: b\n"
+			hs := newHarness(t, sess, 100, 30)
+			q := actionOpen(hs, sess, c.plural, simpleTable("web"))
+			var b binding
+			for _, x := range bindingsFor(q.Resource, sess.Grant()) {
+				if x.Key == c.key {
+					b = x
+				}
+			}
+			e := env{sess: sess, now: hs.clock.now}
+			opened := func() bool {
+				_, editor := hs.root().top().(*editorView)
+				return hs.root().dlg != nil || editor
+			}
+
+			// The read has begun and not come back: a key flashes.
+			read := b.Run(e, q, []kube.ObjectRef{ref})
+			hs.press(c.key)
+			hs.wantFrame(actionTextBusy)
+			if opened() || len(sess.Called(c.method)) != 0 {
+				t.Fatal("a second key read or opened something")
+			}
+			// It comes back: the dialog or the editor opens, and the keys
+			// are free.
+			hs.send(read())
+			if !opened() {
+				t.Fatal("nothing opened")
+			}
+			hs.press("esc")
+			if opened() {
+				t.Fatal("esc did not close it")
+			}
+			hs.press(c.key)
+			if !opened() {
+				t.Fatal("the key is still held after the dialog opened")
+			}
+			hs.press("esc")
+
+			// A read that fails frees them too.
+			sess.Errs[c.method] = errors.New("refused")
+			read = b.Run(e, q, []kube.ObjectRef{ref})
+			hs.send(read())
+			hs.wantFrame("refused")
+			delete(sess.Errs, c.method)
+			hs.press(c.key)
+			if !opened() {
+				t.Fatal("the key is still held after a read failed")
+			}
+		})
 	}
 }

@@ -215,18 +215,65 @@ func TestEditorYAMLErrorIsAFlash(t *testing.T) {
 	}
 }
 
-func TestEditorCleansWhatItShows(t *testing.T) {
+// editorCannotKeep is the flash of a YAML the editor would change.
+const editorCannotKeep = "this object holds characters the editor cannot keep (a tab or a control character outside a quoted string): edit it with kubectl"
+
+// The editor sends nothing but what was read and what was typed: a YAML
+// that cleaning would change opens no editor, and its flash draws
+// nothing of it raw.
+func TestEditorRefusesWhatCleaningWouldChange(t *testing.T) {
+	for name, yaml := range map[string]string{
+		"a tab in a block scalar":  "data:\n  Makefile: |\n    all:\n    \techo hi\n",
+		"an escape sequence":       "data:\n  title: \x1b]0;x\x07owned\n",
+		"a bell":                   "data:\n  bell: \x07\n",
+		"a carriage return":        "data:\n  a: b\r\n",
+		"bytes that are not UTF-8": "data:\n  a: \xff\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			sess := newSession()
+			sess.YAMLs[editorRef.String()] = yaml
+			hs := editorStart(t, sess, false)
+			hs.press("e")
+			if !editorClosed(hs) {
+				t.Fatal("an editor opened")
+			}
+			hs.wantFrame("this object holds characters the editor cannot keep")
+			if !strings.Contains(hs.drawnLine("cannot keep"), sgr(styleError)) {
+				t.Error("the flash is not in the error style")
+			}
+			for _, bad := range []string{"\x1b]0;", "\x07", "\t", "\r"} {
+				if strings.Contains(hs.drawn(), bad) {
+					t.Errorf("the frame draws %q", bad)
+				}
+			}
+			if got := sess.Called("Update"); len(got) != 0 {
+				t.Errorf("Update was called %v", got)
+			}
+		})
+	}
+	if !strings.Contains(editorCannotKeep, "edit it with kubectl") {
+		t.Fatal("the test's text is wrong")
+	}
+}
+
+// Tabs written as \t in a double-quoted string, as the session's YAML
+// writes them, are kept: the save sends what was read and the character
+// typed, byte for byte.
+func TestEditorKeepsWhatWasRead(t *testing.T) {
 	sess := newSession()
-	sess.YAMLs[editorRef.String()] = "data:\n  title: \x1b]0;x\x07owned\n  bell: \x07\n"
+	yaml := "apiVersion: v1\ndata:\n  Makefile: \"all:\\n\\techo hi\\n\"\n  note: caf\u00e9 \u2603\nkind: ConfigMap\n"
+	sess.YAMLs[editorRef.String()] = yaml
 	hs := editorStart(t, sess, true)
-	v := editorShown(hs)
-	if strings.Contains(v.ta.Value(), "\x1b") || strings.Contains(v.ta.Value(), "\x07") {
+	if v := editorShown(hs); v.ta.Value() != yaml || v.was != yaml {
 		t.Errorf("the text area holds %q", v.ta.Value())
 	}
-	if strings.Contains(hs.drawn(), "\x1b]0;") || strings.Contains(hs.drawn(), "\x07") {
-		t.Error("the frame draws the escape sequence")
+	hs.typeText("x")
+	hs.press("ctrl+s")
+	hs.awaitFrame("Updated configmaps/default/cfg")
+	got := sess.Called("Update")
+	if len(got) != 1 || got[0].Args[1].(string) != "x"+yaml {
+		t.Errorf("Update was called %v", got)
 	}
-	hs.wantFrame("title: owned", "bell: ␇")
 }
 
 // A YAML the text area cannot hold as it is, as one of more lines than
@@ -236,7 +283,7 @@ func TestEditorRefusesWhatItCannotHold(t *testing.T) {
 	sess.YAMLs[editorRef.String()] = strings.Repeat("a: b\n", editorMaxLines+1)
 	hs := editorStart(t, sess, false)
 	hs.press("e")
-	hs.wantFrame("cannot be edited here")
+	hs.wantFrame("more lines than the editor holds")
 	if !editorClosed(hs) {
 		t.Error("an editor opened")
 	}

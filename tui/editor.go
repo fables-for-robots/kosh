@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"charm.land/bubbles/v2/textarea"
@@ -25,8 +26,12 @@ type editorView struct {
 	e   env
 	ref kube.ObjectRef
 	ta  textarea.Model
-	// was is the text as it was read, cleaned, as the text area holds it.
-	was      string
+	// was is the text as it was read, which the text area holds as it is.
+	was string
+	// firstOf says that ref is the first of several marked rows:
+	// " (the first of 3 marked)".
+	firstOf  string
+	onOpen   func()
 	modified bool
 	saving   bool
 	// why is the error of a refused update, shown until the next key.
@@ -39,39 +44,49 @@ type editorSavedMsg struct {
 	err error
 }
 
+// The flashes of a YAML the editor will not open.
+const (
+	editorTextCannotKeep = "this object holds characters the editor cannot keep (a tab or a control character outside a quoted string): edit it with kubectl"
+	editorTextCannotHold = "this object's YAML has more lines than the editor holds, or characters it cannot hold: edit it with kubectl"
+)
+
 // editorOpen reads the YAML of the first row in a command and opens the
-// editor with it; an error is a flash.
+// editor with it; an error is a flash. The read holds the session's keys
+// of actions until the editor has opened or the read has failed.
 func editorOpen(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 	sess, ref := e.sess, refs[0]
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
-		defer cancel()
+	return actionRead(e, func(ctx context.Context, opened func()) (tea.Msg, error) {
 		text, err := sess.YAML(ctx, ref, false)
 		if err != nil {
-			return flashMsg{text: err.Error(), err: true}
+			return nil, err
 		}
-		v := editorNew(e, ref, text)
-		if v == nil {
-			return flashMsg{text: "the YAML of " + ref.String() + " cannot be edited here: it has more lines than " +
-				"the editor holds, or characters it cannot hold", err: true}
+		v, why := editorNew(e, ref, text)
+		if why != "" {
+			return nil, errors.New(why)
 		}
-		return pushViewMsg{v}
-	}
+		v.firstOf = actionFirstOf(refs)
+		v.onOpen = opened
+		return pushViewMsg{v}, nil
+	})
 }
 
-// editorNew returns the editor of ref with its YAML, cleaned line by
-// line, and the cursor at its start. It returns nil when the text area
-// would not hold the text as it is, as when it has more lines than
-// editorMaxLines: what was saved would then not be what was read.
-func editorNew(e env, ref kube.ObjectRef, yaml string) *editorView {
+// editorNew returns the editor of ref with its YAML as it was read, and
+// the cursor at its start. The editor never sends anything but what was
+// read and what the user typed, so it returns why instead when it could
+// not keep the text as it is: a line that clean would change (a raw tab,
+// a control character, an escape sequence, bytes that are not UTF-8),
+// more lines than editorMaxLines, or anything the text area would not
+// hold.
+func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why string) {
 	lines := strings.Split(yaml, "\n")
 	if len(lines) > editorMaxLines {
-		return nil
+		return nil, editorTextCannotHold
 	}
-	for i, l := range lines {
-		lines[i] = clean(l)
+	for _, l := range lines {
+		if clean(l) != l {
+			return nil, editorTextCannotKeep
+		}
 	}
-	text := strings.Join(lines, "\n")
 
 	ta := textarea.New()
 	ta.Prompt = ""
@@ -93,16 +108,23 @@ func editorNew(e env, ref kube.ObjectRef, yaml string) *editorView {
 	st.Focused.EndOfBuffer = styleDim
 	st.Blurred = st.Focused
 	ta.SetStyles(st)
-	ta.SetValue(text)
-	if ta.Value() != text {
-		return nil
+	ta.SetValue(yaml)
+	if ta.Value() != yaml {
+		return nil, editorTextCannotHold
 	}
 	ta.MoveToBegin()
 	ta.Focus()
-	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: ta.Value()}
+	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: yaml}, ""
 }
 
-func (v *editorView) Init() tea.Cmd { return nil }
+// Init calls onOpen.
+func (v *editorView) Init() tea.Cmd {
+	if v.onOpen != nil {
+		v.onOpen()
+		v.onOpen = nil
+	}
+	return nil
+}
 
 // Update takes the editor's keys, pastes, and what came of its update.
 func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
@@ -208,10 +230,11 @@ func (v *editorView) View(w, h int) string {
 	return strings.Join(out, "\n")
 }
 
-// Title is "Edit(<ref>)", with " [modified]" once the text was changed
+// Title is "Edit(<ref>)", with " (the first of 3 marked)" when the
+// object is the first of several marked rows, " [modified]" once the text was changed
 // and " [saving]" while the update runs.
 func (v *editorView) Title() string {
-	t := "Edit(" + cleanLine(v.ref.String()) + ")"
+	t := "Edit(" + cleanLine(v.ref.String()) + ")" + v.firstOf
 	switch {
 	case v.saving:
 		t += " [saving]"

@@ -151,6 +151,8 @@ type formDialog struct {
 	focus int
 	// why is why the values are not good, after a button said so.
 	why string
+	// onOpen, when set, is called once, when the dialog is opened.
+	onOpen func()
 }
 
 // dialogConfirm returns a dialog that asks question about names,
@@ -217,7 +219,14 @@ func (d *formDialog) setFocus(i int) {
 	}
 }
 
-func (d *formDialog) Init() tea.Cmd { return nil }
+// Init calls onOpen.
+func (d *formDialog) Init() tea.Cmd {
+	if d.onOpen != nil {
+		d.onOpen()
+		d.onOpen = nil
+	}
+	return nil
+}
 
 // Update takes the dialog's keys and pastes; it has no messages of its
 // own, and every other message is not for it.
@@ -299,7 +308,10 @@ func (d *formDialog) View(width int) string {
 	bw := min(width, dialogWidth)
 	iw := max(bw-4, 1)
 	var body []string
-	body = append(body, "", styleTitle.Render(fit(d.question, iw)))
+	body = append(body, "")
+	for _, l := range dialogWrap(d.question, iw) {
+		body = append(body, styleTitle.Render(l))
+	}
 	for _, n := range d.names {
 		body = append(body, styleText.Render(fit("  "+n, iw)))
 	}
@@ -319,7 +331,10 @@ func (d *formDialog) View(width int) string {
 		body = append(body, "")
 	}
 	if d.why != "" {
-		body = append(body, styleError.Render(fit(d.why, iw)), "")
+		for _, l := range dialogWrap(d.why, iw) {
+			body = append(body, styleError.Render(l))
+		}
+		body = append(body, "")
 	}
 	body = append(body, d.buttonLine(iw), "")
 
@@ -379,4 +394,14 @@ func (d *formDialog) buttonLine(iw int) string {
 	line := strings.Join(parts, "  ")
 	pad := max((iw-ansi.StringWidth(line))/2, 0)
 	return strings.Repeat(" ", pad) + line
+}
+
+// dialogWrap wraps one line of plain text into lines of w cells at
+// most, at spaces where it can and in a word where it must.
+func dialogWrap(s string, w int) []string {
+	lines := strings.Split(ansi.Wrap(s, w, ""), "\n")
+	for i, l := range lines {
+		lines[i] = fit(strings.TrimRight(l, " "), w)
+	}
+	return lines
 }
