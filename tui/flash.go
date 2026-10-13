@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -25,7 +24,7 @@ type flashLine struct {
 // show makes msg the flash, from now.
 func (f *flashLine) show(msg flashMsg, now time.Time) tea.Cmd {
 	f.seq++
-	f.text = strings.ReplaceAll(clean(msg.text), "\n", " ")
+	f.text = cleanLine(msg.text)
 	f.err = msg.err
 	f.at = now
 	seq := f.seq

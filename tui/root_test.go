@@ -245,3 +245,93 @@ func TestTheStartCanFail(t *testing.T) {
 		t.Errorf("the error is not shown in the body in the error style: %q\n%s", l, hs.frame())
 	}
 }
+
+// What the frame shows of a view, a grant and the cluster is cleaned and
+// kept to its line: the title, the crumb, the hints, the help, the key's
+// name, the version, the namespaces.
+func TestEverythingDrawnIsCleaned(t *testing.T) {
+	evil := "\x1b]0;x\x07\x1b[2J\nsecond line"
+	sess := kubetest.New(keys.Grant{Name: "alice" + evil})
+	sess.Version = "v1" + evil
+	hs := newHarness(t, sess, 100, 30)
+	hs.command("po kube" + "\x1b[2J" + "system")
+	v := &namedView{testView: testView{name: "plain", hints: []hint{{"k" + evil, "text" + evil}}}, as: "v" + evil}
+	hs.send(pushViewMsg{v})
+	check := func(what string) {
+		t.Helper()
+		f := hs.drawn()
+		for _, bad := range []string{"\x1b]0;", "\x1b[2J", "\x07"} {
+			if strings.Contains(f, bad) {
+				t.Errorf("%s: the frame holds %q", what, bad)
+			}
+		}
+		if lines := hs.lines(); len(lines) != 30 {
+			t.Errorf("%s: the frame has %d lines", what, len(lines))
+		}
+	}
+	check("a view")
+	if !strings.HasPrefix(hs.title(), "Test(v second line)") {
+		t.Errorf("the title is %q", hs.title())
+	}
+	hs.press("?")
+	check("the help")
+	hs.wantFrame("V SECOND LINE")
+	hs.press("esc", "esc")
+	check("the pods")
+}
+
+// namedView is a test view whose title and crumb are what as says.
+type namedView struct {
+	testView
+	as string
+}
+
+func (v *namedView) Title() string { return "Test(" + v.as + ")" }
+func (v *namedView) Crumb() string { return v.as }
+func (v *namedView) Update(msg tea.Msg) (view, tea.Cmd) {
+	v.testView.Update(msg)
+	return v, nil
+}
+
+func TestTheStartErrorIsOneLine(t *testing.T) {
+	sess := newSession()
+	sess.Errs["Resolve"] = errors.New("down\nfor maintenance \x1b[2J")
+	hs := newHarness(t, sess, 100, 30)
+	hs.wantFrame("│down for maintenance")
+	if strings.Contains(hs.drawn(), "\x1b[2J") {
+		t.Error("the error is drawn raw")
+	}
+}
+
+// The prompt of a fullscreen view is its window's last line, and the view
+// has the lines above it while the prompt is open.
+func TestPromptOverAFullscreenView(t *testing.T) {
+	hs := newHarness(t, newSession(), 100, 30)
+	v := &filterView{testView: testView{name: "full", fullscreen: true}}
+	hs.send(pushViewMsg{v})
+	for _, open := range []string{"/", ":"} {
+		hs.press(open)
+		hs.typeText("web")
+		lines := hs.lines()
+		if len(lines) != 30 || !strings.HasPrefix(lines[29], open+"web") {
+			t.Errorf("with %s open the last line is %q", open, lines[len(lines)-1])
+		}
+		if v.w != 100 || v.h != 29 || !strings.HasPrefix(lines[28], "full line 28") {
+			t.Errorf("with %s open the view was given %dx%d", open, v.w, v.h)
+		}
+		hs.press("esc")
+		lines = hs.lines()
+		if v.h != 30 || len(lines) != 30 || !strings.HasPrefix(lines[29], "full line 29") {
+			t.Errorf("after %s closed the view was given %dx%d, the last line is %q", open, v.w, v.h, lines[len(lines)-1])
+		}
+	}
+	if got := strings.Join(v.filters, ","); got != "w,we,web," {
+		t.Errorf("the filter was given %s", got)
+	}
+	// No window size panics with the prompt open over it.
+	hs.press(":")
+	for _, size := range [][2]int{{100, 1}, {80, 1}, {1, 1}, {80, 12}, {0, 0}} {
+		hs.send(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		hs.drawn()
+	}
+}

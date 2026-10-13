@@ -185,8 +185,14 @@ func TestHistory(t *testing.T) {
 	}
 	hs.command("svc")
 	hs.command("svc")
-	if got := strings.Join(hs.root().hist.entries, ","); got != "pods,deploy,svc,svc" && got != "pods,deploy,svc" {
-		t.Errorf("the history is %s", got)
+	if got := strings.Join(hs.root().hist.entries, ","); got != "pods,deploy,svc" {
+		t.Errorf("after svc twice the history is %s", got)
+	}
+	hs.command("po")
+	hs.command("po")
+	hs.command("svc")
+	if got := strings.Join(hs.root().hist.entries, ","); got != "pods,deploy,svc,po,svc" {
+		t.Errorf("after po twice and svc the history is %s", got)
 	}
 	// Beyond the ends nothing happens.
 	hs = newHarness(t, newSession(), 100, 30)
@@ -257,6 +263,18 @@ func TestTheStartCanFailAndTheCommandsWork(t *testing.T) {
 	if l := hs.line("│the API is down"); l == "" {
 		t.Errorf("the body lost the error of the start:\n%s", hs.frame())
 	}
+	// The help and the names leave on esc even as the only view, back to
+	// the error.
+	for _, keys := range [][]string{{"?", "esc"}, {"?", "q"}, {"?", "?"}, {"ctrl+a", "esc"}} {
+		hs.press(keys[0])
+		if hs.title() == "" {
+			t.Errorf("%s opened nothing", keys[0])
+		}
+		hs.press(keys[1])
+		if len(hs.root().stack) != 0 || hs.line("│the API is down") == "" {
+			t.Errorf("%s then %s leaves %d views:\n%s", keys[0], keys[1], len(hs.root().stack), hs.frame())
+		}
+	}
 	delete(sess.Errs, "Resolve")
 	hs.command("deploy")
 	if !strings.HasPrefix(hs.title(), "Deployments(default)[") {
@@ -266,5 +284,47 @@ func TestTheStartCanFailAndTheCommandsWork(t *testing.T) {
 		if strings.HasPrefix(l, "│") && strings.Contains(l, "the API is down") {
 			t.Errorf("the body still shows the error: %q", l)
 		}
+	}
+}
+
+// ctrl+v reads no clipboard of the server: bubbles' Paste would start a
+// program in the pod to read one. It is not bound, and gives no command.
+func TestPromptHasNoClipboardPaste(t *testing.T) {
+	for _, open := range []string{":", "/"} {
+		hs := newHarness(t, newSession(), 100, 30)
+		hs.send(pushViewMsg{&filterView{testView: testView{name: "f"}}})
+		hs.press(open)
+		hs.typeText("ab")
+		// The command is not run: were it bubbles' Paste, it would read
+		// the clipboard of the machine the test runs on.
+		_, cmd := hs.m.Update(keyPress("ctrl+v"))
+		if cmd != nil {
+			t.Errorf("ctrl+v at %s gives a command", open)
+		}
+		if v := hs.root().prompt.in.Value(); v != "ab" {
+			t.Errorf("ctrl+v at %s made the text %q", open, v)
+		}
+		if hs.root().prompt.in.KeyMap.Paste.Enabled() {
+			t.Errorf("the prompt of %s has Paste", open)
+		}
+	}
+}
+
+// What the terminal pastes is typed text, cleaned and on one line.
+func TestPromptTakesAPaste(t *testing.T) {
+	hs := newHarness(t, newSession(), 100, 30)
+	v := &filterView{testView: testView{name: "f"}}
+	hs.send(pushViewMsg{v})
+	hs.press("/")
+	hs.send(tea.PasteMsg{Content: "web\x1b[2J\nfront\x07"})
+	got := hs.root().prompt.in.Value()
+	if got != "web front␇" {
+		t.Errorf("the pasted text is %q", got)
+	}
+	if last := v.filters[len(v.filters)-1]; last != got {
+		t.Errorf("the filter was given %q", last)
+	}
+	if d := hs.drawn(); strings.Contains(d, "\x1b[2J") {
+		t.Error("the paste was drawn raw")
 	}
 }

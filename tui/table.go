@@ -65,10 +65,15 @@ type ttable struct {
 	err        string
 }
 
-// prepare cleans a reading of a watch and measures its cells. A cell is
-// one line: a line feed in it becomes a space.
+// prepare cleans a reading of a watch, the names of its columns
+// included, and measures its cells. A cell and a column's name are one
+// line: a line feed in them becomes a space.
 func prepare(t kube.Table) ttable {
-	out := ttable{cols: t.Columns, namespaced: t.Namespaced, stale: t.Stale}
+	out := ttable{cols: make([]render.Column, len(t.Columns)), namespaced: t.Namespaced, stale: t.Stale}
+	for i, c := range t.Columns {
+		c.Name = cleanLine(c.Name)
+		out.cols[i] = c
+	}
 	if t.Err != nil {
 		out.err = cleanLine(t.Err.Error())
 		return out
@@ -623,8 +628,14 @@ func (v *tableView) hasShortcuts() bool {
 	return !v.plain && v.q.Resource.Namespaced && v.q.Of == nil
 }
 
-// View draws the header and the rows that fit, or why there are none.
+// View draws the header and the rows that fit, or why there are none,
+// in exactly h lines of w cells.
 func (v *tableView) View(w, h int) string {
+	return strings.Join(block(v.draw(w, h), w, h), "\n")
+}
+
+// draw draws what View shows, in at most h lines.
+func (v *tableView) draw(w, h int) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
@@ -646,6 +657,10 @@ func (v *tableView) View(w, h int) string {
 			text = textWaiting
 		}
 		lines = append(lines, styleText.Render(fit(text, w)))
+		if len(lines) > h {
+			// One line: the text says more than the header.
+			lines = lines[1:]
+		}
 		return strings.Join(lines, "\n")
 	}
 	if v.cursor < v.top {

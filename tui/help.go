@@ -23,7 +23,7 @@ func (r *root) openHelp() tea.Cmd {
 	var sections []helpSection
 	if top := r.top(); top != nil {
 		if hs := top.Hints(); len(hs) > 0 {
-			sections = append(sections, helpSection{strings.ToUpper(clean(top.Crumb())), hs})
+			sections = append(sections, helpSection{strings.ToUpper(cleanLine(top.Crumb())), hs})
 		}
 	}
 	sections = append(sections, helpSection{"GENERAL", rootHints()})
@@ -46,8 +46,11 @@ func (v *helpView) Update(msg tea.Msg) (view, tea.Cmd) {
 // View draws the sections side by side, each in as many columns of h
 // lines as its keys need, as far as they fit.
 func (v *helpView) View(w, h int) string {
-	if w <= 0 || h <= 1 {
+	if w <= 0 || h <= 0 {
 		return ""
+	}
+	if h == 1 {
+		return fit(styleSection.Render("HELP"), w)
 	}
 	type column struct {
 		lines []string
@@ -57,7 +60,7 @@ func (v *helpView) View(w, h int) string {
 	for _, s := range v.sections {
 		keyW := 0
 		for _, hn := range s.hints {
-			keyW = max(keyW, ansi.StringWidth(clean(hn.Key))+2)
+			keyW = max(keyW, ansi.StringWidth(cleanLine(hn.Key))+2)
 		}
 		for i, part := range columns(helpLines(s.hints, keyW), h-1) {
 			title := s.title
@@ -89,8 +92,8 @@ func (v *helpView) View(w, h int) string {
 func helpLines(hints []hint, keyW int) []string {
 	out := make([]string, len(hints))
 	for i, h := range hints {
-		key := "<" + clean(h.Key) + ">"
-		out[i] = styleKey.Render(key) + strings.Repeat(" ", max(keyW-ansi.StringWidth(key), 0)+1) + styleHint.Render(clean(h.Text))
+		key := "<" + cleanLine(h.Key) + ">"
+		out[i] = styleKey.Render(key) + strings.Repeat(" ", max(keyW-ansi.StringWidth(key), 0)+1) + styleHint.Render(cleanLine(h.Text))
 	}
 	return out
 }

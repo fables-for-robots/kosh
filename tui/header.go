@@ -17,18 +17,18 @@ const headerGap = "   "
 // header draws the header's lines: who and what on the left, the
 // namespace shortcuts in the middle, the top view's keys on the right.
 func (r *root) header() []string {
-	name := clean(r.grant.Name)
+	name := cleanLine(r.grant.Name)
 	if r.grant.ReadOnly {
 		name += " [read-only]"
 	}
 	info := [][2]string{
 		{"Key:", name},
-		{"Cluster:", clean(r.cluster)},
-		{"kosh:", clean(r.version)},
+		{"Cluster:", cleanLine(r.cluster)},
+		{"kosh:", cleanLine(r.version)},
 	}
 	var left []string
 	for _, kv := range info {
-		left = append(left, styleInfoLabel.Render(kv[0]+strings.Repeat(" ", 9-len(kv[0])))+styleInfoValue.Render(strings.ReplaceAll(kv[1], "\n", " ")))
+		left = append(left, styleInfoLabel.Render(kv[0]+strings.Repeat(" ", 9-len(kv[0])))+styleInfoValue.Render(kv[1]))
 	}
 	cols := [][]string{left}
 
@@ -38,7 +38,7 @@ func (r *root) header() []string {
 			if ns == "" {
 				ns = "all"
 			}
-			sc = append(sc, styleNumKey.Render("<"+strconv.Itoa(i)+">")+" "+styleHint.Render(clean(ns)))
+			sc = append(sc, styleNumKey.Render("<"+strconv.Itoa(i)+">")+" "+styleHint.Render(cleanLine(ns)))
 		}
 		cols = append(cols, columns(sc, hintRows)...)
 	}
@@ -46,7 +46,7 @@ func (r *root) header() []string {
 	var hints []string
 	if top := r.top(); top != nil {
 		for _, h := range top.Hints() {
-			hints = append(hints, styleKey.Render("<"+clean(h.Key)+">")+" "+styleHint.Render(clean(h.Text)))
+			hints = append(hints, styleKey.Render("<"+cleanLine(h.Key)+">")+" "+styleHint.Render(cleanLine(h.Text)))
 		}
 	}
 	used := 0

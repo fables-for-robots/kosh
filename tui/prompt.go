@@ -32,6 +32,9 @@ func newInput(w int) textinput.Model {
 	st.Focused.Suggestion = styleDim
 	in.SetStyles(st)
 	in.SetWidth(max(w-3, 1))
+	// Paste would read the clipboard by starting a program on the server.
+	// What the user pastes comes from their terminal as a tea.PasteMsg.
+	in.KeyMap.Paste.SetEnabled(false)
 	in.Focus()
 	return in
 }
@@ -121,8 +124,11 @@ func (r *root) promptKey(k tea.KeyPressMsg) tea.Cmd {
 	return r.promptInput(k)
 }
 
-// promptPaste puts pasted text into the prompt.
-func (r *root) promptPaste(p tea.PasteMsg) tea.Cmd { return r.promptInput(p) }
+// promptPaste puts what the terminal pasted into the prompt as typed
+// text, cleaned and on one line.
+func (r *root) promptPaste(p tea.PasteMsg) tea.Cmd {
+	return r.promptInput(tea.PasteMsg{Content: cleanLine(p.Content)})
+}
 
 // promptInput gives msg to the text input, and a changed filter to the
 // top view.

@@ -1,0 +1,34 @@
+package kube
+
+import (
+	"context"
+	"errors"
+)
+
+func (s *session) YAML(ctx context.Context, ref ObjectRef, managedFields bool) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func (s *session) SecretData(ctx context.Context, ref ObjectRef) ([]SecretEntry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (LogStream, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *session) Owner(ctx context.Context, ref ObjectRef) (ObjectRef, error) {
+	return ObjectRef{}, errors.New("not implemented")
+}
+
+func (s *session) Images(ctx context.Context, ref ObjectRef) ([]ContainerImage, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *session) Replicas(ctx context.Context, ref ObjectRef) (int32, error) {
+	return 0, errors.New("not implemented")
+}
