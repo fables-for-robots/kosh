@@ -153,6 +153,27 @@ func TestOpenLogsRejectedLinesAndCount(t *testing.T) {
 	}
 }
 
+func TestReloadCountsBothKinds(t *testing.T) {
+	_, a := newKey(t)
+	_, b := newKey(t)
+	_, c := newKey(t)
+	path := filepath.Join(t.TempDir(), "authorized_keys")
+	writeFile(t, path, a+" a\n"+b+" b\nread-only "+c+" c\n")
+	log, rec := newLog()
+	if _, err := Open(path, log); err != nil {
+		t.Fatal(err)
+	}
+	infos := rec.at(slog.LevelInfo)
+	if len(infos) != 1 {
+		t.Fatalf("info = %+v, want one line", infos)
+	}
+	for k, want := range map[string]string{"keys": "3", "full": "2", "read_only": "1"} {
+		if got := infos[0].attrs[k]; got != want {
+			t.Errorf("%s = %q, want %s", k, got, want)
+		}
+	}
+}
+
 func TestOpenEmptyFileWarns(t *testing.T) {
 	for name, content := range map[string]string{
 		"empty":              "",

@@ -151,9 +151,9 @@ func (s *Set) add(line []byte) (reason string) {
 		return "unknown option " + strings.Join(unknown, ", ")
 	}
 	// "ssh-ed25519 AAAA… read-only guest" would otherwise be a full key
-	// named "read-only guest".
-	if firstWordIs(comment, OptionReadOnly) {
-		return "read-only is an option and goes in front of the key"
+	// named "read-only guest". With the option, any comment will do.
+	if !readOnly && saysReadOnly(comment) {
+		return reasonReadOnlyComment
 	}
 	wire := string(key.Marshal())
 	if g, ok := s.grants[wire]; ok {
@@ -170,14 +170,46 @@ func (s *Set) add(line []byte) (reason string) {
 	return ""
 }
 
-// firstWordIs reports whether the first word of s, up to white space, is
-// word in any case.
-func firstWordIs(s, word string) bool {
-	s = strings.TrimSpace(s)
-	if i := strings.IndexFunc(s, unicode.IsSpace); i >= 0 {
-		s = s[:i]
+// reasonReadOnlyComment is why a line without the option whose comment
+// says read-only is rejected.
+const reasonReadOnlyComment = "read-only is an option and goes in front of the key type; " +
+	"a full key's name must not hold read-only, readonly, read_only or read only"
+
+// readOnlyWords are the ways read-only is written in a comment, as
+// saysReadOnly reads it.
+var readOnlyWords = []string{"read-only", "readonly", "read_only", "read only"}
+
+// saysReadOnly reports whether comment holds read-only, readonly,
+// read_only or read only anywhere, in any case, once its format
+// characters (Unicode's Cf: zero-width spaces, a byte order mark) are
+// dropped, every dash (Pd) is read as "-" and every run of white space
+// as one space.
+func saysReadOnly(comment string) bool {
+	var b strings.Builder
+	space := false
+	for _, r := range comment {
+		switch {
+		case unicode.Is(unicode.Cf, r):
+			continue
+		case unicode.IsSpace(r):
+			if !space {
+				b.WriteByte(' ')
+			}
+			space = true
+			continue
+		case unicode.Is(unicode.Pd, r):
+			r = '-'
+		}
+		space = false
+		b.WriteRune(unicode.ToLower(r))
 	}
-	return strings.EqualFold(s, word)
+	s := b.String()
+	for _, w := range readOnlyWords {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // Lookup returns the grant of key.
@@ -187,6 +219,21 @@ func (s *Set) Lookup(key ssh.PublicKey) (Grant, bool) {
 	}
 	g, ok := s.grants[string(key.Marshal())]
 	return g, ok
+}
+
+// counts returns how many keys are full and how many read-only.
+func (s *Set) counts() (full, readOnly int) {
+	if s == nil {
+		return 0, 0
+	}
+	for _, g := range s.grants {
+		if g.ReadOnly {
+			readOnly++
+		} else {
+			full++
+		}
+	}
+	return full, readOnly
 }
 
 // Len returns the number of keys.
@@ -240,7 +287,8 @@ func Open(path string, log *slog.Logger) (*List, error) {
 
 // parseLogged parses data, the content of the file at path, and logs
 // what Open and Watch log of it: each rejected line, a list of no key,
-// and msg with the counts.
+// and msg with the counts: of keys, full and read-only, and of lines
+// rejected.
 func parseLogged(path string, data []byte, log *slog.Logger, msg string) *Set {
 	set, rejected := Parse(bytes.NewReader(data))
 	for _, r := range rejected {
@@ -249,7 +297,8 @@ func parseLogged(path string, data []byte, log *slog.Logger, msg string) *Set {
 	if set.Len() == 0 {
 		log.Warn("key list holds no key: nobody is accepted", "path", path)
 	}
-	log.Info(msg, "path", path, "keys", set.Len(), "rejected", len(rejected))
+	full, readOnly := set.counts()
+	log.Info(msg, "path", path, "keys", set.Len(), "full", full, "read_only", readOnly, "rejected", len(rejected))
 	return set
 }
 
