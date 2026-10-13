@@ -215,3 +215,110 @@ func TestEditorEnterAtTheLimit(t *testing.T) {
 	}
 	hs.wantFrame(editorTextTooLong)
 }
+
+// editorFill pastes plain lines into the editor until its text is size
+// bytes, and fails when it is not.
+func editorFill(hs *harness, v *editorView, size int, unit string) {
+	hs.t.Helper()
+	room := size - len(v.ta.Value())
+	var b strings.Builder
+	for b.Len()+len(unit) <= room {
+		b.WriteString(unit)
+	}
+	b.WriteString(strings.Repeat("a", room-b.Len()))
+	hs.send(tea.PasteMsg{Content: b.String()})
+	if got := len(v.ta.Value()); got != size {
+		hs.t.Fatalf("the text is %d bytes, want %d", got, size)
+	}
+	hs.clock.advance(flashFor)
+	hs.press("left")
+}
+
+// editorRefusedWhole checks that a paste of content is refused whole:
+// the flash, and the text and the cursor as they were.
+func editorRefusedWhole(t *testing.T, hs *harness, v *editorView, what, content string) {
+	t.Helper()
+	text, line, col := v.ta.Value(), v.ta.Line(), v.ta.Column()
+	hs.send(tea.PasteMsg{Content: content})
+	if v.ta.Value() != text || v.ta.Line() != line || v.ta.Column() != col {
+		t.Errorf("%s: the text went from %d bytes and %d lines to %d bytes and %d lines, the cursor from %d:%d to %d:%d",
+			what, len(text), strings.Count(text, "\n")+1, len(v.ta.Value()), v.ta.LineCount(), line, col, v.ta.Line(), v.ta.Column())
+	}
+	if !strings.Contains(hs.root().flash.text, editorTextTooLong) {
+		t.Errorf("%s: the flash is %q", what, hs.root().flash.text)
+	}
+	if v.size != len(v.ta.Value()) {
+		t.Errorf("%s: the editor counts %d bytes, the text has %d", what, v.size, len(v.ta.Value()))
+	}
+	hs.clock.advance(flashFor)
+	hs.press("left")
+	hs.send(flashMsg{text: "-"})
+}
+
+// A paste is measured as the text area will hold it: CR and CRLF one
+// line end each, a tab four spaces, control characters and U+FFFD
+// dropped; and it is taken whole or refused whole.
+func TestEditorPasteIsMeasuredAsHeld(t *testing.T) {
+	// The probes of the review.
+	hs := editorStart(t, newSession(), true)
+	v := editorShown(hs)
+	editorFill(hs, v, 61418, strings.Repeat("a", 72)+"\n")
+	editorRefusedWhole(t, hs, v, "2,000 tabs at 61,418 bytes", strings.Repeat("\t", 2000))
+
+	hs = editorStart(t, newSession(), true)
+	v = editorShown(hs)
+	editorFill(hs, v, 41051, strings.Repeat("é", 36)+"\n")
+	editorRefusedWhole(t, hs, v, "20,000 tabs at 41,051 bytes of é", strings.Repeat("\t", 20000))
+
+	hs = editorStart(t, newSession(), true)
+	v = editorShown(hs)
+	editorRefusedWhole(t, hs, v, `"a\r" × 10,049`, strings.Repeat("a\r", 10049))
+	editorRefusedWhole(t, hs, v, "CRLF × 10,000", strings.Repeat("x\r\n", 10000))
+
+	// A CRLF paste of 6,000 lines is 6,000 lines, and fits.
+	n := v.ta.LineCount()
+	hs.send(tea.PasteMsg{Content: strings.Repeat("x\r\n", 6000)})
+	if got := v.ta.LineCount(); got != n+6000 {
+		t.Errorf("a CRLF paste of 6,000 lines added %d lines", got-n)
+	}
+	if strings.Contains(hs.root().flash.text, editorTextTooLong) {
+		t.Error("a CRLF paste of 6,000 lines was refused")
+	}
+
+	// A CRLF paste of 3 lines adds 3 lines; a paste with tabs, CRs,
+	// controls and U+FFFD grows the text by what it measures as.
+	hs = editorStart(t, newSession(), true)
+	v = editorShown(hs)
+	n = v.ta.LineCount()
+	hs.send(tea.PasteMsg{Content: "a: 1\r\nb: 2\r\nc: 3\r\n"})
+	if got := v.ta.LineCount(); got != n+3 {
+		t.Errorf("a CRLF paste of 3 lines added %d lines", got-n)
+	}
+	for _, c := range []struct{ paste, held string }{
+		{"\tk: v\r\n", "    k: v\n"},
+		{"a\tb\rc\x07d\x1b[2Je\xff�f\u0085g", "a    b\ncd[2Jefg"},
+		{"\t\t", "        "},
+	} {
+		before := len(v.ta.Value())
+		hs.send(tea.PasteMsg{Content: c.paste})
+		if got := len(v.ta.Value()) - before; got != len(c.held) {
+			t.Errorf("a paste of %q grew the text by %d bytes, want %d (%q)", c.paste, got, len(c.held), c.held)
+		}
+		if got := editorHeld(c.paste); got != c.held {
+			t.Errorf("a paste of %q is held as %q, want %q", c.paste, got, c.held)
+		}
+		if v.size != len(v.ta.Value()) {
+			t.Errorf("after %q the editor counts %d bytes, the text has %d", c.paste, v.size, len(v.ta.Value()))
+		}
+	}
+
+	// A paste with tabs that lands exactly on the limit is taken; one
+	// byte more is refused.
+	room := editorMaxText - len(v.ta.Value())
+	fits := strings.Repeat("\t", room/4) + strings.Repeat("y", room%4)
+	editorRefusedWhole(t, hs, v, "a byte past the limit", fits+"y")
+	hs.send(tea.PasteMsg{Content: fits})
+	if got := len(v.ta.Value()); got != editorMaxText || v.size != got {
+		t.Errorf("a paste to the limit left %d bytes (counted %d), want %d", got, v.size, editorMaxText)
+	}
+}

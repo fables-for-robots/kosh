@@ -245,13 +245,18 @@ const errorMaxBytes = 64 << 10
 // its first errorMaxBytes bytes, with "…" when there were more, cleaned.
 // The flash, the editor and a table each keep an error's text so, and
 // so cost a bounded amount at each reading.
+// The mark is added after the cleaning, which would take it into an
+// escape sequence the cut fell in.
 func errorText(s string) string {
-	if len(s) > errorMaxBytes {
-		i := errorMaxBytes
-		for i > 0 && !utf8.RuneStart(s[i]) {
-			i--
-		}
-		s = s[:i] + "…"
+	if len(s) <= errorMaxBytes {
+		return clean(s)
 	}
-	return clean(s)
+	i := errorMaxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return clean(s[:i]) + "…"
 }
+
+// errorLine is errorText on one line: a line feed becomes a space.
+func errorLine(s string) string { return strings.ReplaceAll(errorText(s), "\n", " ") }

@@ -256,8 +256,19 @@ func TestHugeErrorIsCut(t *testing.T) {
 		}
 	}
 	bounded("errorText", errorText(huge))
+	// The logs keep an error on one line.
+	if l := errorLine(strings.Repeat("broken\n", 1<<15)); strings.Contains(l, "\n") {
+		t.Error("errorLine keeps a line feed")
+	} else {
+		bounded("errorLine", l)
+	}
 	if got := errorText("short\x1b[2J"); got != "short" {
 		t.Errorf("a short error is %q", got)
+	}
+	// A cut inside an OSC string still shows: the mark comes after the
+	// cleaning, which would take it into the string.
+	if got := errorText("denied \x1b]0;" + strings.Repeat("y", errorMaxBytes)); !strings.HasSuffix(got, "…") || strings.Contains(got, "yyy") {
+		t.Errorf("a cut inside an OSC string is %q", got[:min(len(got), 40)])
 	}
 	// A cut in a character of several bytes keeps the text UTF-8.
 	if got := errorText(strings.Repeat("é", errorMaxBytes)); !utf8.ValidString(got) {

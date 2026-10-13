@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
@@ -155,6 +157,34 @@ func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why strin
 	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: yaml, size: len(yaml)}, ""
 }
 
+// editorTab is what the text area makes of a tab.
+const editorTab = "    "
+
+// editorHeld returns s as the text area holds what is pasted into it,
+// as its sanitizer makes it, so that it has nothing left to change: a
+// CRLF, and a CR alone, become one line feed; a tab becomes editorTab;
+// U+FFFD and bytes that are not UTF-8, and every control character but
+// the line feed, are dropped. Bidirectional controls are dropped too,
+// which the text area would keep: the editor draws its text as it holds
+// it, and opens no text that clean would change.
+func editorHeld(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\r' || r == '\n':
+			b.WriteByte('\n')
+		case r == '\t':
+			b.WriteString(editorTab)
+		case r == utf8.RuneError, unicode.IsControl(r), isBidiControl(r):
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // Init calls onOpen.
 func (v *editorView) Init() tea.Cmd {
 	if v.onOpen != nil {
@@ -199,15 +229,19 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 
 // input gives msg to the text area, unless what it adds would take the
 // text past editorMaxText bytes or editorTextMaxRows lines: then the
-// text and the cursor stay as they were, and the flash says why.
+// text and the cursor stay as they were, and the flash says why. A
+// paste is measured, and given to the text area, as the text area holds
+// it (editorHeld), so that it is taken whole or not at all.
 func (v *editorView) input(msg tea.Msg) tea.Cmd {
 	added, rows := 0, 0
 	switch m := msg.(type) {
 	case tea.PasteMsg:
+		m.Content = editorHeld(m.Content)
+		msg = m
 		added = len(m.Content)
 		rows = strings.Count(m.Content, "\n")
 	case tea.KeyPressMsg:
-		added = len(m.Text)
+		added = len(editorHeld(m.Text))
 		if m.String() == "enter" {
 			added, rows = max(added, 1), 1
 		}
