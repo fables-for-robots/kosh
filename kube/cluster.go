@@ -163,6 +163,7 @@ func (c *Cluster) Session(ctx context.Context, grant keys.Grant) Session {
 
 // Close stops every informer and everything else the Cluster runs.
 func (c *Cluster) Close() {
+	c.stopCaches()
 	c.cancel()
 	c.wg.Wait()
 }
