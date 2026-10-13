@@ -24,7 +24,8 @@ The key list: the file that says whose SSH key kosh accepts, and whether as a fu
 6. `Grant.Name` is the comment, whole, with the spaces it has inside (`Dragan's laptop`); when the comment is empty it is the fingerprint. `Grant.Fingerprint` is `ssh.FingerprintSHA256(key)`.
 7. A key on several accepted lines: read-only if any of them says so, the name of the first.
 8. What people write (Review Focus 5): a UTF-8 byte order mark at the start of the file is ignored; `\r\n` line ends work; a last line without a line feed works; a line longer than 64 KiB is rejected with a reason that says it is too long, and the lines after it are still read. `bufio.Scanner` with its default buffer fails the whole read on such a line: do not let it.
-9. Every key type `ssh.ParseAuthorizedKey` accepts is accepted.
+9. Every key type `ssh.ParseAuthorizedKey` accepts is accepted, except a certificate (`*ssh.Certificate`), which is rejected with the reason `certificates are not accepted: list the key itself`. (Added after the task's review.)
+9a. A line whose comment begins with the word `read-only`, in any case, is rejected with the reason `read-only is an option and goes in front of the key`. (Added after the task's review.)
 10. `Parse` never fails. A reader that returns an error mid-way yields the keys read so far and one `Rejected` whose reason is the error, with the number of the line it happened on.
 
 **Set**

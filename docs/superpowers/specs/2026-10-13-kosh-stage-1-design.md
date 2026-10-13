@@ -164,7 +164,12 @@ read-only ssh-ed25519 AAAAC3Nza...  guest@laptop
   it has none.
 - **A key that is listed twice** is read-only if any of its lines says
   so, and has the name of its first line.
-- Every key type `golang.org/x/crypto/ssh` reads is accepted.
+- **A comment that begins with the word `read-only`** rejects the line:
+  `ssh-ed25519 AAAA… read-only guest` is how a read-only key is written
+  wrongly, and as the format stands it would be a full key.
+- Every key type `golang.org/x/crypto/ssh` reads is accepted, **except
+  certificates**: kosh checks no certificate's validity, principals or
+  authority, so a line that holds one is rejected.
 
 **Reloading.** kosh reads the file again every 2 seconds and takes it
 over when its content has changed. That follows the way a ConfigMap is
