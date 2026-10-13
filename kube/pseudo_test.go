@@ -13,7 +13,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -126,10 +125,18 @@ func TestContainersKeepTheirRowsWhenARelistFails(t *testing.T) {
 	}
 }
 
-var (
-	readRoleBindings        = Resource{GVR: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}, Kind: "RoleBinding", Namespaced: true}
-	readClusterRoleBindings = Resource{GVR: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}, Kind: "ClusterRoleBinding"}
-)
+// readResources are standardResources and the bindings of roles.
+func readResources() []*metav1.APIResourceList {
+	rr := standardResources()
+	for _, l := range rr {
+		if l.GroupVersion == "rbac.authorization.k8s.io/v1" {
+			l.APIResources = append(l.APIResources,
+				metav1.APIResource{Name: "rolebindings", SingularName: "rolebinding", Namespaced: true, Kind: "RoleBinding", Verbs: allVerbs},
+				metav1.APIResource{Name: "clusterrolebindings", SingularName: "clusterrolebinding", Kind: "ClusterRoleBinding", Verbs: allVerbs})
+		}
+	}
+	return rr
+}
 
 func readRole(namespace, name string, rules ...rbacv1.PolicyRule) *rbacv1.Role {
 	return &rbacv1.Role{ObjectMeta: objMeta(namespace, name), Rules: rules}
@@ -155,7 +162,7 @@ func TestRulesOfARole(t *testing.T) {
 	podsRule := readRule("", "pods", "get", "list")
 	nsPodsRule := readRule("", "pods", "get", "list", "watch", "delete")
 	allRule := readRule("*", "*", "*")
-	e := newEnv(t, envConfig{},
+	e := newEnv(t, envConfig{resources: readResources()},
 		readRole("default", "reader", podsRule),
 		readRole("other", "reader", nsPodsRule),
 		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "reader"}, Rules: []rbacv1.PolicyRule{allRule}},
@@ -167,6 +174,8 @@ func TestRulesOfARole(t *testing.T) {
 			RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "reader"}},
 	)
 	s := e.session(t)
+	roleBindings := e.resource(t, "rbac.authorization.k8s.io", "rolebindings")
+	clusterRoleBindings := e.resource(t, "rbac.authorization.k8s.io", "clusterrolebindings")
 	for _, tc := range []struct {
 		name string
 		of   ObjectRef
@@ -174,9 +183,9 @@ func TestRulesOfARole(t *testing.T) {
 	}{
 		{"a role", ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "roles"), Namespace: "default", Name: "reader"}, podsRule},
 		{"a clusterrole", ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "clusterroles"), Name: "reader"}, allRule},
-		{"a rolebinding to a role, of its namespace", ObjectRef{Resource: readRoleBindings, Namespace: "other", Name: "to-role"}, nsPodsRule},
-		{"a rolebinding to a clusterrole", ObjectRef{Resource: readRoleBindings, Namespace: "default", Name: "to-clusterrole"}, allRule},
-		{"a clusterrolebinding", ObjectRef{Resource: readClusterRoleBindings, Name: "crb"}, allRule},
+		{"a rolebinding to a role, of its namespace", ObjectRef{Resource: roleBindings, Namespace: "other", Name: "to-role"}, nsPodsRule},
+		{"a rolebinding to a clusterrole", ObjectRef{Resource: roleBindings, Namespace: "default", Name: "to-clusterrole"}, allRule},
+		{"a clusterrolebinding", ObjectRef{Resource: clusterRoleBindings, Name: "crb"}, allRule},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := watchOf(t, s, Query{Resource: Rules, Of: &tc.of})
@@ -298,9 +307,9 @@ func TestPseudoWatchesEndWithTheSession(t *testing.T) {
 }
 
 func TestRulesOfABindingWhoseRoleIsGone(t *testing.T) {
-	e := newEnv(t, envConfig{}, &rbacv1.RoleBinding{ObjectMeta: objMeta("default", "orphan"),
+	e := newEnv(t, envConfig{resources: readResources()}, &rbacv1.RoleBinding{ObjectMeta: objMeta("default", "orphan"),
 		RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "gone"}})
-	of := ObjectRef{Resource: readRoleBindings, Namespace: "default", Name: "orphan"}
+	of := ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "rolebindings"), Namespace: "default", Name: "orphan"}
 	w := watchOf(t, e.session(t), Query{Resource: Rules, Of: &of})
 	eventually(t, "Err", func() bool {
 		tab := w.Table(time.Now())

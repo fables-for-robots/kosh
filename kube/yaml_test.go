@@ -164,7 +164,7 @@ func readActionCounts(e *env) (int, int) {
 	return len(e.dyn.Actions()), len(e.typed.Actions())
 }
 
-func TestASecretByItsKindIsRefusedReadOnly(t *testing.T) {
+func TestASecretByItsKindIsRefused(t *testing.T) {
 	e := newEnv(t, envConfig{}, readSecret(), readConfigMap())
 	// A configmap's resource that says it is of the kind Secret: the
 	// Secret's describer would be chosen by the kind.
@@ -173,53 +173,87 @@ func TestASecretByItsKindIsRefusedReadOnly(t *testing.T) {
 	ref := ObjectRef{Resource: cm, Namespace: "default", Name: "settings"}
 	ro := readSessionOf(t, e, readOnlyGrant)
 	dyn, typed := readActionCounts(e)
-	if _, err := ro.YAML(context.Background(), ref, false); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("YAML: got %v, want ErrReadOnly", err)
-	}
-	if _, err := ro.Describe(context.Background(), ref); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("Describe: got %v, want ErrReadOnly", err)
+	for _, s := range []*session{ro, e.session(t)} {
+		if _, err := s.YAML(context.Background(), ref, false); !errors.Is(err, ErrUnknownResource) {
+			t.Errorf("YAML, read-only %v: got %v, want ErrUnknownResource", s.grant.ReadOnly, err)
+		}
+		if _, err := s.Describe(context.Background(), ref); !errors.Is(err, ErrUnknownResource) {
+			t.Errorf("Describe, read-only %v: got %v, want ErrUnknownResource", s.grant.ReadOnly, err)
+		}
 	}
 	if d, ty := readActionCounts(e); d != dyn || ty != typed {
 		t.Errorf("something was read: %v %v", e.dyn.Actions()[dyn:], e.typed.Actions()[typed:])
 	}
+	// maySee, the last line, refuses it by its kind too.
+	if err := ro.maySee(ref); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("maySee, read-only: got %v, want ErrReadOnly", err)
+	}
+	if err := e.session(t).maySee(ref); err != nil {
+		t.Errorf("maySee, full: got %v", err)
+	}
 }
 
-func TestAResourceThatIsAPathIsRefused(t *testing.T) {
+func TestAReferenceTheClusterDoesNotKnowIsRefused(t *testing.T) {
 	e := newEnv(t, envConfig{}, readSecret(), readConfigMap(), readPodWith("default", "web", nil, "app"))
 	f := &readFakeLogs{}
 	e.c.openLog = f.open
 	ctx := context.Background()
-	bad := func(resource string) Resource {
+	with := func(change func(*Resource)) Resource {
 		r := e.resource(t, "", "configmaps")
-		r.GVR.Resource = resource
+		change(&r)
 		return r
 	}
-	for _, res := range []Resource{bad("configmaps/../secrets"), bad("../secrets"), bad(".."), bad("")} {
-		ref := ObjectRef{Resource: res, Namespace: "default", Name: "token"}
-		for _, g := range []struct {
-			name string
-			s    *session
-		}{{"read-only", readSessionOf(t, e, readOnlyGrant)}, {"full", e.session(t)}} {
+	resource := func(s string) Resource { return with(func(r *Resource) { r.GVR.Resource = s }) }
+	group := func(s string) Resource { return with(func(r *Resource) { r.GVR.Group = s }) }
+	version := func(s string) Resource { return with(func(r *Resource) { r.GVR.Version = s }) }
+	for _, tc := range []struct {
+		name string
+		res  Resource
+	}{
+		{"resource .", resource(".")},
+		{"resource ./secrets", resource("./secrets")},
+		{"resource secrets/.", resource("secrets/.")},
+		{"resource Secrets", resource("Secrets")},
+		{"resource ' secrets'", resource(" secrets")},
+		{"resource secrets%2f", resource("secrets%2f")},
+		{"resource empty", resource("")},
+		{"resource configmaps/../secrets", resource("configmaps/../secrets")},
+		{"resource ..", resource("..")},
+		{"group .", group(".")},
+		{"group a..b", group("a..b")},
+		{"group -x", group("-x")},
+		{"version .", version(".")},
+		{"version ../v1", version("../v1")},
+		{"not discovered", with(func(r *Resource) { r.GVR.Resource, r.Kind = "gizmos", "Gizmo" })},
+		{"another kind", with(func(r *Resource) { r.Kind = "Secret" })},
+		{"another scope", with(func(r *Resource) { r.Namespaced = false })},
+		{"the containers table", Containers},
+		{"the rules table", Rules},
+	} {
+		// Of the "." resource, the name "secrets" would be the path of
+		// every Secret of the namespace.
+		ref := ObjectRef{Resource: tc.res, Namespace: "default", Name: "secrets"}
+		for _, s := range []*session{readSessionOf(t, e, readOnlyGrant), e.session(t)} {
 			dyn, typed := readActionCounts(e)
 			calls := map[string]error{}
-			_, calls["YAML"] = g.s.YAML(ctx, ref, false)
-			_, calls["Describe"] = g.s.Describe(ctx, ref)
-			_, calls["Owner"] = g.s.Owner(ctx, ref)
-			_, calls["Images"] = g.s.Images(ctx, ref)
-			_, calls["Replicas"] = g.s.Replicas(ctx, ref)
-			_, calls["Logs"] = g.s.Logs(ctx, ref, LogOptions{})
-			_, calls["Watch Containers"] = g.s.Watch(Query{Resource: Containers, Of: &ref})
-			_, calls["Watch Rules"] = g.s.Watch(Query{Resource: Rules, Of: &ref})
-			if g.name == "full" {
-				_, calls["SecretData"] = g.s.SecretData(ctx, ref)
+			_, calls["YAML"] = s.YAML(ctx, ref, false)
+			_, calls["Describe"] = s.Describe(ctx, ref)
+			_, calls["Owner"] = s.Owner(ctx, ref)
+			_, calls["Images"] = s.Images(ctx, ref)
+			_, calls["Replicas"] = s.Replicas(ctx, ref)
+			_, calls["Logs"] = s.Logs(ctx, ref, LogOptions{})
+			_, calls["Watch Containers"] = s.Watch(Query{Resource: Containers, Of: &ref})
+			_, calls["Watch Rules"] = s.Watch(Query{Resource: Rules, Of: &ref})
+			if !s.grant.ReadOnly {
+				_, calls["SecretData"] = s.SecretData(ctx, ref)
 			}
 			for m, err := range calls {
-				if !errors.Is(err, errNotAResource) {
-					t.Errorf("%s, %s of %q: got %v, want errNotAResource", g.name, m, res.GVR.Resource, err)
+				if !errors.Is(err, ErrUnknownResource) {
+					t.Errorf("%s, read-only %v, %s: got %v, want ErrUnknownResource", tc.name, s.grant.ReadOnly, m, err)
 				}
 			}
 			if d, ty := readActionCounts(e); d != dyn || ty != typed {
-				t.Errorf("%s, %q: something was read: %v %v", g.name, res.GVR.Resource, e.dyn.Actions()[dyn:], e.typed.Actions()[typed:])
+				t.Errorf("%s, read-only %v: something was read: %v %v", tc.name, s.grant.ReadOnly, e.dyn.Actions()[dyn:], e.typed.Actions()[typed:])
 			}
 		}
 	}
@@ -242,5 +276,18 @@ func TestDescribeConfig(t *testing.T) {
 	}
 	if cfg.Timeout != 0 {
 		t.Errorf("the Cluster's config was changed: timeout %v", cfg.Timeout)
+	}
+
+	// A config with a shorter timeout of its own keeps it.
+	short := &rest.Config{Host: cfg.Host, Timeout: 2 * time.Second}
+	if got := describeConfig(context.Background(), short).Timeout; got != 2*time.Second {
+		t.Errorf("a config of 2s, without a deadline: %v", got)
+	}
+	if got := describeConfig(ctx, short).Timeout; got != 2*time.Second {
+		t.Errorf("a config of 2s, a deadline in 5s: %v", got)
+	}
+	long := &rest.Config{Host: cfg.Host, Timeout: time.Minute}
+	if got := describeConfig(context.Background(), long).Timeout; got != 30*time.Second {
+		t.Errorf("a config of 1m, without a deadline: %v", got)
 	}
 }

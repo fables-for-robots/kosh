@@ -17,7 +17,7 @@ func (s *session) SecretData(ctx context.Context, ref ObjectRef) ([]SecretEntry,
 	if s.grant.ReadOnly {
 		return nil, ErrReadOnly
 	}
-	if err := checkRef(ref); err != nil {
+	if err := s.c.checkRef(ref); err != nil {
 		return nil, err
 	}
 	if !ref.Resource.Is("", "secrets") {

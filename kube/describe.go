@@ -29,9 +29,10 @@ var errNoConfig = errors.New("describe needs a connection to the API server, and
 // included: kubectl's describer of its kind, or for a kind that has
 // none, the generic describer. A Secret is refused to a read-only grant
 // before anything is read. The describers take no context: each of
-// their requests is bounded by ctx's deadline, or by describeTimeout.
+// their requests, not the describe as a whole, is bounded as
+// describeConfig says.
 func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
-	if err := checkRef(ref); err != nil {
+	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}
 	if err := s.maySee(ref); err != nil {
@@ -64,14 +65,20 @@ func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
 }
 
 // describeConfig is the config the describers of one Describe are made
-// with: cfg, with every request bounded by ctx's deadline, or by
-// describeTimeout when ctx has none. The describers take no context, so
-// this is what bounds a call that hangs.
+// with: cfg, with a timeout that is the time left until ctx's deadline,
+// or describeTimeout when ctx has none, or cfg's own timeout when that
+// is shorter. The timeout bounds each request of the describe, not the
+// describe as a whole, which may make several. The describers take no
+// context, so this is what bounds a request that hangs.
 func describeConfig(ctx context.Context, cfg *rest.Config) *rest.Config {
+	own := cfg.Timeout
 	cfg = rest.CopyConfig(cfg)
 	cfg.Timeout = describeTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		cfg.Timeout = max(time.Until(deadline), time.Millisecond)
+	}
+	if own > 0 {
+		cfg.Timeout = min(cfg.Timeout, own)
 	}
 	return cfg
 }

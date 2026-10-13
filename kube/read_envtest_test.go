@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -132,7 +133,7 @@ func TestEnvDescribe(t *testing.T) {
 	}
 }
 
-func TestEnvDescribeSecretShowsNoValue(t *testing.T) {
+func TestEnvDescribeOfAnOpaqueSecretShowsNoValue(t *testing.T) {
 	cfg := startAPIServer(t)
 	c := newEnvCluster(t, cfg, Options{})
 	typed := kubernetes.NewForConfigOrDie(cfg)
@@ -215,5 +216,57 @@ func TestEnvOwner(t *testing.T) {
 	}
 	if want := (ObjectRef{Resource: readEnvResolve(t, s, "deployments"), Namespace: "default", Name: "web"}); got.String() != want.String() || got.Resource.Kind != "Deployment" {
 		t.Errorf("owner %s (%s), want %s", got, got.Resource.Kind, want)
+	}
+}
+
+// Ordinary references, as discovery made them, pass checkRef and are
+// read.
+func TestEnvOrdinaryReferencesAreRead(t *testing.T) {
+	cfg := startAPIServer(t)
+	c := newEnvCluster(t, cfg, Options{})
+	typed := kubernetes.NewForConfigOrDie(cfg)
+	ctx := context.Background()
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}},
+	}
+	if _, err := typed.CoreV1().Pods("default").Create(ctx, p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := typed.AppsV1().Deployments("default").Create(ctx, readEnvDeployment("web"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	readEnvWidget(t, cfg, c, "sprocket")
+	s := c.Session(ctx, readOnlyGrant)
+	pod := ObjectRef{Resource: readEnvResolve(t, s, "pods"), Namespace: "default", Name: "web"}
+	deploy := ObjectRef{Resource: readEnvResolve(t, s, "deployments"), Namespace: "default", Name: "web"}
+	widget := ObjectRef{Resource: readEnvResolve(t, s, "widgets"), Namespace: "default", Name: "sprocket"}
+
+	for _, ref := range []ObjectRef{pod, deploy, widget} {
+		if text, err := s.YAML(ctx, ref, false); err != nil || !strings.Contains(text, ref.Name) {
+			t.Errorf("YAML of %s: %v", ref, err)
+		}
+		if text, err := s.Describe(ctx, ref); err != nil || !strings.Contains(text, ref.Name) {
+			t.Errorf("Describe of %s: %v", ref, err)
+		}
+		if _, err := s.Owner(ctx, ref); !errors.Is(err, ErrNoOwner) {
+			t.Errorf("Owner of %s: %v, want ErrNoOwner", ref, err)
+		}
+	}
+	if images, err := s.Images(ctx, deploy); err != nil || len(images) != 1 || images[0].Image != "nginx" {
+		t.Errorf("Images: %+v, %v", images, err)
+	}
+	if n, err := s.Replicas(ctx, deploy); err != nil || n != 1 {
+		t.Errorf("Replicas: %d, %v; want the default 1", n, err)
+	}
+	// Without a kubelet the log cannot be opened: the stream says so.
+	for _, ref := range []ObjectRef{pod, deploy} {
+		ls, err := s.Logs(ctx, ref, LogOptions{})
+		if err != nil {
+			t.Errorf("Logs of %s: %v", ref, err)
+			continue
+		}
+		readCollect(t, ls)
+		ls.Close()
 	}
 }

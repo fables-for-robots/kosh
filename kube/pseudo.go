@@ -24,7 +24,7 @@ func (s *session) watchPseudo(q Query) (Watch, error) {
 		return nil, ErrNoRelation
 	}
 	of := *q.Of
-	if err := checkRef(of); err != nil {
+	if err := s.c.checkRef(of); err != nil {
 		return nil, err
 	}
 	switch {
