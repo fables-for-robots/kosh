@@ -6,6 +6,7 @@ package irohnet
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"slices"
@@ -20,6 +21,11 @@ import (
 
 // relayWait is how long Listen waits for the home relay.
 const relayWait = 15 * time.Second
+
+// addrAnnouncer is what refreshAddrs hands the addresses to: mDNS.
+type addrAnnouncer interface {
+	setAddrs(addrs []netip.AddrPort)
+}
 
 // addrRefresh is how often the machine's addresses are read again, so
 // that the announcements follow them.
@@ -41,7 +47,11 @@ func (l *Listener) announce(ctx context.Context, cfg Config) error {
 			m = nil
 		}
 	}
-	addrs, _ := l.refreshAddrs(m)
+	var la addrAnnouncer
+	if m != nil {
+		la = m
+	}
+	addrs, _ := l.refreshAddrs(readInterfaces, ep.LocalAddr(), la)
 	if m != nil {
 		l.wg.Add(1)
 		go func() {
@@ -79,7 +89,7 @@ func (l *Listener) announce(ctx context.Context, cfg Config) error {
 	}
 
 	l.wg.Add(1)
-	go l.followAddrs(m)
+	go l.followAddrs(la)
 	return nil
 }
 
@@ -87,13 +97,19 @@ func (l *Listener) announce(ctx context.Context, cfg Config) error {
 // announced has changed, pins the new addresses as the endpoint's direct
 // addresses, which makes the pkarr record anew, and hands them to m, when
 // there is mDNS. It returns the addresses and whether they changed.
-func (l *Listener) refreshAddrs(m *mdnsAnnouncer) ([]netip.AddrPort, bool) {
-	ifaces, err := readInterfaces()
+func (l *Listener) refreshAddrs(read func() ([]iface, error), local netip.AddrPort, m addrAnnouncer) ([]netip.AddrPort, bool) {
+	ifaces, err := read()
 	if err != nil {
-		l.log.Debug("the machine's addresses cannot be read", "error", err)
-		return nil, false
+		// Until they can be read again the pkarr record holds the relay
+		// alone, and mDNS goes on with what it had.
+		l.log.Debug("the machine's addresses cannot be read; the pkarr record holds the relay alone", "error", err)
+		l.amu.Lock()
+		old := l.announced
+		l.hidden = nil
+		l.amu.Unlock()
+		return old, false
 	}
-	addrs := announcedAddrs(ifaces, l.ep.LocalAddr())
+	addrs := announcedAddrs(ifaces, local)
 	hidden := hiddenAddrs(ifaces, addrs)
 	l.amu.Lock()
 	old := l.announced
@@ -118,7 +134,7 @@ func (l *Listener) refreshAddrs(m *mdnsAnnouncer) ([]netip.AddrPort, bool) {
 
 // followAddrs reads the machine's addresses every addrRefresh until the
 // listener is closed, and announces them anew when they changed.
-func (l *Listener) followAddrs(m *mdnsAnnouncer) {
+func (l *Listener) followAddrs(m addrAnnouncer) {
 	defer l.wg.Done()
 	t := time.NewTicker(addrRefresh)
 	defer t.Stop()
@@ -128,7 +144,7 @@ func (l *Listener) followAddrs(m *mdnsAnnouncer) {
 			return
 		case <-t.C:
 		}
-		if addrs, changed := l.refreshAddrs(m); changed {
+		if addrs, changed := l.refreshAddrs(readInterfaces, l.ep.LocalAddr(), m); changed {
 			l.log.Info("the announced addresses changed", "addrs", addrs)
 		}
 	}
@@ -163,18 +179,24 @@ func (l *Listener) publishPkarr(key irohkey.SecretKey) error {
 	return nil
 }
 
-// bridgePrefixes begin the names of the interfaces of containers and
-// virtual machines. Their addresses cannot be reached from another machine,
-// and every dead address that is advertised is one more a client waits on.
-var bridgePrefixes = []string{"docker", "br-", "cni", "flannel", "veth", "virbr", "lxc"}
-
-func isBridgeName(name string) bool {
-	for _, p := range bridgePrefixes {
-		if strings.HasPrefix(name, p) {
-			return true
+// isDockerBridge reports whether name is certainly one of Docker's
+// bridges, docker0 or a Docker network's "br-" and 12 hex characters,
+// whose addresses no other machine reaches. Nothing else is recognised by
+// name: a LAN may well be bridged as br-lan.
+func isDockerBridge(name string) bool {
+	if name == "docker0" {
+		return true
+	}
+	id, ok := strings.CutPrefix(name, "br-")
+	if !ok || len(id) != 12 {
+		return false
+	}
+	for _, c := range id {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // iface is the name, the flags and the addresses of one network
@@ -187,7 +209,8 @@ type iface struct {
 }
 
 // readInterfaces lists the machine's interfaces. An interface whose
-// addresses cannot be read is listed without them.
+// addresses cannot be read fails it all: what is hidden from the pkarr
+// record cannot be known without them.
 func readInterfaces() ([]iface, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -195,7 +218,10 @@ func readInterfaces() ([]iface, error) {
 	}
 	out := make([]iface, 0, len(ifaces))
 	for _, ifc := range ifaces {
-		addrs, _ := ifc.Addrs()
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("addresses of %s: %w", ifc.Name, err)
+		}
 		out = append(out, iface{name: ifc.Name, flags: ifc.Flags, addrs: addrs})
 	}
 	return out, nil
@@ -238,7 +264,7 @@ func announcedAddrs(ifaces []iface, local netip.AddrPort) []netip.AddrPort {
 	var out []netip.AddrPort
 	seen := make(map[netip.Addr]bool)
 	for _, ifc := range ifaces {
-		if !isLAN(ifc.flags) || isBridgeName(ifc.name) {
+		if !isLAN(ifc.flags) || isDockerBridge(ifc.name) {
 			continue
 		}
 		for _, ip := range ifaceIPs(ifc) {
@@ -275,15 +301,20 @@ func hiddenAddrs(ifaces []iface, announced []netip.AddrPort) map[netip.Addr]bool
 }
 
 // publishable is what of the endpoint's addresses the pkarr record
-// holds: every address but the IP addresses nobody can dial (invalid,
-// unspecified) and those that are hidden. The publisher's own default
-// filter would publish the relay alone.
+// holds. It fails closed: an IP address is left out when it is invalid,
+// unspecified, loopback or link-local, whatever the interfaces say, or
+// hidden; and with hidden nil, while the interfaces cannot be read, every
+// IP address is left out and the record holds the relay alone. The
+// publisher's own default filter would publish the relay alone always.
 func publishable(addrs []netaddr.TransportAddr, hidden map[netip.Addr]bool) []netaddr.TransportAddr {
 	out := make([]netaddr.TransportAddr, 0, len(addrs))
 	for _, a := range addrs {
-		if ip, ok := a.(netaddr.IPAddr); ok &&
-			(!ip.Addr.IsValid() || ip.Addr.Addr().IsUnspecified() || hidden[ip.Addr.Addr().Unmap()]) {
-			continue
+		if ip, ok := a.(netaddr.IPAddr); ok {
+			addr := ip.Addr.Addr().Unmap()
+			if hidden == nil || !ip.Addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() ||
+				addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || hidden[addr] {
+				continue
+			}
 		}
 		out = append(out, a)
 	}
