@@ -280,6 +280,14 @@ func TestCloseStopsEverything(t *testing.T) {
 	eventually(t, "the first list", func() bool { return synced(k) })
 	j := acquire(t, e, render.Jobs)
 	e.c.release(j) // idle, with its timer running
+	e.c.tables = &fakeTables{table: &metav1.Table{}}
+	s := e.session(t)
+	if _, err := s.Watch(Query{Resource: e.resource(t, "example.com", "widgets")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Watch(Query{Resource: e.resource(t, "", "pods")}); err != nil {
+		t.Fatal(err)
+	}
 	e.c.Close()
 	e.c.Close()
 	eventually(t, "the goroutines of the Cluster are gone", func() bool {

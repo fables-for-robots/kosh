@@ -126,6 +126,14 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 		cancel: cancel,
 		caches: map[schema.GroupVersionResource]*kindCache{},
 	}
+	if cfg != nil {
+		tables, err := newRESTTables(cfg)
+		if err != nil {
+			c.log.Error("the API server's tables cannot be read", "err", err)
+		} else {
+			c.tables = tables
+		}
+	}
 	if resources == nil {
 		c.refresh(ctx)
 	} else {
