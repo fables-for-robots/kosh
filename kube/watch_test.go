@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,6 +174,43 @@ func TestWatchStaleWhenTheWatchBreaks(t *testing.T) {
 		tab := w.Table(time.Now())
 		return tab.Stale && len(tab.Rows) == 1 && tab.Err == nil
 	})
+}
+
+func TestWatchKeepsItsRowsWhenARelistFails(t *testing.T) {
+	var fw atomic.Pointer[watch.FakeWatcher]
+	var lists atomic.Int32
+	forbidden := apierrors.NewForbidden(podsResource, "", errors.New("no"))
+	e := newEnv(t, envConfig{before: func(e *env) {
+		e.dyn.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+			if fw.Load() != nil {
+				return true, nil, apierrors.NewTooManyRequests("the API is busy", 1)
+			}
+			w := watch.NewFakeWithChanSize(1, false)
+			fw.Store(w)
+			return true, w, nil
+		})
+		e.dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+			if lists.Add(1) > 1 {
+				return true, nil, forbidden
+			}
+			return false, nil, nil
+		})
+	}}, pod("default", "a", nil))
+	w := watchOf(t, e.session(t), Query{Resource: e.resource(t, "", "pods")})
+	rowsWhen(t, w, "default/a")
+	eventually(t, "the watch", func() bool { return fw.Load() != nil })
+
+	// The watch ends with an error, the relist fails.
+	fw.Load().Error(&metav1.Status{Status: metav1.StatusFailure, Code: 500, Reason: metav1.StatusReasonInternalError, Message: "broken"})
+	eventually(t, "the relist", func() bool { return lists.Load() > 1 })
+	var tab Table
+	eventually(t, "the failed relist in the table", func() bool {
+		tab = w.Table(time.Now())
+		return tab.Stale
+	})
+	if tab.Err != nil || len(tab.Rows) != 1 || len(tab.Columns) != 3 {
+		t.Errorf("after a failed relist: err %v, %d rows, %d columns; want the last rows, stale", tab.Err, len(tab.Rows), len(tab.Columns))
+	}
 }
 
 func TestObjectsAreTypedAndWithoutManagedFields(t *testing.T) {

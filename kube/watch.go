@@ -76,10 +76,13 @@ func (s *session) watchTyped(q Query) (Watch, error) {
 
 func (w *typedWatch) Table(now time.Time) Table {
 	synced, stale, err := w.cache.status()
-	if err != nil {
+	if err != nil && !synced {
+		// The first list failed: there is nothing to show but why.
 		return Table{Namespaced: w.res.Namespaced, Err: err}
 	}
-	t := Table{Columns: w.renderer.Columns(), Namespaced: w.res.Namespaced, Stale: stale}
+	// A later list that failed leaves the last rows, which may be out of
+	// date.
+	t := Table{Columns: w.renderer.Columns(), Namespaced: w.res.Namespaced, Stale: stale || err != nil}
 	if !synced {
 		t.Stale = true
 		return t

@@ -60,10 +60,7 @@ func (c *Cluster) acquire(gvr schema.GroupVersionResource) (*kindCache, error) {
 		c.caches[gvr] = k
 	}
 	k.users++
-	if k.idle != nil {
-		k.idle.Stop()
-		k.idle = nil
-	}
+	k.stopTimer()
 	return k, nil
 }
 
@@ -78,12 +75,28 @@ func (c *Cluster) release(k *kindCache) {
 	}
 	k.gen++
 	gen := k.gen
+	// The timer's function is counted in c.wg from now: Close waits for
+	// it, or stopTimer takes it back when it never runs.
+	c.wg.Add(1)
 	k.idle = time.AfterFunc(c.opts.IdleStop, func() { c.stopIdle(k, gen) })
 }
 
+// stopTimer stops k's idle timer, and when its function will not run,
+// takes back what release counted for it. c.mu is held.
+func (k *kindCache) stopTimer() {
+	if k.idle == nil {
+		return
+	}
+	if k.idle.Stop() {
+		k.c.wg.Done()
+	}
+	k.idle = nil
+}
+
 // stopIdle stops k when it has had no user since it became idle the
-// gen-th time.
+// gen-th time. It is the function of an idle timer.
 func (c *Cluster) stopIdle(k *kindCache, gen int) {
+	defer c.wg.Done()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || k.users > 0 || k.gen != gen || c.caches[k.gvr] != k {
@@ -100,10 +113,7 @@ func (c *Cluster) stopCaches() {
 	defer c.mu.Unlock()
 	c.closed = true
 	for gvr, k := range c.caches {
-		if k.idle != nil {
-			k.idle.Stop()
-			k.idle = nil
-		}
+		k.stopTimer()
 		k.cancel()
 		delete(c.caches, gvr)
 	}
