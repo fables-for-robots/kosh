@@ -15,8 +15,9 @@
 # kosh-e2e:<random>, right after it is loaded, and only that tag is used
 # and removed; the cluster, kosh-e2e-<random>, has a kubeconfig of its
 # own. Loading the image built by Nix sets the tag that image carries,
-# ghcr.io/fables-for-robots/kosh:nix, as docker load does; the script
-# neither uses nor removes it afterwards. Whatever happens, it deletes
+# ghcr.io/fables-for-robots/kosh:nix, as docker load does: the script
+# leaves that tag as it found it, put back onto the image it named
+# before, or removed when there was none. Whatever happens, it deletes
 # what it made when it ends.
 set -euo pipefail
 
@@ -61,13 +62,29 @@ export KUBECONFIG=$WORK/kubeconfig
 CREATED_CLUSTER=
 TAGGED=
 FORWARD=
+BUILDING=      # a build of iroh-ssh is under way, in $CACHE/iroh-ssh-build
+NIX_TAG=       # the tag docker load set, until it is as it was found
+NIX_TAG_WAS=   # the image it named before, or empty for none
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { echo "== $*"; }
 
+# restore_nix_tag leaves the tag the loaded image carries as it was found.
+restore_nix_tag() {
+  [ -n "$NIX_TAG" ] || return 0
+  if [ -n "$NIX_TAG_WAS" ]; then
+    docker tag "$NIX_TAG_WAS" "$NIX_TAG" || echo "warning: $NIX_TAG could not be put back onto $NIX_TAG_WAS" >&2
+  else
+    docker rmi "$NIX_TAG" >/dev/null || echo "warning: $NIX_TAG could not be removed" >&2
+  fi
+  NIX_TAG=
+}
+
 cleanup() {
   local status=$?
   set +e
+  restore_nix_tag
+  [ -z "$BUILDING" ] || rm -rf "$CACHE/iroh-ssh-build"
   if [ "$status" != 0 ] && [ -n "$CREATED_CLUSTER" ]; then
     echo "== kosh's log, the test having failed"
     kubectl --namespace "$NAMESPACE" logs deploy/"$RELEASE" --tail=200 2>&1
@@ -91,10 +108,15 @@ if [ -n "${KOSH_E2E_IMAGE:-}" ]; then
 else
   step "the image, built by Nix, as $TAG"
   nix build "$FLAKE#image" --option allow-unsafe-native-code-during-evaluation true --out-link "$WORK/image"
+  # The tag the archive carries, and the image it names now, if any.
+  name=$(tar -xOf "$WORK/image" manifest.json | yq -p json '.[0].RepoTags[0]')
+  NIX_TAG_WAS=$(docker image inspect --format '{{.Id}}' "$name" 2>/dev/null || true)
+  NIX_TAG=$name
   loaded=$(docker load -i "$WORK/image" | sed -n 's/^Loaded image: //p' | tail -1)
-  [ -n "$loaded" ] || fail "docker load named no image"
+  [ "$loaded" = "$name" ] || fail "docker load named '$loaded', the archive '$name'"
   docker tag "$loaded" "$TAG"
   TAGGED=1
+  restore_nix_tag
   # The tag is the image that was built, and not one somebody loaded
   # under the same name in the meantime: its layers are the archive's.
   config=$(tar -xOf "$WORK/image" manifest.json | yq -p json '.[0].Config')
@@ -192,6 +214,8 @@ if [ "$(uname -s)/$(uname -m)" = Linux/x86_64 ]; then
     chmod +x "$iroh_ssh.download"
     mv "$iroh_ssh.download" "$iroh_ssh"
   fi
+  # The cached one too is the one this script knows.
+  echo "$IROH_SSH_SHA256  $iroh_ssh" | sha256sum -c --quiet - || fail "$iroh_ssh is not the release this script knows"
   "$iroh_ssh" --help >/dev/null 2>&1 || {
     echo "the released iroh-ssh does not run here"
     iroh_ssh=
@@ -205,6 +229,7 @@ if [ -z "$iroh_ssh" ]; then
   if [ ! -x "$iroh_ssh" ]; then
     echo "building iroh-ssh at $IROH_SSH_COMMIT with Nix's cargo instead (a few minutes)"
     build=$CACHE/iroh-ssh-build
+    BUILDING=1
     rm -rf "$build"
     git clone --quiet "$IROH_SSH_REPO" "$build/src"
     git -C "$build/src" checkout --quiet "$IROH_SSH_COMMIT"
@@ -212,6 +237,7 @@ if [ -z "$iroh_ssh" ]; then
       nix shell --inputs-from "$FLAKE" nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc \
       --command cargo install --quiet --locked --path "$build/src" --root "$CACHE/iroh-ssh-$IROH_SSH_COMMIT"
     rm -rf "$build"
+    BUILDING=
   fi
 fi
 echo "ok   $iroh_ssh"

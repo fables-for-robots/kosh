@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -205,19 +206,27 @@ func (w *tableWatch) Close() {
 }
 
 // convertTable turns the API server's table into kosh's: names in
-// capitals, a column of priority above 0 Wide, integers, numbers and
-// dates Numeric, a date shown as its age, and for a namespaced resource
-// a NAMESPACE column in front.
+// capitals, a column of priority above 0 Wide, a date shown as its age,
+// and for a namespaced resource a NAMESPACE column in front.
+//
+// Integers, numbers and dates are Numeric and sort by their value, and so
+// is a column whose cells are durations as Kubernetes humanises them
+// ("5m", "3d2h"), with nothing else but empty cells and placeholders
+// ("<none>"). The column named Age, in any case and of any type, is
+// Numeric and sorts by the row's creation time, as the typed renderers'
+// AGE: by the seconds since. A row whose object has no creation time (the
+// server ignored includeObject) sorts there by its cell's duration.
 func convertTable(in *metav1.Table, namespaced bool, now time.Time) Table {
 	t := Table{Namespaced: namespaced}
 	if namespaced {
 		t.Columns = append(t.Columns, render.Column{Name: "NAMESPACE"})
 	}
-	for _, d := range in.ColumnDefinitions {
+	for i, d := range in.ColumnDefinitions {
 		t.Columns = append(t.Columns, render.Column{
-			Name:    strings.ToUpper(d.Name),
-			Wide:    d.Priority > 0,
-			Numeric: d.Type == "integer" || d.Type == "number" || d.Type == "date",
+			Name: strings.ToUpper(d.Name),
+			Wide: d.Priority > 0,
+			Numeric: d.Type == "integer" || d.Type == "number" || d.Type == "date" ||
+				isAge(d) || durationColumn(in.Rows, i),
 		})
 	}
 	for _, r := range in.Rows {
@@ -236,6 +245,9 @@ func convertTable(in *metav1.Table, namespaced bool, now time.Time) Table {
 				v = r.Cells[i]
 			}
 			text, order := cell(d.Type, v, now)
+			if isAge(d) && !m.CreationTimestamp.IsZero() {
+				order = now.Sub(m.CreationTimestamp.Time).Seconds()
+			}
 			row.Cells = append(row.Cells, text)
 			row.Order = append(row.Order, order)
 		}
@@ -244,8 +256,39 @@ func convertTable(in *metav1.Table, namespaced bool, now time.Time) Table {
 	return t
 }
 
+// isAge tells whether d is the column of the objects' ages.
+func isAge(d metav1.TableColumnDefinition) bool {
+	return strings.EqualFold(d.Name, "Age")
+}
+
+// durationColumn tells whether the cells of column i are durations: at
+// least one is, and every other one is empty or a placeholder.
+func durationColumn(rows []metav1.TableRow, i int) bool {
+	found := false
+	for _, r := range rows {
+		if i >= len(r.Cells) || r.Cells[i] == nil {
+			continue
+		}
+		s, ok := r.Cells[i].(string)
+		if !ok {
+			return false
+		}
+		switch s {
+		case "", render.MissingValue, render.NAValue, render.UnknownValue:
+			continue
+		}
+		if _, ok := parseHumanDuration(s); !ok {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 // cell returns the text of a cell of a column of type typ, and what it
-// is sorted by.
+// is sorted by: a number its value, a date (an RFC 3339 time) the seconds
+// since, and a duration as Kubernetes humanises it its seconds, in a
+// column of any type. Any other cell sorts by 0.
 func cell(typ string, v any, now time.Time) (string, float64) {
 	switch typ {
 	case "date":
@@ -264,6 +307,9 @@ func cell(typ string, v any, now time.Time) (string, float64) {
 	case nil:
 		return "", 0
 	case string:
+		if d, ok := parseHumanDuration(v); ok {
+			return v, d.Seconds()
+		}
 		return v, 0
 	default:
 		return fmt.Sprint(v), 0
@@ -287,4 +333,71 @@ func number(v any) (float64, bool) {
 		return f, err == nil
 	}
 	return 0, false
+}
+
+// humanUnits are the units of a humanised duration, the largest first. A
+// year is 365 days, as duration.HumanDuration counts it.
+var humanUnits = []struct {
+	name byte
+	size time.Duration
+}{
+	{'y', 365 * 24 * time.Hour},
+	{'d', 24 * time.Hour},
+	{'h', time.Hour},
+	{'m', time.Minute},
+	{'s', time.Second},
+}
+
+// parseHumanDuration reads a duration in the forms that
+// duration.HumanDuration and ShortHumanDuration of
+// k8s.io/apimachinery/pkg/util/duration print: a number and a unit ("5s",
+// "120m", "3h", "400d", "2y"), or two of them whose units are next to
+// each other, the second less than one of the first ("2m30s", "3h20m",
+// "3d2h", "2y120d"). The numbers are decimal digits without a sign and
+// without a leading zero. Anything else, and a duration too long for a
+// time.Duration, is not a duration: it returns false.
+func parseHumanDuration(s string) (time.Duration, bool) {
+	// No duration a time.Duration holds takes more than 11 characters in
+	// these forms ("9223372036s"): a longer text is not one.
+	if s == "" || len(s) > 11 {
+		return 0, false
+	}
+	var total time.Duration
+	prev := -1 // the unit of the part before, or -1
+	for parts := 0; s != ""; parts++ {
+		if parts == 2 {
+			return 0, false
+		}
+		n := 0
+		for n < len(s) && s[n] >= '0' && s[n] <= '9' {
+			n++
+		}
+		if n == 0 || n == len(s) || (n > 1 && s[0] == '0') {
+			return 0, false
+		}
+		u := -1
+		for i, hu := range humanUnits {
+			if hu.name == s[n] {
+				u = i
+			}
+		}
+		if u < 0 || (prev >= 0 && u != prev+1) {
+			return 0, false
+		}
+		v, err := strconv.ParseInt(s[:n], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		size := humanUnits[u].size
+		if prev >= 0 && v >= int64(humanUnits[prev].size/size) {
+			return 0, false
+		}
+		if v > int64((math.MaxInt64-total)/size) {
+			return 0, false
+		}
+		total += time.Duration(v) * size
+		prev = u
+		s = s[n+1:]
+	}
+	return total, true
 }

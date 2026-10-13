@@ -1,6 +1,8 @@
 # What the end-to-end tests look at, in the namespace default. The
 # images are pulled into the kind node by scripts/test-e2e.sh before
-# this is applied, so that nothing is pulled while the tests run.
+# this is applied, so that nothing is pulled while the tests run; both
+# are Kubernetes' own, from registry.k8s.io, which has no pull limit as
+# Docker Hub has and answered where Docker Hub timed out.
 
 # marker prints a numbered line every second, for the tests of the logs.
 apiVersion: v1
@@ -12,7 +14,7 @@ spec:
   terminationGracePeriodSeconds: 0
   containers:
     - name: marker
-      image: docker.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+      image: registry.k8s.io/e2e-test-images/busybox:1.37.0-2@sha256:690925c6f3493b235eb590113f8c481564dcd4f1962cf7d5b321f185980721ef
       imagePullPolicy: IfNotPresent
       command:
         - sh

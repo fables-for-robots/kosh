@@ -164,6 +164,7 @@ type tableView struct {
 	stop    chan struct{}
 	gen     int
 	closed  bool
+	buried  bool // another view is over it: it does not read (bury)
 	openErr string
 
 	data    ttable
@@ -265,6 +266,9 @@ func (v *tableView) readNow() tea.Cmd {
 // wait waits for the next reading: until the watch changes, but not
 // sooner than readMin after this one, or until readMax has passed.
 func (v *tableView) wait() tea.Cmd {
+	if v.buried {
+		return nil
+	}
 	w, stop, id, gen, now := v.watch, v.stop, v.id, v.gen, v.e.now
 	least, most := v.readMin, v.readMax
 	return waitCmd(func() tea.Msg {
@@ -317,7 +321,10 @@ func (v *tableView) Update(msg tea.Msg) (view, tea.Cmd) {
 		v.apply(msg.table)
 		return v, v.wait()
 	case refreshMsg:
+		v.buried = false
 		return v, v.readNow()
+	case buriedMsg:
+		return v, v.bury()
 	case namespacesMsg:
 		v.ns = msg
 		return v, nil

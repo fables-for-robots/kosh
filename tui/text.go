@@ -70,6 +70,7 @@ type textView struct {
 	autoGen  int
 	autoStop chan struct{}
 	closed   bool
+	buried   bool // another view is over it: r rests (bury)
 
 	// search is the text of the / prompt, re what it searches for, and
 	// matches where it is found, in the order of the text. at is the
@@ -343,7 +344,10 @@ func (v *textView) Update(msg tea.Msg) (view, tea.Cmd) {
 		}
 		return v, v.load(true)
 	case refreshMsg:
-		return v, v.load(false)
+		return v, v.load(v.surface())
+	case buriedMsg:
+		v.bury()
+		return v, nil
 	}
 	return v, nil
 }
@@ -657,6 +661,9 @@ func (v *textView) toggleAuto() tea.Cmd {
 
 // tick waits every, then says that it is time to read again.
 func (v *textView) tick() tea.Cmd {
+	if v.buried {
+		return nil
+	}
 	id, gen, every, stop := v.id, v.autoGen, v.every, v.autoStop
 	return waitCmd(func() tea.Msg {
 		t := time.NewTimer(every)

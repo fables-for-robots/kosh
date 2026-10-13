@@ -18,12 +18,16 @@ env:
 jobs:
   # A tag v* that is not a version would get the images pushed before
   # Helm refused it as the chart's version: nothing is published for it.
+  # The pattern is SemVer's for a version without build metadata: no
+  # leading zero in a number, no empty identifier in the pre-release.
   validate:
     runs-on: ubuntu-24.04
+    permissions: {}
     steps:
       - name: The tag is a version
         run: |
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$TAG" =~ $re ]]; then
             echo "::error::'$TAG' is not a release tag: a release tag is v and a SemVer version without build metadata, as v1.2.3 or v1.2.3-rc.1"
             exit 1
           fi
@@ -109,9 +113,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: cachix/install-nix-action@v31
-      - name: Package and push the chart
+      # The registry's token is given only to the step that logs in and
+      # pushes.
+      - name: Package the chart
+        run: helm package charts/kosh --version "${TAG#v}" --app-version "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+      - name: Push the chart
         run: |
-          helm package charts/kosh --version "${TAG#v}" --app-version "$TAG"
           echo "$TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
           helm push "kosh-${TAG#v}.tgz" oci://ghcr.io/fables-for-robots/charts
         env:

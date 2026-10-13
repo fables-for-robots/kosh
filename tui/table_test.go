@@ -608,11 +608,12 @@ func TestCoveredViewsStillGetTheirMessages(t *testing.T) {
 	hs := newHarness(t, sess, 100, 30)
 	tv := hs.table()
 	hs.send(pushViewMsg{&testView{name: "cover"}})
-	sess.SetTable(q, podsNamed("web-1", "web-2"))
-	hs.await("the covered table to take the new rows", func() bool { return len(tv.shown) == 2 })
-	// And it goes on reading.
-	sess.SetTable(q, podsNamed("web-1", "web-2", "web-3"))
-	hs.await("the covered table to take the next rows", func() bool { return len(tv.shown) == 3 })
+	// A covered table does not read (TestBuriedTableDoesNotRead), but
+	// it takes the messages that are for it.
+	hs.send(useNamespaceMsg{"kube-system"})
+	if tv.ns.current != "kube-system" {
+		t.Errorf("the covered table has the namespace %q", tv.ns.current)
+	}
 }
 
 func TestTableReadsAtIntervals(t *testing.T) {

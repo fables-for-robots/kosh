@@ -22,7 +22,10 @@ const tabWidth = 8
 // The 8-bit forms of the introducers (U+009B and the others) are read as
 // the 7-bit ones. A C0 control character becomes its picture of the
 // Control Pictures block (NUL is ␀, CR is ␍), DEL becomes ␡, and any
-// other C1 control character U+FFFD.
+// other C1 control character U+FFFD. A bidirectional control (U+202A to
+// U+202E, U+2066 to U+2069, U+200E, U+200F, U+061C) becomes U+FFFD too,
+// so that text is drawn in its own order: a name cannot be made to read
+// as another.
 func clean(s string) string {
 	if isPlain(s) {
 		return s
@@ -64,7 +67,7 @@ func clean(s string) string {
 		case r == 0x7f:
 			b.WriteRune(0x2421)
 			i += size
-		case r >= 0x80 && r <= 0x9f:
+		case r >= 0x80 && r <= 0x9f, isBidiControl(r):
 			b.WriteRune(utf8.RuneError)
 			i += size
 		default:
@@ -84,6 +87,12 @@ func isPlain(s string) bool {
 		}
 	}
 	return true
+}
+
+// isBidiControl reports whether r changes the order the terminal draws
+// text in: an embedding, override or isolate, or a directional mark.
+func isBidiControl(r rune) bool {
+	return r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 || r == 0x200e || r == 0x200f || r == 0x061c
 }
 
 // skipEscape returns where the sequence that an ESC at i-1 began ends.

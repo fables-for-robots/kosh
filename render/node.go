@@ -1,4 +1,4 @@
-// Follows k9s's internal/render/node.go (Apache-2.0).
+// Derived from k9s's internal/render/node.go, Copyright Authors of K9s, Apache-2.0 (see LICENSES/Apache-2.0.txt); changed for kosh.
 
 package render
 
