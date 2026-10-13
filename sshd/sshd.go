@@ -147,6 +147,9 @@ type Server struct {
 	// its program and say why. Then its connection is closed: a client
 	// that does not read cannot keep a session kosh has ended.
 	endTimeout time.Duration
+	// minTurn is how long a command's turn with a session's terminal
+	// lasts at least: minTurn, but for a test.
+	minTurn time.Duration
 
 	handshakes atomic.Int64 // connections in the handshake, over every listener
 
@@ -194,6 +197,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		endTimeout: 2 * time.Second,
+		minTurn:    minTurn,
 		listeners:  map[net.Listener]string{},
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},

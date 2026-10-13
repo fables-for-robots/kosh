@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -25,8 +26,9 @@ import (
 
 // exec is Session.Exec.
 func (sess *session) exec(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
-	// refuse tells done why the command is not run.
-	refuse := func(err error) tea.Msg {
+	// tell tells done what became of the command; a nil done is told
+	// nothing, and the program is given no message.
+	tell := func(err error) tea.Msg {
 		if done == nil {
 			return nil
 		}
@@ -34,13 +36,13 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 	}
 	return func() tea.Msg {
 		if sess.over() {
-			return refuse(ErrSessionEnded)
+			return tell(ErrSessionEnded)
 		}
 		// From here on what the client sends is the command's, and the
 		// program's reader is given the mark and its end.
 		in, drained, told := sess.in.give()
 		if in == nil {
-			return refuse(ErrTerminalBusy)
+			return tell(ErrTerminalBusy)
 		}
 		// The mark arrives when the model has every key that was read
 		// before the hand-over. It does not arrive when the reader was
@@ -64,9 +66,15 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 		if sess.over() {
 			// The program takes no command now.
 			sess.in.takeBack(in)
-			return refuse(ErrSessionEnded)
+			return tell(ErrSessionEnded)
 		}
-		return tea.Exec(&turn{sess: sess, run: run, in: in}, done)()
+		return tea.Exec(&turn{sess: sess, run: run, in: in}, func(err error) tea.Msg {
+			// Run has taken the terminal back. When Bubble Tea could not
+			// release the terminal it has not called Run, and tells
+			// this: the terminal is the program's again all the same.
+			sess.in.takeBack(in)
+			return tell(err)
+		})()
 	}
 }
 
@@ -82,7 +90,8 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 // one draws by, and the program draws nothing from then on, though it
 // still takes its keys. The old goroutine has only to be scheduled once,
 // which waiting here lets happen: this is time for it, not a guarantee,
-// and it costs a command that lasts longer than this nothing.
+// and it costs a command that lasts longer than this nothing. What is
+// left to the scheduler is what watchScreen is for.
 const minTurn = 10 * time.Millisecond
 
 // turn is the time one command has the terminal, as a tea.ExecCommand:
@@ -118,29 +127,34 @@ func (t *turn) SetStderr(io.Writer) {}
 func (t *turn) Run() error {
 	sess := t.sess
 	began := time.Now()
-	defer func() {
-		// See minTurn. The command has returned, and what it left
-		// unread waits for the program.
-		if rest := minTurn - time.Since(began); rest > 0 {
-			time.Sleep(rest)
-		}
-	}()
-	defer sess.in.takeBack(t.in)
 	out := &gate{w: sess.raw}
-	defer out.close()
 	ctx, cancel := context.WithCancel(sess.ctx)
-	defer cancel()
 	// In a goroutine of its own: closing the gate waits for a write of
 	// the command to a client that does not read.
 	stop := context.AfterFunc(ctx, func() {
 		sess.in.cut(t.in)
 		out.close()
 	})
-	defer stop()
+	defer func() {
+		stop()
+		cancel()
+		// A write of the command's that is under way is waited for: the
+		// program's output must not run into it. One that the client
+		// does not take ends with the channel or the connection.
+		sess.commandWaits(waitsForWrite)
+		out.close()
+		sess.commandWaits("")
+		sess.in.takeBack(t.in)
+		// See minTurn. What the command left unread waits for the
+		// program.
+		if rest := sess.srv.minTurn - time.Since(began); rest > 0 {
+			time.Sleep(rest)
+		}
+		sess.watchScreen()
+	}()
 	if !sess.beginCommand(cancel) {
 		return ErrSessionEnded
 	}
-	defer sess.endCommand()
 	size, resized, unwatch := sess.win.watch()
 	defer unwatch()
 	return t.run(ctx, Terminal{In: t.in, Out: out, Size: size, Resized: resized})
@@ -353,11 +367,13 @@ func (in *input) pump(r io.Reader) {
 	}
 }
 
-// close ends the input: every reader is told io.EOF once buf is empty,
-// and the pump returns when its Read does, which is when the channel is
-// closed at the latest.
+// close ends the input: what waits in buf is dropped, every reader is
+// told the end from now on (io.EOF, or the channel's error when it had
+// one), and the pump returns when its Read does, which is when the
+// channel is closed at the latest.
 func (in *input) close() {
 	in.mu.Lock()
+	in.buf = nil
 	if in.err == nil {
 		in.err = io.EOF
 	}
@@ -488,3 +504,80 @@ type commandInput struct {
 // Read gives the command what the client sent in its turn, and io.EOF
 // from the end of the turn on.
 func (c *commandInput) Read(b []byte) (int, error) { return c.in.read(b, c) }
+
+// The program's screen after a turn.
+
+// screenCheck is how long after a turn the session looks whether its
+// program has written.
+const screenCheck = 150 * time.Millisecond
+
+// countingWriter is a writer whose calls of Write are counted.
+type countingWriter struct {
+	w io.Writer
+	// n is how many times Write was called, also by a call that has not
+	// returned.
+	n atomic.Int64
+}
+
+// Write writes p to w.
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.n.Add(1)
+	return c.w.Write(p)
+}
+
+// watchScreen is called at the end of a turn, before Bubble Tea takes
+// the terminal back: in screenCheck from now the session looks whether
+// its program has written since.
+//
+// A program that has the terminal back writes: the alternate screen's
+// sequence and its frame, with the renderer's first tick. One that has
+// not written by then has the dead renderer that minTurn tells of, and
+// stays so: a key does not wake it, a new size does not. Another
+// hand-over does, since it starts the renderer anew.
+func (sess *session) watchScreen() {
+	n := sess.out.n.Load()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.overLocked() {
+		return
+	}
+	if sess.screenTimer != nil {
+		sess.screenTimer.Stop()
+	}
+	sess.screenTimer = time.AfterFunc(screenCheck, func() { sess.checkScreen(n) })
+}
+
+// checkScreen repairs the program's screen when the program has written
+// nothing since its output had n writes: it hands the terminal over once
+// more, to a command that only waits, and tells nobody but the log. The
+// end of that turn has the screen looked at again. Nothing is done when
+// the program has written, when the session is over, or when a command
+// has the terminal: that command's turn ends with a look of its own.
+func (sess *session) checkScreen(n int64) {
+	if sess.out.n.Load() != n || sess.over() {
+		return
+	}
+	// As the program would run the command of a hand-over: it returns
+	// nil when the terminal is busy or the session over.
+	msg := sess.exec(func(ctx context.Context, _ Terminal) error {
+		// Not the server's minTurn, which a test may have made nothing.
+		wait := time.NewTimer(minTurn)
+		defer wait.Stop()
+		select {
+		case <-wait.C:
+		case <-ctx.Done():
+		}
+		return nil
+	}, nil)()
+	if msg == nil {
+		return
+	}
+	sess.mu.Lock()
+	p := sess.program
+	sess.mu.Unlock()
+	sess.srv.log.Warn("the program's screen was repaired after a command",
+		"transport", sess.conn.transport, "remote", sess.conn.remote,
+		"key", sess.grant.Name, "fingerprint", fingerprint(sess.key))
+	// Send returns when the program takes it, or has ended.
+	p.Send(msg)
+}
