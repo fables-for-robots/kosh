@@ -319,6 +319,104 @@ func TestParseReaderError(t *testing.T) {
 	}
 }
 
+// newCertificate returns the authorized_keys form of a user certificate
+// for key, valid now and forever, signed by a fresh CA.
+func newCertificate(t *testing.T, key ssh.PublicKey) string {
+	t.Helper()
+	_, caPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := ssh.NewSignerFromKey(caPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &ssh.Certificate{
+		Key:             key,
+		Serial:          1,
+		CertType:        ssh.UserCert,
+		KeyId:           "guest",
+		ValidPrincipals: []string{"guest"},
+		ValidAfter:      uint64(time.Now().Add(-time.Hour).Unix()),
+		ValidBefore:     ssh.CertTimeInfinity,
+	}
+	if err := cert.SignCert(rand.Reader, ca); err != nil {
+		t.Fatal(err)
+	}
+	// The certificate is otherwise valid: its CA's signature checks out.
+	checker := &ssh.CertChecker{IsUserAuthority: func(auth ssh.PublicKey) bool {
+		return string(auth.Marshal()) == string(ca.PublicKey().Marshal())
+	}}
+	if err := checker.CheckCert("guest", cert); err != nil {
+		t.Fatalf("the test's certificate is not valid: %v", err)
+	}
+	return strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(cert)), "\n")
+}
+
+func TestParseRejectsCertificates(t *testing.T) {
+	const reason = "certificates are not accepted: list the key itself"
+	for _, options := range []string{"", "read-only "} {
+		t.Run("options "+strings.TrimSpace(options), func(t *testing.T) {
+			key, _ := newKey(t)
+			line := newCertificate(t, key)
+			if !strings.HasPrefix(line, "ssh-ed25519-cert-v01@openssh.com ") {
+				t.Fatalf("not a certificate line: %.60s", line)
+			}
+			set, rejected := parseString(options + line + " guest\n")
+			if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reason {
+				t.Fatalf("rejected = %+v, want line 1: %s", rejected, reason)
+			}
+			if set.Len() != 0 {
+				t.Errorf("Len = %d, want 0", set.Len())
+			}
+			mustNotGrant(t, set, key)
+		})
+	}
+}
+
+func TestParseReadOnlyAsComment(t *testing.T) {
+	const reason = "read-only is an option and goes in front of the key"
+	for _, tc := range []struct {
+		line     string // with KEY for the key
+		rejected bool
+	}{
+		{"KEY read-only", true},
+		{"KEY READ-ONLY guest", true},
+		{"KEY read-only\tguest", true},
+		{"KEY  Read-Only  guest", true},
+		{"read-only KEY read-only", true},
+		{"read-only KEY READ-ONLY guest", true},
+		{"read-only KEY read-only\tguest", true},
+		{"KEY bob's read-only laptop", false},
+		{"KEY read-only-bot", false},
+		{"KEY read-onlyguest", false},
+		{"read-only KEY read-only-bot", false},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			key, keyLine := newKey(t)
+			set, rejected := parseString(strings.Replace(tc.line, "KEY", keyLine, 1) + "\n")
+			if !tc.rejected {
+				noRejected(t, rejected)
+				mustGrant(t, set, key)
+				return
+			}
+			if len(rejected) != 1 || rejected[0].Reason != reason {
+				t.Fatalf("rejected = %+v, want: %s", rejected, reason)
+			}
+			mustNotGrant(t, set, key)
+		})
+	}
+}
+
+func TestParseCommaOnlyOptionsIsFull(t *testing.T) {
+	key, line := newKey(t)
+	set, rejected := parseString(", " + line + " c\n")
+	noRejected(t, rejected)
+	if g := mustGrant(t, set, key); g.ReadOnly || g.Name != "c" {
+		t.Errorf("grant = %+v, want a full key named c", g)
+	}
+}
+
 func TestNilSetHoldsNothing(t *testing.T) {
 	key, _ := newKey(t)
 	for name, set := range map[string]*Set{"nil": nil, "zero": {}} {

@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -132,6 +133,11 @@ func (s *Set) add(line []byte) (reason string) {
 	if err != nil {
 		return err.Error()
 	}
+	// kosh checks no certificate's validity, principals or CA: a listed
+	// certificate would keep working after it expired.
+	if _, ok := key.(*ssh.Certificate); ok {
+		return "certificates are not accepted: list the key itself"
+	}
 	readOnly := false
 	var unknown []string
 	for _, o := range options {
@@ -143,6 +149,11 @@ func (s *Set) add(line []byte) (reason string) {
 	}
 	if len(unknown) > 0 {
 		return "unknown option " + strings.Join(unknown, ", ")
+	}
+	// "ssh-ed25519 AAAA… read-only guest" would otherwise be a full key
+	// named "read-only guest".
+	if firstWordIs(comment, OptionReadOnly) {
+		return "read-only is an option and goes in front of the key"
 	}
 	wire := string(key.Marshal())
 	if g, ok := s.grants[wire]; ok {
@@ -157,6 +168,16 @@ func (s *Set) add(line []byte) (reason string) {
 	}
 	s.grants[wire] = Grant{Name: name, Fingerprint: fp, ReadOnly: readOnly}
 	return ""
+}
+
+// firstWordIs reports whether the first word of s, up to white space, is
+// word in any case.
+func firstWordIs(s, word string) bool {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexFunc(s, unicode.IsSpace); i >= 0 {
+		s = s[:i]
+	}
+	return strings.EqualFold(s, word)
 }
 
 // Lookup returns the grant of key.
@@ -237,7 +258,9 @@ func parseLogged(path string, data []byte, log *slog.Logger, msg string) *Set {
 // that cannot be read then is an empty set, until it can be read again.
 // Watch returns when ctx is done. It is for a list that Open returned.
 func (l *List) Watch(ctx context.Context, interval time.Duration) {
-	if l.path == "" {
+	// A list without a path has no file to read, and an interval of zero
+	// or less is no interval: time.NewTicker would panic on it.
+	if l.path == "" || interval <= 0 {
 		return
 	}
 	tick := time.NewTicker(interval)

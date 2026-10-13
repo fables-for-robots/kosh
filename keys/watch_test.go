@@ -348,3 +348,34 @@ func TestWatchEndsWithItsContext(t *testing.T) {
 		}
 	})
 }
+
+func TestWatchWithoutAnIntervalReturns(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		t.Run(interval.String(), func(t *testing.T) {
+			_, line := newKey(t)
+			path := filepath.Join(t.TempDir(), "authorized_keys")
+			writeFile(t, path, line+"\n")
+			log, _ := newLog()
+			l, err := Open(path, log)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan any)
+			go func() {
+				defer func() { done <- recover() }()
+				l.Watch(context.Background(), interval)
+			}()
+			select {
+			case p := <-done:
+				if p != nil {
+					t.Fatalf("Watch panicked: %v", p)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Watch did not return")
+			}
+			if n := l.reads.Load(); n != 0 {
+				t.Errorf("Watch read the file %d times", n)
+			}
+		})
+	}
+}
