@@ -203,6 +203,7 @@ func TestEnvGenericTableOfACustomResource(t *testing.T) {
 				AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
 					{Name: "Size", Type: "integer", JSONPath: ".spec.size"},
 					{Name: "Since", Type: "date", JSONPath: ".spec.since", Priority: 1},
+					{Name: "Age", Type: "date", JSONPath: ".metadata.creationTimestamp"},
 				},
 			}},
 		},
@@ -231,9 +232,14 @@ func TestEnvGenericTableOfACustomResource(t *testing.T) {
 		"metadata": map[string]any{"name": "sprocket", "namespace": "default", "labels": map[string]any{"size": "big"}},
 		"spec":     map[string]any{"size": int64(7), "since": since},
 	}}
+	var sprocket *unstructured.Unstructured
 	eventually(t, "the widget is created", func() bool {
-		_, err := c.dyn.Resource(gvr).Namespace("default").Create(ctx, widget, metav1.CreateOptions{})
-		return err == nil || apierrors.IsAlreadyExists(err)
+		got, err := c.dyn.Resource(gvr).Namespace("default").Create(ctx, widget, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			got, err = c.dyn.Resource(gvr).Namespace("default").Get(ctx, "sprocket", metav1.GetOptions{})
+		}
+		sprocket = got
+		return err == nil
 	})
 
 	start := time.Now()
@@ -255,15 +261,45 @@ func TestEnvGenericTableOfACustomResource(t *testing.T) {
 	for _, col := range tab.Columns {
 		cols = append(cols, col.Name)
 	}
-	if strings.Join(cols, ",") != "NAMESPACE,NAME,SIZE,SINCE" {
+	if strings.Join(cols, ",") != "NAMESPACE,NAME,SIZE,SINCE,AGE" {
 		t.Fatalf("columns %v", cols)
 	}
-	if !tab.Columns[2].Numeric || !tab.Columns[3].Numeric || !tab.Columns[3].Wide {
+	if !tab.Columns[2].Numeric || !tab.Columns[3].Numeric || !tab.Columns[3].Wide || !tab.Columns[4].Numeric {
 		t.Errorf("columns %+v", tab.Columns)
 	}
 	row := tab.Rows[0]
 	if row.Cells[2] != "7" || row.Order[2] != 7 || row.Cells[3] != "120m" || row.Labels["size"] != "big" {
 		t.Errorf("row %+v", row)
+	}
+	if want := (2 * time.Hour).Seconds(); row.Order[3] < want || row.Order[3] >= want+60 {
+		t.Errorf("SINCE %q sorts by %v, want %v or a little more", row.Cells[3], row.Order[3], want)
+	}
+
+	// A second widget, created a second later at least: the creation
+	// times differ, the humanised ages may not.
+	first := sprocket.GetCreationTimestamp().Time
+	eventually(t, "the next second", func() bool { return time.Now().Truncate(time.Second).After(first) })
+	gear := widget.DeepCopy()
+	gear.SetName("gear")
+	gear, err = c.dyn.Resource(gvr).Namespace("default").Create(ctx, gear, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowsWhen(t, w, "default/sprocket", "default/gear")
+	now := time.Now()
+	tab = w.Table(now)
+	keys := map[string]float64{}
+	for _, r := range tab.Rows {
+		keys[r.Name] = r.Order[4]
+	}
+	// As the typed tables: the newer one has the smaller key.
+	for name, created := range map[string]time.Time{"sprocket": first, "gear": gear.GetCreationTimestamp().Time} {
+		if want := now.Sub(created).Seconds(); keys[name] != want {
+			t.Errorf("%s: AGE sorts by %v, want %v, the seconds since its creation", name, keys[name], want)
+		}
+	}
+	if keys["gear"] >= keys["sprocket"] {
+		t.Errorf("AGE keys gear %v, sprocket %v: the newer does not sort first", keys["gear"], keys["sprocket"])
 	}
 }
 
