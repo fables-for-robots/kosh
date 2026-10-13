@@ -1298,6 +1298,37 @@ func (c *term) shellRun(command, want string) {
 	})
 }
 
+// sizeFollows waits until stty size in the shell shows want. The new
+// size reaches the container beside what is typed, not in order with it,
+// as over kubectl exec -it: a command typed at once after a resize may
+// still see the old size, and stty size is asked again until the
+// deadline.
+func (c *term) sizeFollows(want string) {
+	c.t.Helper()
+	deadline := time.Now().Add(wait)
+	var got string
+	for i := 1; ; i++ {
+		mark := fmt.Sprintf("kosh-size-%d", i)
+		c.send("echo " + mark + " $(stty size)" + keyEnter)
+		c.waitUntil(wait, "the answer to "+mark+", then the prompt", func(lines []string) bool {
+			for j := len(lines) - 1; j >= 0; j-- {
+				if rest, ok := strings.CutPrefix(strings.TrimRight(lines[j], " "), mark+" "); ok {
+					got = rest
+					return prompted(lines, j)
+				}
+			}
+			return false
+		})
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatalf("%s: stty size shows %s, want %s, %v after the resize; the screen:\n%s", c.what, got, want, wait, c.scr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // openShell presses s on marker, the first row of the pods of default,
 // and enter, and waits for the shell.
 func (c *term) openShell() {
@@ -1326,7 +1357,7 @@ func TestShell(t *testing.T) {
 	p.shellRun("echo kosh-$((6*7))", "kosh-42")
 	p.shellRun("stty size", "40 120")
 	p.resize(100, 30)
-	p.shellRun("stty size", "30 100")
+	p.sizeFollows("30 100")
 	p.backFromShell(100, 30)
 
 	// The table follows the cluster again.
