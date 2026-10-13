@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Tests the image that `nix build .#image` makes, once it is loaded into
 # Docker: that it is kosh, runs as kosh's user on a read-only root, and
-# holds no shell and nothing in /nix/store. Stops at the first check that
+# holds kosh and nothing else. Stops at the first check that
 # does not hold. With VERSION, kosh version has to print exactly that.
 #
 #   nix build .#image --option allow-unsafe-native-code-during-evaluation true
 #   docker load < result
 #   scripts/test-image.sh ghcr.io/fables-for-robots/kosh:nix [VERSION]
+#
+# Docker runs only an image it has: the script never pulls one.
 set -euo pipefail
+# sort and comm have to agree on the order.
+export LC_ALL=C
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
   echo "usage: $0 IMAGE [VERSION]" >&2
@@ -28,7 +32,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # 8. The entry point is kosh, and it says what it is.
 echo "== version"
-docker run --rm "$IMAGE" version >"$OUT/version" 2>"$OUT/version.err" ||
+docker run --pull never --rm "$IMAGE" version >"$OUT/version" 2>"$OUT/version.err" ||
   { cat "$OUT/version.err" >&2; fail "version: kosh version failed"; }
 [ "$(grep -c . "$OUT/version")" = 1 ] ||
   fail "version: want one line, got: $(cat "$OUT/version")"
@@ -46,7 +50,7 @@ echo "== user"
 user=$(docker inspect --format '{{.Config.User}}' "$IMAGE") || fail "user: docker inspect $IMAGE failed"
 [ "$user" = "65532:65532" ] || fail "user: the image's user is '$user', want 65532:65532"
 echo "ok   the image's user is $user"
-docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+docker run --pull never --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
   --tmpfs /var/lib/kosh:uid=65532,gid=65532,mode=0700 \
   "$IMAGE" id --state-dir /var/lib/kosh >"$OUT/id" 2>"$OUT/id.err" ||
   { cat "$OUT/id.err" >&2; fail "user: kosh id on a read-only root failed"; }
@@ -56,24 +60,49 @@ for field in "endpoint ID" "iroh-ssh" "host key" "fingerprint"; do
 done
 echo "ok   kosh id as 65532 on a read-only root"
 
-# 10. kosh and nothing else: no shell, no busybox, and nothing in
-# /nix/store, as the file system of a container made from the image
-# holds it.
+# 10. kosh and nothing else: the file system of a container made from
+# the image holds exactly the files and directories below, of which
+# bin/kosh is the one program, and the certificates are there.
 echo "== contents"
-CONTAINER=$(docker create "$IMAGE")
-docker export "$CONTAINER" | tar -t | sed 's|^\./||' >"$OUT/files"
-for f in bin/sh bin/busybox; do
-  ! grep -qx "$f" "$OUT/files" || fail "contents: the image has $f"
-done
-echo "ok   no bin/sh, no bin/busybox"
-store=$(grep '^nix/store/.' "$OUT/files" || true)
-[ -z "$store" ] || fail "contents: the image has, in nix/store: $(echo "$store" | head -5)"
-echo "ok   nothing in nix/store"
+# What the image holds: kosh, the certificates, its user, and the
+# directories the flake makes.
+image_files=(
+  bin bin/kosh
+  etc etc/group etc/passwd etc/kosh etc/ssl etc/ssl/certs etc/ssl/certs/ca-certificates.crt
+  tmp var var/lib var/lib/kosh
+)
+# What Docker adds to the file system of every container, whatever its
+# image: these do not come from the image.
+docker_files=(
+  .dockerenv dev dev/console dev/pts dev/shm proc sys
+  etc/hostname etc/hosts etc/mtab etc/resolv.conf
+)
+CONTAINER=$(docker create --pull never "$IMAGE")
+docker export "$CONTAINER" >"$OUT/export.tar"
+# Each name once, without a leading ./ or a trailing /.
+tar -tf "$OUT/export.tar" | sed -e 's|^\./||' -e 's|/$||' | grep . | sort -u >"$OUT/files"
+printf '%s\n' "${image_files[@]}" "${docker_files[@]}" | sort -u >"$OUT/want"
+extra=$(comm -23 "$OUT/files" "$OUT/want" | tr '\n' ' ')
+[ -z "$extra" ] || fail "contents: the image has what it should not: $extra"
+missing=$(comm -13 "$OUT/files" "$OUT/want" | tr '\n' ' ')
+[ -z "$missing" ] || fail "contents: the image lacks: $missing"
+echo "ok   exactly kosh, its certificates, its user and its directories"
+# Docker's files are empty placeholders with the execute bit; of the
+# image's own, only bin/kosh is a program.
+printf '%s\n' "${docker_files[@]}" >"$OUT/docker"
+programs=$(tar -tvf "$OUT/export.tar" | awk '$1 ~ /^-/ && $1 ~ /x/ { print $NF }' |
+  sed 's|^\./||' | grep -vxF -f "$OUT/docker" | tr '\n' ' ' || true)
+[ "$programs" = "bin/kosh " ] || fail "contents: the executable files are '$programs', want only bin/kosh"
+echo "ok   bin/kosh is the only program"
+tar -xOf "$OUT/export.tar" etc/ssl/certs/ca-certificates.crt >"$OUT/ca.crt" ||
+  fail "contents: etc/ssl/certs/ca-certificates.crt cannot be read"
+grep -q "BEGIN CERTIFICATE" "$OUT/ca.crt" || fail "contents: etc/ssl/certs/ca-certificates.crt holds no certificate"
+echo "ok   the CA bundle holds $(grep -c "BEGIN CERTIFICATE" "$OUT/ca.crt") certificates"
 
 # 11. kosh's errors come out: with both transports off it refuses to
 # start, says why, and exits with a status that is not 0.
 echo "== refusal"
-if docker run --rm "$IMAGE" serve --ssh-listen "" --iroh=false >"$OUT/serve" 2>"$OUT/serve.err"; then
+if docker run --pull never --rm "$IMAGE" serve --ssh-listen "" --iroh=false >"$OUT/serve" 2>"$OUT/serve.err"; then
   fail "refusal: kosh serve with both transports off exited 0"
 fi
 grep -qF "both transports are off" "$OUT/serve.err" ||

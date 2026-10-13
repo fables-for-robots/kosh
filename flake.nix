@@ -22,11 +22,17 @@
       # KOSH_VERSION and --impure, without which Nix reads no environment;
       # every other build is named by its commit, with -dirty when the
       # tree had changes.
+      #
+      # gonixgo splits ldflags on white space, so a version with a space
+      # in it would become more arguments of the linker: KOSH_VERSION is
+      # held to letters, digits and . _ + -.
       version = let fromEnv = builtins.getEnv "KOSH_VERSION";
-      in if fromEnv != "" then
+      in if fromEnv == "" then
+        self.shortRev or self.dirtyShortRev or "dev"
+      else if builtins.match "[A-Za-z0-9._+-]+" fromEnv != null then
         fromEnv
       else
-        self.shortRev or self.dirtyShortRev or "dev";
+        throw "KOSH_VERSION is '${fromEnv}': a version is letters, digits and . _ + - only, as v1.2.3";
 
       # The Go that builds kosh, in the derivation and in the shells: the
       # one go.mod asks for. go.mod says go 1.26.8, and the go_1_26 of the
@@ -123,6 +129,13 @@
               # names by its number.
               echo 'kosh:x:65532:65532:kosh:/:/sbin/nologin' > etc/passwd
               echo 'kosh:x:65532:' > etc/group
+            '';
+            # The state directory is kosh's, so that a volume put there
+            # without the chart's fsGroup starts out writable by it.
+            # fakeroot records the owner in the layer and adds nothing to
+            # the image.
+            fakeRootCommands = ''
+              chown 65532:65532 var/lib/kosh
             '';
             config = {
               Entrypoint = [ "/bin/kosh" ];
