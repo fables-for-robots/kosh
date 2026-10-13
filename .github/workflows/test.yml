@@ -60,3 +60,23 @@ jobs:
           # Without KOSH_VERSION the flake names the build by its commit:
           # its first seven characters, which is what Nix's shortRev is.
           scripts/test-image.sh ghcr.io/fables-for-robots/kosh:nix "$(git rev-parse HEAD | cut -c1-7)"
+
+  # kosh as its users meet it: the image in a kind cluster, installed with
+  # the chart, reached with ssh and with iroh-ssh over the relays; then
+  # kosh as a process, found by iroh-ssh through mDNS alone. Both scripts
+  # run themselves in the bare shell, and build what they need.
+  e2e:
+    needs: nix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: end to end
+        run: scripts/test-e2e.sh
+      - name: mDNS
+        # Needs neither the image nor the chart: it says what it says
+        # whatever the step before found.
+        if: ${{ !cancelled() }}
+        run: scripts/test-mdns.sh
