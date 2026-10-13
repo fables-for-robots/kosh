@@ -515,10 +515,7 @@ func TestTextIsCleaned(t *testing.T) {
 	check := func(what string) {
 		t.Helper()
 		_, cmd := textTop(hs).Update(keyPress("c"))
-		copied, ok := textClipboard(textMsgs(cmd))
-		if !ok {
-			t.Fatalf("%s: c copies nothing", what)
-		}
+		copied := textClipboard(t, textMsgs(cmd))
 		for _, f := range []string{hs.drawn(), copied} {
 			for _, bad := range []string{"\x1b]0;", "\x1b[2J", "\x00", "\x07"} {
 				if strings.Contains(f, bad) {
@@ -539,4 +536,104 @@ func TestTextIsCleaned(t *testing.T) {
 	hs.press("x")
 	hs.wantFrame("token: abc␀", "  two")
 	check("decode")
+}
+
+func TestSecondKeyWhileOpeningOpensNothing(t *testing.T) {
+	sess := &textBlockingSession{Session: textPodsAndSecrets(keys.Grant{Name: "alice@laptop"}), release: make(chan struct{})}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(sess.release)
+		}
+	}
+	t.Cleanup(release)
+	hs := newHarness(t, sess, 100, 30)
+	_, first := hs.root().Update(keyPress("d"))
+	if first == nil {
+		t.Fatal("d gives no command")
+	}
+	for _, k := range []string{"d", "y"} {
+		if _, cmd := hs.root().Update(keyPress(k)); cmd != nil {
+			t.Errorf("%s while the first reading is in flight gives a command", k)
+		}
+	}
+	release()
+	hs.queue = append(hs.queue, first)
+	hs.settle()
+	if len(hs.root().stack) != 2 || len(sess.Called("Describe")) != 1 || len(sess.Called("YAML")) != 0 {
+		t.Errorf("the stack has %d views; Describe was called %d times, YAML %d", len(hs.root().stack), len(sess.Called("Describe")), len(sess.Called("YAML")))
+	}
+	// Once it is back, the keys open again.
+	hs.press("esc", "y")
+	if got := hs.title(); got != "YAML(pods/default/web-1)" {
+		t.Errorf("y after the first reading opened %q", got)
+	}
+	// So they do after a reading that failed.
+	hs.press("esc")
+	sess.Errs["Describe"] = errors.New("no")
+	hs.press("d")
+	delete(sess.Errs, "Describe")
+	hs.press("d")
+	if got := hs.title(); got != "Describe(pods/default/web-1)" {
+		t.Errorf("d after a failed reading opened %q", got)
+	}
+}
+
+// textHoldingSession is a session whose YAML, while hold is set, waits
+// until its context is done.
+type textHoldingSession struct {
+	*kubetest.Session
+	hold atomic.Bool
+}
+
+func (s *textHoldingSession) YAML(ctx context.Context, ref kube.ObjectRef, managed bool) (string, error) {
+	if s.hold.Load() {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	return s.Session.YAML(ctx, ref, managed)
+}
+
+func TestCloseCancelsTheReading(t *testing.T) {
+	sess := &textHoldingSession{Session: textPodsAndSecrets(keys.Grant{Name: "alice@laptop"})}
+	sess.YAMLs[textPod.String()] = "kind: Pod\n"
+	hs := newHarness(t, sess, 100, 30)
+	// run runs cmd in a goroutine and gives its message.
+	run := func(cmd tea.Cmd) <-chan tea.Msg {
+		out := make(chan tea.Msg, 1)
+		go func() { out <- cmd() }()
+		return out
+	}
+	// cancelled waits for a reading to end, which it does only when its
+	// context is cancelled.
+	cancelled := func(what string, got <-chan tea.Msg) {
+		t.Helper()
+		select {
+		case msg := <-got:
+			if m, ok := msg.(textLoadedMsg); !ok || !errors.Is(m.err, context.Canceled) {
+				t.Errorf("%s: the reading ended with %#v", what, msg)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the reading in flight goes on", what)
+		}
+	}
+	hs.press("y")
+	v := textTop(hs)
+	sess.hold.Store(true)
+	_, cmd := v.Update(keyPress("m"))
+	first := run(cmd)
+	_, cmd = v.Update(keyPress("m"))
+	second := run(cmd)
+	cancelled("a later reading", first)
+	select {
+	case msg := <-second:
+		t.Fatalf("the later reading ended by itself: %#v", msg)
+	default:
+	}
+	hs.press("q")
+	if len(hs.root().stack) != 1 {
+		t.Fatalf("q left %d views", len(hs.root().stack))
+	}
+	cancelled("Close", second)
 }

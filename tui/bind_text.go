@@ -1,6 +1,10 @@
 package tui
 
 import (
+	"context"
+	"reflect"
+	"sync"
+
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/fables-for-robots/kosh/keys"
@@ -40,12 +44,35 @@ func textRun(kind textKind) func(e env, q kube.Query, refs []kube.ObjectRef) tea
 	}
 }
 
+// textOpening holds the sessions that have a text view's first reading
+// in flight: until it is back, d, y and x open nothing more.
+//
+// The root gives the command of a binding no way to know whether the
+// table that asked is still on top when the reading returns, nor tells
+// it when that table goes, so the reading cannot be cancelled when its
+// view is no longer wanted. This keeps at least a second key from
+// opening a second view.
+var textOpening sync.Map
+
 // textOpen reads what a text view of kind shows of ref, in a command,
 // and pushes the view with it. When the reading fails no view is pushed
-// and the flash shows the error.
+// and the flash shows the error. While another first reading of the
+// session is in flight it does nothing.
 func textOpen(e env, kind textKind, ref kube.ObjectRef) tea.Cmd {
+	var key any
+	if t := reflect.TypeOf(e.sess); t != nil && t.Comparable() {
+		key = e.sess
+		if _, busy := textOpening.LoadOrStore(key, struct{}{}); busy {
+			return nil
+		}
+	}
 	return func() tea.Msg {
-		text, err := textRead(e, kind, ref, false)
+		if key != nil {
+			defer textOpening.Delete(key)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		text, err := textRead(ctx, e, kind, ref, false)
 		if err != nil {
 			return flashMsg{text: err.Error(), err: true}
 		}

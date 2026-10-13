@@ -3,8 +3,10 @@ package tui
 import (
 	"fmt"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -63,7 +65,8 @@ func textFirst(hs *harness) string {
 
 // textLoaded is the message of a reading of v that brought text.
 func textLoaded(v *textView, text string) textLoadedMsg {
-	return textLoadedMsg{id: v.id, gen: v.loads, lines: textLines(text)}
+	c := textPrepare(text, v.kind, "", nil, 0)
+	return textLoadedMsg{id: v.id, gen: v.loads, content: &c}
 }
 
 // textMsgs runs cmd and the commands of its batches, and returns their
@@ -84,14 +87,30 @@ func textMsgs(cmd tea.Cmd) []tea.Msg {
 }
 
 // textClipboard returns the text of the clipboard message among msgs,
-// and whether there is one.
-func textClipboard(msgs []tea.Msg) (string, bool) {
+// and fails the test when there is none.
+//
+// The message tea.SetClipboard makes is of a type Bubble Tea does not
+// export (setClipboardMsg, a string), and the root does not keep it: it
+// goes on to the views like any message the root does not know. So the
+// test finds it by the name of its type and reads its string through
+// reflection. When Bubble Tea renames the type, this fails and says so.
+func textClipboard(t *testing.T, msgs []tea.Msg) string {
+	t.Helper()
 	for _, m := range msgs {
 		if fmt.Sprintf("%T", m) == "tea.setClipboardMsg" {
-			return reflect.ValueOf(m).String(), true
+			return reflect.ValueOf(m).String()
 		}
 	}
-	return "", false
+	version := "of unknown version"
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, d := range bi.Deps {
+			if d.Path == "charm.land/bubbletea/v2" {
+				version = d.Version
+			}
+		}
+	}
+	t.Fatalf("no tea.setClipboardMsg among %#v: has Bubble Tea (charm.land/bubbletea/v2 %s) renamed the message of tea.SetClipboard?", msgs, version)
+	return ""
 }
 
 func TestScrolling(t *testing.T) {
@@ -265,10 +284,7 @@ func TestCopy(t *testing.T) {
 	hs, v := textOpenWith(t, textDescribe, "one\n\x1b[2Jtwo\x1b]0;x\x07\nthree\x00\n")
 	_, cmd := v.Update(keyPress("c"))
 	msgs := textMsgs(cmd)
-	got, ok := textClipboard(msgs)
-	if !ok {
-		t.Fatalf("c gives no clipboard command, but %v", msgs)
-	}
+	got := textClipboard(t, msgs)
 	if want := "one\ntwo\nthree␀"; got != want {
 		t.Errorf("c copies %q, want %q", got, want)
 	}
@@ -420,5 +436,140 @@ func TestSearchInAWrappedYAML(t *testing.T) {
 	hs.press("enter", "g")
 	if l := hs.drawnLine("kind: Pod"); !strings.Contains(l, styleKey.Render("k")+styleMatch.Render("ind")) {
 		t.Errorf("a match in a key is drawn %q", l)
+	}
+}
+
+// textTime fails the test when do takes longer than limit times the
+// race detector's factor.
+func textTime(t *testing.T, what string, limit time.Duration, do func()) {
+	t.Helper()
+	start := time.Now()
+	do()
+	if took, most := time.Since(start), limit*textRaceFactor; took > most {
+		t.Errorf("%s took %v, more than %v", what, took, most)
+	}
+}
+
+func TestLongLinesDrawFast(t *testing.T) {
+	// One line of a megabyte, of a hundred thousand matches.
+	long := "x: " + strings.Repeat("abcdefghij", 100_000)
+	hs, v := textOpenWith(t, textYAML, "kind: Pod\n"+long+"\nend: here\n")
+	hs.press("/", "a", "enter")
+	if len(v.matches) != 100_000 {
+		t.Fatalf("/a has %d matches", len(v.matches))
+	}
+	redraw := func(what string) {
+		t.Helper()
+		textTime(t, "a hundred redraws "+what, 200*time.Millisecond, func() {
+			for range 100 {
+				v.View(98, 20)
+			}
+		})
+		out := v.View(98, 20)
+		if !strings.Contains(out, styleMatch.Render("a")) {
+			t.Errorf("%s: the matches are not drawn: %q", what, ansi.Strip(out))
+		}
+		if lines := strings.Split(out, "\n"); len(lines) != 20 {
+			t.Errorf("%s: the view draws %d lines", what, len(lines))
+		}
+	}
+	redraw("unwrapped")
+	hs.press("n")
+	for range 1000 {
+		v.Update(keyPress("right"))
+	}
+	redraw("far to the right")
+	if l := strings.Split(ansi.Strip(v.View(98, 20)), "\n")[1]; len(l) < 90 || !strings.Contains(long[8000:], strings.TrimSuffix(l, "…")) {
+		t.Errorf("far to the right the long line is drawn %q", l)
+	}
+	hs.press("w")
+	redraw("wrapped")
+	hs.press("pgdown", "pgdown", "pgdown")
+	redraw("wrapped, three pages down")
+	if l := strings.Split(ansi.Strip(v.View(98, 20)), "\n")[0]; !strings.Contains(long, l) || len(l) != 98 {
+		t.Errorf("three pages down the wrapped line is drawn %q", l)
+	}
+	at := v.at
+	textTime(t, "a hundred n", 200*time.Millisecond, func() {
+		for range 100 {
+			v.Update(keyPress("n"))
+		}
+	})
+	if v.at != at+100 {
+		t.Errorf("a hundred n went from match %d to %d", at, v.at)
+	}
+	hs.press("G")
+	redraw("wrapped, at the end")
+	if b := textBody(hs); b[len(b)-1] != "end: here" {
+		t.Errorf("at the end the last line is %q", b[len(b)-1])
+	}
+}
+
+func TestReadingIsPreparedInTheCommand(t *testing.T) {
+	hs, v := textOpenWith(t, textYAML, "kind: Pod\n")
+	sess := hs.root().e.sess.(*kubetest.Session)
+	long := "x: " + strings.Repeat("abcdefghij", 100_000) // 1 MB
+	sess.YAMLs[textPod.String()] = "kind: Pod\n" + long + "\n"
+	hs.press("w", "/", "a", "enter")
+	_, cmd := v.Update(keyPress("m"))
+	msgs := textMsgs(cmd)
+	if len(msgs) != 1 {
+		t.Fatalf("m gives %v", msgs)
+	}
+	msg, ok := msgs[0].(textLoadedMsg)
+	if !ok || msg.content == nil {
+		t.Fatalf("m gives %#v", msgs[0])
+	}
+	c := msg.content
+	if c.width != len(long) || len(c.lines) != 2 || c.lines[1].width != len(long) {
+		t.Errorf("the reading brings the width %d of %d lines", c.width, len(c.lines))
+	}
+	if c.search != "a" || len(c.matches) != 100_000 {
+		t.Errorf("the reading brings %d matches of %q", len(c.matches), c.search)
+	}
+	if c.wrapW != 98 || len(c.rows) != 1+(len(long)+97)/98 {
+		t.Errorf("the reading brings %d rows wrapped at %d", len(c.rows), c.wrapW)
+	}
+	// Measuring, finding or wrapping a megabyte again would take more.
+	textTime(t, "taking a reading of 1 MB", 10*time.Millisecond, func() {
+		v.Update(msg)
+		v.View(98, 20)
+	})
+	if got := hs.title(); got != "YAML(pods/default/web-1) </a> 0/100000" {
+		t.Errorf("after the reading the title is %q", got)
+	}
+	// A reading for another search, or another width, is brought up to
+	// date when it is taken.
+	_, cmd = v.Update(keyPress("m"))
+	msg = textMsgs(cmd)[0].(textLoadedMsg)
+	hs.press("/", "b", "enter", "w")
+	v.Update(msg)
+	if len(v.matches) != 100_000 || v.lines[1].text[v.matches[0].from:v.matches[0].to] != "b" {
+		t.Errorf("a reading of another search is taken with the matches of %q", v.lines[1].text[v.matches[0].from:v.matches[0].to])
+	}
+	if len(v.layout()) != 2 {
+		t.Errorf("a reading of another width is taken with %d rows", len(v.layout()))
+	}
+}
+
+func TestViewIsExactlyItsHeight(t *testing.T) {
+	_, v := textOpenWith(t, textDescribe, "one\ntwo")
+	for _, size := range [][2]int{{98, 20}, {10, 3}, {1, 1}, {98, 1}} {
+		lines := strings.Split(v.View(size[0], size[1]), "\n")
+		if len(lines) != size[1] {
+			t.Errorf("at %dx%d the view draws %d lines", size[0], size[1], len(lines))
+		}
+		for i, l := range lines {
+			if w := ansi.StringWidth(l); w != size[0] {
+				t.Errorf("at %dx%d line %d is %d wide", size[0], size[1], i, w)
+			}
+		}
+	}
+	if got := v.View(0, 5); got != "" {
+		t.Errorf("at 0x5 the view draws %q", got)
+	}
+	empty := textNew(v.e, textDescribe, textPod, "")
+	if lines := strings.Split(empty.View(10, 4), "\n"); len(lines) != 4 {
+		t.Errorf("an empty text draws %d lines", len(lines))
 	}
 }
