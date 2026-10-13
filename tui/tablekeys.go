@@ -171,8 +171,40 @@ func (v *tableView) markRange() {
 	v.lastMark = &k
 }
 
-// Hints are the table's own keys that apply, then its bindings'.
+// Hints are the table's own keys that apply, then its bindings': the
+// header's list.
 func (v *tableView) Hints() []hint {
+	return append(v.ownHints(), v.bindingHints()...)
+}
+
+// helpHints are every key of the table, for the help: the movement keys,
+// its own keys, and its bindings'.
+func (v *tableView) helpHints() []hint {
+	hs := []hint{
+		{"j/down", "Down"},
+		{"k/up", "Up"},
+		{"ctrl-f/pgdown", "Page Down"},
+		{"ctrl-b/pgup", "Page Up"},
+		{"g/home", "Top"},
+		{"shift-g/end", "Bottom"},
+		{"left/right", "Column"},
+	}
+	hs = append(hs, v.ownHints()...)
+	hs = append(hs,
+		hint{"ctrl-space", "Mark Range"},
+		hint{"ctrl-\\", "Clear Marks"},
+		hint{"enter", "Go Into"},
+		hint{"ctrl-r", "Read Again"},
+		hint{"esc", "Clear Filter / Back"},
+	)
+	if v.hasShortcuts() {
+		hs = append(hs, hint{"0-9", "Namespace Shortcut"})
+	}
+	return append(hs, v.bindingHints()...)
+}
+
+// ownHints are the hints of the table's own keys that apply.
+func (v *tableView) ownHints() []hint {
 	var hs []hint
 	if v.colIndex("NAME") >= 0 {
 		hs = append(hs, hint{"shift-n", "Sort Name"})
@@ -193,7 +225,12 @@ func (v *tableView) Hints() []hint {
 	if v.hasOwner() {
 		hs = append(hs, hint{"shift-j", "Owner"})
 	}
-	hs = append(hs, hint{"?", "Help"})
+	return append(hs, hint{"?", "Help"})
+}
+
+// bindingHints are the hints of the table's bindings.
+func (v *tableView) bindingHints() []hint {
+	var hs []hint
 	if !v.plain {
 		for _, b := range bindingsFor(v.q.Resource, v.grant) {
 			hs = append(hs, b.Hint)

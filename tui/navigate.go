@@ -86,8 +86,8 @@ func (r *root) useNamespace(ns string) tea.Cmd {
 }
 
 // runCommand runs a command of the prompt: a name and optionally a
-// namespace. record puts it into the history when it goes to a
-// resource.
+// namespace, where "all" and "-A" are all of them, as 0 is. record puts
+// it into the history when it goes to a resource.
 func (r *root) runCommand(text string, record bool) tea.Cmd {
 	fields := strings.Fields(text)
 	if len(fields) == 0 {
@@ -104,6 +104,10 @@ func (r *root) runCommand(text string, record bool) tea.Cmd {
 	ns := ""
 	if len(fields) > 1 {
 		ns = fields[1]
+	}
+	if ns == "all" || ns == "-A" {
+		// A namespace named all is chosen from the namespaces' table.
+		ns = ""
 	}
 	return r.resolve(strings.Join(fields, " "), fields[0], ns, len(fields) > 1, record, false)
 }

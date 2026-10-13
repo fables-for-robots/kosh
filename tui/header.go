@@ -22,7 +22,9 @@ const headerGap = "   "
 // when it fits whole, with the gap before it, and the columns are shown
 // in order up to the first that does not. When not every hint fits, the
 // last place shown is the hint of ?, so that the help is always among
-// the hints the header shows.
+// the hints the header shows. When no hint would fit right of every
+// column of shortcuts, only their first column is shown, when that makes
+// room for the hints.
 func (r *root) header() []string {
 	name := cleanLine(r.grant.Name)
 	if r.grant.ReadOnly {
@@ -52,18 +54,30 @@ func (r *root) header() []string {
 		}
 		shortcuts = columns(sc, hintRows)
 	}
-	n := fitting(shortcuts, used, r.w)
-	for _, c := range shortcuts[:n] {
+	// place returns how many of the columns of shortcuts sc fit, and the
+	// columns of hints that fit right of them when all of them do.
+	place := func(sc [][]string) (n int, hints [][]string) {
+		n = fitting(sc, used, r.w)
+		if n < len(sc) {
+			return n, nil
+		}
+		u := used
+		for _, c := range sc {
+			u += len(headerGap) + colWidth(c)
+		}
+		return n, r.hintColumns(u)
+	}
+	n, hints := place(shortcuts)
+	if len(hints) == 0 && len(shortcuts) > 1 {
+		// The help rather than a second column of shortcuts: the first
+		// column, 0 to 4, and the hints with <?> Help right of it.
+		if n1, h1 := place(shortcuts[:1]); len(h1) > 0 {
+			shortcuts, n, hints = shortcuts[:1], n1, h1
+		}
+	}
+	for _, c := range append(shortcuts[:n:n], hints...) {
 		cols = append(cols, c)
 		widths = append(widths, colWidth(c))
-		used += len(headerGap) + colWidth(c)
-	}
-
-	if n == len(shortcuts) {
-		for _, c := range r.hintColumns(used) {
-			cols = append(cols, c)
-			widths = append(widths, colWidth(c))
-		}
 	}
 
 	lines := make([]string, headerHeight)
