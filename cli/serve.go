@@ -60,8 +60,6 @@ type serving struct {
 	ssh net.Addr
 	// iroh is the iroh endpoint, nil without one.
 	iroh *irohnet.Listener
-	// cluster is the cluster every session uses.
-	cluster *kube.Cluster
 }
 
 // serveCommand is kosh serve, which runs runServe with its flags.
@@ -260,7 +258,8 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		r.serve(r.iroh, "iroh")
 	}
 
-	// A session with no grant reads only the version: it opens nothing.
+	// The Cluster tells the API server's version only through a
+	// Session; one that is asked nothing else opens nothing.
 	args := []any{"version", Version}
 	if r.iroh != nil {
 		args = append(args, "endpoint", r.iroh.ID())
@@ -273,7 +272,7 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	log.Info("kosh is serving", args...)
 
 	if o.started != nil {
-		s := serving{iroh: r.iroh, cluster: cluster}
+		s := serving{iroh: r.iroh}
 		if r.tcp != nil {
 			s.ssh = r.tcp.Addr()
 		}
@@ -294,10 +293,10 @@ func (r *running) serve(l net.Listener, transport string) {
 	}()
 }
 
-// stop stops what start started, within stopTimeout from now: the
-// sessions are told and closed, the listeners closed, the key list no
-// longer read, and the cluster closed. It returns when every goroutine
-// start started has ended.
+// stop stops what start started: the sessions are told and closed,
+// stopTimeout at most, the listeners closed, the key list no longer
+// read, and the cluster closed. It returns when every goroutine start
+// started has ended.
 func (r *running) stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 	defer cancel()
