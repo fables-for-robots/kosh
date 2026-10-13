@@ -231,3 +231,105 @@ func TestLogCopyIsBounded(t *testing.T) {
 	}
 	hs.wantFrame(fmt.Sprintf("copied the last %d of 5000 lines", n))
 }
+
+// logLong returns the line i of n bytes: "line 0001 aaa…".
+func logLong(i, n int) kube.LogLine {
+	text := fmt.Sprintf("line %04d ", i)
+	return kube.LogLine{Pod: "web-1", Container: "app", Text: text + strings.Repeat("a", n-len(text))}
+}
+
+// logHeld returns the bytes of text v's buffer holds, and fails the test
+// when its array holds a line beyond the buffer.
+func logHeld(t *testing.T, v *logView) int {
+	t.Helper()
+	n := 0
+	for _, l := range v.lines {
+		n += len(l.text) + len(l.src)
+	}
+	for i, l := range v.lines[len(v.lines):cap(v.lines)] {
+		if l.text != "" {
+			t.Errorf("beyond the buffer, at %d, is %q", i, l.text[:min(len(l.text), 20)])
+		}
+	}
+	return n
+}
+
+func TestLogBufferHasABudget(t *testing.T) {
+	const long = 64 << 10
+	const budget = 16 << 20
+
+	// 300 lines of 64 KiB: the oldest go, so that 16 MiB is held at
+	// most, and no more go than must.
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	go func() {
+		for i := 1; i <= 300; i++ {
+			s.Send(logLong(i, long))
+		}
+	}()
+	hs.await("the 300th line", func() bool {
+		return len(v.lines) > 0 && strings.HasPrefix(v.lines[len(v.lines)-1].text, "line 0300 ")
+	})
+	if held := logHeld(t, v); held > budget {
+		t.Errorf("the buffer holds %d bytes in %d lines", held, len(v.lines))
+	}
+	if n := len(v.lines); n < budget/long-1 {
+		t.Errorf("the buffer holds %d lines of 64 KiB", n)
+	}
+	for i, l := range v.lines {
+		if want := fmt.Sprintf("line %04d ", 300-len(v.lines)+1+i); !strings.HasPrefix(l.text, want) {
+			t.Fatalf("line %d of the buffer is %q, want %q", i, l.text[:20], want)
+		}
+	}
+	hs.wantFrame("line 0300")
+
+	// 6000 short lines: 5000 are held.
+	hs = newHarness(t, sess, 100, 30)
+	v, s = logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	for i := range 60 {
+		s.Send(logTexts(i*100+1, 100)...)
+	}
+	hs.await("the 6000th line", func() bool { return logHas(v, "line 6000") })
+	if len(v.lines) != kube.LogBufferLines || v.lines[0].text != "line 1001" {
+		t.Errorf("the buffer holds %d lines from %q", len(v.lines), v.lines[0].text)
+	}
+
+	// A user who scrolled up keeps their place while the oldest go.
+	hs = newHarness(t, sess, 100, 30)
+	v, s = logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	go func() {
+		for i := 1; i <= 200; i++ {
+			s.Send(logLong(i, long))
+		}
+	}()
+	hs.await("the 200th line", func() bool {
+		return len(v.lines) == 200 && strings.HasPrefix(v.lines[199].text, "line 0200 ")
+	})
+	logBody(hs) // drawn, as the user sees it before the key
+	hs.press("up")
+	before := logBody(hs)
+	if !strings.HasPrefix(before[0], "line 0180 ") {
+		t.Fatalf("after up the body starts with %q", before[0][:20])
+	}
+	go func() {
+		for i := 201; i <= 300; i++ {
+			s.Send(logLong(i, long))
+		}
+	}()
+	hs.await("the 300th line", func() bool {
+		return len(v.lines) > 0 && strings.HasPrefix(v.lines[len(v.lines)-1].text, "line 0300 ")
+	})
+	if strings.HasPrefix(v.lines[0].text, "line 0001 ") {
+		t.Fatal("no line was dropped")
+	}
+	if held := logHeld(t, v); held > budget {
+		t.Errorf("the buffer holds %d bytes", held)
+	}
+	if after := logBody(hs); strings.Join(after, "\n") != strings.Join(before, "\n") {
+		t.Errorf("the view moved while the oldest lines went: it starts with %q", after[0][:20])
+	}
+	if !strings.Contains(hs.title(), "[autoscroll:off]") {
+		t.Errorf("the title is %q", hs.title())
+	}
+}
