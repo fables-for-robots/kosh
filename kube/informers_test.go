@@ -344,8 +344,6 @@ func TestCloseWaitsForIdleTimers(t *testing.T) {
 
 	// The timers fire while Close waits for c.mu, so that their functions
 	// run after Close has seen them; Close returns only after they ended.
-	e.c.mu.Lock()
-	e.c.mu.Unlock()
 	e.c.release(k)
 	e.c.release(j)
 	e.c.mu.Lock()
@@ -357,10 +355,12 @@ func TestCloseWaitsForIdleTimers(t *testing.T) {
 	time.Sleep(20 * time.Millisecond) // the timers fire, and wait for c.mu
 	e.c.mu.Unlock()
 	<-closed
+	// wg.Done is stopIdle's last deferred call, so the goroutine that woke
+	// Close may still be on its way out of it for a moment.
 	buf := make([]byte, 1<<20)
-	if stack := string(buf[:runtime.Stack(buf, true)]); strings.Contains(stack, "stopIdle") {
-		t.Errorf("an idle timer's function runs after Close:\n%s", stack)
-	}
+	eventually(t, "no idle timer's function runs after Close", func() bool {
+		return !strings.Contains(string(buf[:runtime.Stack(buf, true)]), "stopIdle")
+	})
 }
 
 func drain(ch <-chan struct{}) {
