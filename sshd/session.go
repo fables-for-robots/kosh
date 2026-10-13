@@ -85,6 +85,17 @@ type session struct {
 	// finished is set when the session has exited: end does nothing
 	// after that.
 	finished bool
+	// cancelCommand ends the context of the command that has the
+	// terminal; it is nil when none has.
+	cancelCommand context.CancelFunc
+
+	// in is what the client sends, for whoever has the terminal. It is
+	// read from the channel from the moment the program starts.
+	in *input
+	// win is the session's window.
+	win *window
+	// raw writes to the session channel what it is given: ss does not.
+	raw io.Writer
 }
 
 // run gives the session its program, and ends it when the program ends.
@@ -93,8 +104,9 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	defer cancel()
 	// The session ends when the client closes its channel, even if the
 	// connection stays: nothing would end the program then.
-	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx}
+	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput()}
 	win := s.windowOf(ss)
+	sess.win, sess.raw = win, rawWriter(ss)
 	go func() {
 		select {
 		case <-win.closed:
@@ -116,7 +128,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	started := false
 	if sess.ending() == "" {
 		m = makeModel(func() tea.Model {
-			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote, Exec: execNotBuilt})
+			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote, Exec: sess.exec})
 		}, &sess.stopped, panicked)
 	}
 	if m != nil {
@@ -125,9 +137,15 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			tea.WithContext(ctx),
 			// SIGINT and SIGTERM are kosh's, not a session's.
 			tea.WithoutSignalHandler(),
+			// The channel is read by the session, and the program is
+			// given what is the program's: see input.
+			tea.WithInput(programInput{sess.in}),
+			// In place of the filter among MakeOptions.
+			tea.WithFilter(sess.filter),
 		)
 		p := tea.NewProgram(m, opts...)
 		if started = sess.start(p); started {
+			go sess.in.pump(ss)
 			s.mu.Lock()
 			s.running++
 			s.mu.Unlock()
@@ -136,6 +154,9 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 
 			go win.forward(ctx, p)
 			_, err := p.Run()
+			// Bubble Tea leaves its reader in Read: it ends here, and
+			// the pump with the channel.
+			sess.in.close()
 			// Taken now: a channel that closes after the program ended
 			// by itself is not why it ended.
 			byClient := sess.channelClosed.Load()
@@ -188,8 +209,11 @@ func (sess *session) start(p *tea.Program) bool {
 // end ends the session from kosh's side: it stops the program, and when
 // the program has stopped and the terminal is back to its normal screen,
 // msg and a line feed are written to the session and it exits with
-// status 1. end does not wait for any of that. A session that has not
-// ended within srv.endTimeout has its connection closed. end reports
+// status 1. A command that has the terminal has its context ended, and
+// the program stops when the command has returned. end does not wait
+// for any of that. A session that has not ended within srv.endTimeout,
+// because its client does not read or its command does not return, has
+// its connection closed. end reports
 // whether it ended the session; a session that was ended before keeps
 // its first reason.
 func (sess *session) end(msg string) bool {
@@ -201,17 +225,68 @@ func (sess *session) end(msg string) bool {
 	sess.reason = msg
 	sess.stopped.Store(true)
 	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() {
-		sess.srv.log.Warn("session did not end in time: its connection is closed",
+		what := "session did not end in time: its connection is closed"
+		if sess.commandRuns() {
+			what = "session did not end in time, the command that has its terminal did not return: its connection is closed"
+		}
+		sess.srv.log.Warn(what,
 			"transport", sess.conn.transport, "remote", sess.conn.remote,
 			"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "reason", msg)
 		_ = sess.conn.Close()
 	})
+	if sess.cancelCommand != nil {
+		// The program takes nothing, Quit neither, until the command
+		// that has the terminal has returned.
+		sess.cancelCommand()
+	}
 	if p := sess.program; p != nil {
 		// Quit waits for the program to take it, and the program may be
 		// waiting for a client that does not read.
 		go p.Quit()
 	}
 	return true
+}
+
+// over reports whether the session has ended or is being ended: by the
+// client, by kosh, or because its program has returned.
+func (sess *session) over() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.overLocked()
+}
+
+// overLocked is over with sess.mu held.
+func (sess *session) overLocked() bool {
+	return sess.reason != "" || sess.finished || sess.ctx.Err() != nil
+}
+
+// beginCommand makes cancel what ends the context of the command that
+// has the terminal. It reports false, and keeps nothing, when the
+// session is over: end, which would call cancel, has been and gone.
+func (sess *session) beginCommand(cancel context.CancelFunc) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.overLocked() {
+		return false
+	}
+	sess.cancelCommand = cancel
+	return true
+}
+
+// endCommand is called when the command that has the terminal has
+// returned.
+func (sess *session) endCommand() {
+	sess.mu.Lock()
+	sess.cancelCommand = nil
+	sess.mu.Unlock()
+}
+
+// commandRuns reports whether a command has the terminal and has not
+// returned.
+func (sess *session) commandRuns() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.cancelCommand != nil
 }
 
 // finish marks the session as exited, and stops the timer of end. An end
@@ -354,6 +429,10 @@ type window struct {
 
 	mu   sync.Mutex
 	size ssh.Window
+	// watcher is given a value, when it has none, with each change of
+	// size: it is the Resized of the command that has the terminal, or
+	// nil.
+	watcher chan struct{}
 }
 
 // ptyHandler is the library's PtyHandler: the library's emulated
@@ -376,6 +455,12 @@ func (s *Server) ptyHandler(emulate ssh.PtyHandler) ssh.PtyHandler {
 			for size := range sizes {
 				w.mu.Lock()
 				w.size = size
+				if w.watcher != nil {
+					select {
+					case w.watcher <- struct{}{}:
+					default:
+					}
+				}
 				w.mu.Unlock()
 				select {
 				case w.changed <- struct{}{}:
@@ -427,4 +512,37 @@ func (w *window) forward(ctx context.Context, p *tea.Program) {
 			p.Send(tea.WindowSizeMsg{Width: size.Width, Height: size.Height})
 		}
 	}
+}
+
+// watch returns a Terminal's Size and Resized for the turn of a command,
+// and what ends them. The program cannot tell the command of a size: it
+// takes no message while a command runs, and forward waits in Send with
+// the first change. So the command asks the window: size returns the
+// size now, and resized has a value when the size has changed since size
+// was last called, one however many changes there were. After stop
+// resized gets no more.
+func (w *window) watch() (size func() (width, height int), resized <-chan struct{}, stop func()) {
+	ch := make(chan struct{}, 1)
+	w.mu.Lock()
+	w.watcher = ch
+	w.mu.Unlock()
+	size = func() (int, int) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		// Under the lock a change is made under: the size returned is
+		// the one this value was for, or a later one.
+		select {
+		case <-ch:
+		default:
+		}
+		return w.size.Width, w.size.Height
+	}
+	stop = func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.watcher == ch {
+			w.watcher = nil
+		}
+	}
+	return size, ch, stop
 }

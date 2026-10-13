@@ -32,6 +32,8 @@ var passedRequests = map[string]bool{
 // once it is accepted.
 type filteredChannel struct {
 	gossh.NewChannel
+	// a is told the channel when it is accepted: see rawWriter.
+	a *accepted
 }
 
 // Accept accepts the channel, and returns, in place of its requests,
@@ -41,6 +43,7 @@ func (f filteredChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) 
 	if err != nil {
 		return ch, in, err
 	}
+	f.a.set(ch)
 	out := make(chan *gossh.Request)
 	go filterRequests(in, out)
 	return ch, out, nil
