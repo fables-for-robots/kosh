@@ -10,11 +10,17 @@ package sshd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/ssh"
+	"charm.land/wish/v2"
+	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/fables-for-robots/kosh/keys"
 )
@@ -74,9 +80,26 @@ type Config struct {
 	KeepaliveMisses int
 }
 
+// maxAuthTries is how many times a connection may fail to authenticate.
+// iroh-ssh lets ssh offer every key of the user's agent before the one
+// named with -i, and each key offered is a try.
+const maxAuthTries = 20
+
 // Server is the SSH server.
 type Server struct {
 	_ noCopy
+
+	cfg Config // with the defaults in place of zeros
+	log *slog.Logger
+	ssh *ssh.Server
+
+	mu        sync.Mutex
+	closing   bool // Shutdown has been called
+	listeners map[net.Listener]struct{}
+	conns     map[*conn]struct{}
+	sessions  map[*session]struct{}
+	running   int           // sessions whose program runs
+	changed   chan struct{} // closed, and replaced, when conns or sessions change
 }
 
 type noCopy struct{}
@@ -84,24 +107,219 @@ type noCopy struct{}
 // New returns a server. It fails when the host key does not parse, or
 // when Keys or Model is missing.
 func New(cfg Config) (*Server, error) {
-	panic("not implemented")
+	if cfg.Keys == nil {
+		return nil, errors.New("sshd: no key list")
+	}
+	if cfg.Model == nil {
+		return nil, errors.New("sshd: no maker of a session's model")
+	}
+	if cfg.Log == nil {
+		cfg.Log = slog.Default()
+	}
+	if cfg.HandshakeTimeout <= 0 {
+		cfg.HandshakeTimeout = 30 * time.Second
+	}
+	if cfg.MaxHandshakes <= 0 {
+		cfg.MaxHandshakes = 64
+	}
+	if cfg.KeepaliveInterval <= 0 {
+		cfg.KeepaliveInterval = 30 * time.Second
+	}
+	if cfg.KeepaliveMisses <= 0 {
+		cfg.KeepaliveMisses = 3
+	}
+	s := &Server{
+		cfg:       cfg,
+		log:       cfg.Log,
+		listeners: map[net.Listener]struct{}{},
+		conns:     map[*conn]struct{}{},
+		sessions:  map[*session]struct{}{},
+		changed:   make(chan struct{}),
+	}
+	// The host key goes first: without it wish would make one and write
+	// it to a file.
+	srv, err := wish.NewServer(
+		wish.WithHostKeyPEM(cfg.HostKeyPEM),
+		wish.WithVersion("kosh_"+cfg.Version),
+		wish.WithPublicKeyAuth(s.keyAccepted),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sshd: the host key: %w", err)
+	}
+	// No password or keyboard-interactive handler, and no channel,
+	// request or subsystem handler but the library's session: what is
+	// not handled is refused. The library fills these maps in only in
+	// its own Serve, which kosh does not use.
+	srv.ChannelHandlers = map[string]ssh.ChannelHandler{"session": ssh.DefaultSessionHandler}
+	srv.RequestHandlers = map[string]ssh.RequestHandler{}
+	srv.SubsystemHandlers = map[string]ssh.SubsystemHandler{}
+	srv.Handler = s.handle
+	srv.HandshakeTimeout = cfg.HandshakeTimeout
+	srv.ServerConfigCallback = s.serverConfig
+	srv.ConnectionFailedCallback = s.connectionFailed
+	s.ssh = srv
+	return s, nil
+}
+
+// keyAccepted is the public key handler: a key is accepted when the key
+// list holds it now. The user name is not looked at.
+func (s *Server) keyAccepted(_ ssh.Context, key ssh.PublicKey) bool {
+	_, ok := s.cfg.Keys.Lookup(key)
+	return ok
+}
+
+// serverConfig is the library's configuration of x/crypto's server, for
+// one connection.
+func (s *Server) serverConfig(ssh.Context) *gossh.ServerConfig {
+	return &gossh.ServerConfig{
+		MaxAuthTries: maxAuthTries,
+	}
+}
+
+// connectionFailed logs a connection that ended before it authenticated.
+func (s *Server) connectionFailed(nc net.Conn, err error) {
+	c := connOf(nc.RemoteAddr())
+	if c == nil {
+		return
+	}
+	s.logRefused(c.transport, c.remote, err.Error())
+}
+
+// logRefused logs a connection that is closed without having
+// authenticated.
+func (s *Server) logRefused(transport, remote, reason string) {
+	s.log.Info("connection closed before authenticating", "transport", transport, "remote", remote, "reason", reason)
 }
 
 // Serve accepts connections from l until l is closed or Shutdown is
 // called, and returns nil then. transport names l in the log and in
 // Session.Transport. Serve may be called for several listeners.
 func (s *Server) Serve(l net.Listener, transport string) error {
-	panic("not implemented")
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		_ = l.Close()
+		return nil
+	}
+	s.listeners[l] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.listeners, l)
+		s.mu.Unlock()
+	}()
+
+	var delay time.Duration
+	for {
+		nc, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) || s.isClosing() {
+				return nil
+			}
+			// As net/http does: an error the system may get over, such as
+			// too many open files, is waited out.
+			if ne, ok := err.(net.Error); ok && ne.Temporary() { //nolint:staticcheck // SA1019: as net/http
+				delay = min(max(2*delay, 5*time.Millisecond), time.Second)
+				time.Sleep(delay)
+				continue
+			}
+			return err
+		}
+		delay = 0
+		c := newConn(nc, transport)
+		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
+			_ = nc.Close()
+			continue
+		}
+		s.conns[c] = struct{}{}
+		s.notifyLocked()
+		s.mu.Unlock()
+		go s.serveConn(c)
+	}
+}
+
+// serveConn hands c to the library and forgets it when the library is
+// done with it.
+func (s *Server) serveConn(c *conn) {
+	s.ssh.HandleConn(c)
+	_ = c.Close()
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.notifyLocked()
+	s.mu.Unlock()
+}
+
+func (s *Server) isClosing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing
+}
+
+// notifyLocked wakes whoever waits for conns or sessions to change. s.mu
+// is held.
+func (s *Server) notifyLocked() {
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+// waitFor waits until cond, called with s.mu held, is true, or ctx is
+// done.
+func (s *Server) waitFor(ctx context.Context, cond func() bool) error {
+	s.mu.Lock()
+	for !cond() {
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		s.mu.Lock()
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 // Shutdown closes every listener Serve was given, tells every session
 // MsgShuttingDown and closes it, and returns when all connections are
 // closed or ctx is done, whichever is first.
 func (s *Server) Shutdown(ctx context.Context) error {
-	panic("not implemented")
+	s.mu.Lock()
+	s.closing = true
+	var listeners []net.Listener
+	for l := range s.listeners {
+		listeners = append(listeners, l)
+	}
+	s.mu.Unlock()
+	for _, l := range listeners {
+		_ = l.Close()
+	}
+
+	// The library's server closes the connections it has, which are
+	// those that have authenticated; the others are closed here.
+	_ = s.ssh.Close()
+	s.closeConns()
+	return s.waitFor(ctx, func() bool { return len(s.conns) == 0 && len(s.sessions) == 0 })
+}
+
+// closeConns closes every connection.
+func (s *Server) closeConns() {
+	s.mu.Lock()
+	var conns []*conn
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }
 
 // Sessions returns how many sessions are open.
 func (s *Server) Sessions() int {
-	panic("not implemented")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
 }
