@@ -100,9 +100,11 @@ func (s *screen) String() string {
 }
 
 // watch makes the screen look, after every write, for each of texts on
-// the screen and in the bytes written so far without their escape
-// sequences: a text that a frame shows, or sends broken up by cursor
-// moves, is seen even when it is painted over before anybody looks.
+// the screen, on the screen with its rows joined (a text wrapped onto the
+// next row), in the bytes written so far without their escape sequences
+// (a text sent broken up by cursor moves), and in the raw bytes (what an
+// OSC string carries, which taking the sequences out throws away): a
+// text is seen even when it is painted over before anybody looks.
 func (s *screen) watch(texts ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,7 +143,9 @@ func (s *screen) look() {
 		}
 		screen.WriteByte('\n')
 	}
-	stripped := ansi.Strip(s.all.String())
+	joined := strings.ReplaceAll(screen.String(), "\n", "")
+	raw := s.all.String()
+	stripped := ansi.Strip(raw)
 	for _, t := range s.watched {
 		if _, ok := s.seenAt[t]; ok {
 			continue
@@ -149,8 +153,12 @@ func (s *screen) look() {
 		switch {
 		case strings.Contains(screen.String(), t):
 			s.seenAt[t] = fmt.Sprintf("on the screen, after %d bytes:\n%s", s.all.Len(), screen.String())
+		case strings.Contains(joined, t):
+			s.seenAt[t] = fmt.Sprintf("on the screen with its rows joined, after %d bytes:\n%s", s.all.Len(), screen.String())
 		case strings.Contains(stripped, t):
-			s.seenAt[t] = fmt.Sprintf("in the bytes, after %d bytes", s.all.Len())
+			s.seenAt[t] = fmt.Sprintf("in the bytes without escape sequences, after %d bytes", s.all.Len())
+		case strings.Contains(raw, t):
+			s.seenAt[t] = fmt.Sprintf("in the raw bytes, after %d bytes", s.all.Len())
 		}
 	}
 }
@@ -609,6 +617,25 @@ func TestScreenIgnoresWhatDrawsNothing(t *testing.T) {
 		"seen",
 	)
 	wantLines(t, s, "seen")
+}
+
+// What ansi.Strip throws away, the payload of an OSC string such as a
+// copy to the clipboard, is looked at in the raw bytes; a text wrapped
+// across two rows is seen with the rows joined.
+func TestScreenWatchesRawBytesAndWrappedRows(t *testing.T) {
+	s := newScreen(10, 3)
+	s.watch("c2VjcmV0")
+	_, _ = s.Write([]byte("\x1b]52;c;c2VjcmV0\x07"))
+	if seen := s.seen(); len(seen) != 1 || !strings.Contains(seen[0], "in the raw bytes") {
+		t.Errorf("seen %q, want c2VjcmV0 in the raw bytes", seen)
+	}
+	s = newScreen(10, 3)
+	s.watch("abcdefghijkl")
+	_, _ = s.Write([]byte("\x1b[2;1Hkl\x1b[1;1Habcdefghij")) // the second row first
+
+	if seen := s.seen(); len(seen) != 1 || !strings.Contains(seen[0], "rows joined") {
+		t.Errorf("seen %q, want the text with the rows joined", seen)
+	}
 }
 
 // A narrow character written over either half of a wide one takes the

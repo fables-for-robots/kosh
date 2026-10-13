@@ -34,7 +34,8 @@ if ! command -v go >/dev/null || ! command -v kind >/dev/null || ! command -v ku
     echo "FAIL: go, kind and kubectl are not all in the development shell" >&2
     exit 1
   fi
-  KOSH_E2E_IN_SHELL=1 exec nix develop "$FLAKE#bare" --command "$0" "$@"
+  # By its path from the root: "$0" may be relative to where it was called.
+  KOSH_E2E_IN_SHELL=1 exec nix develop "$FLAKE#bare" --command "$ROOT/scripts/test-mdns.sh" "$@"
 fi
 
 IROH_SSH_REPO=https://github.com/rustonbsd/iroh-ssh

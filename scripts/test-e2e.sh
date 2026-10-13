@@ -37,7 +37,8 @@ if ! command -v go >/dev/null || ! command -v helm >/dev/null || ! command -v ki
     echo "FAIL: go, helm, kind, kubectl and yq are not all in the development shell" >&2
     exit 1
   fi
-  KOSH_E2E_IN_SHELL=1 exec nix develop "$FLAKE#bare" --command "$0" "$@"
+  # By its path from the root: "$0" may be relative to where it was called.
+  KOSH_E2E_IN_SHELL=1 exec nix develop "$FLAKE#bare" --command "$ROOT/scripts/test-e2e.sh" "$@"
 fi
 
 # iroh-ssh as its users have it: the released 0.2.12 for Linux x86_64,
@@ -72,10 +73,16 @@ step() { echo "== $*"; }
 # restore_nix_tag leaves the tag the loaded image carries as it was found.
 restore_nix_tag() {
   [ -n "$NIX_TAG" ] || return 0
+  local now ours
   if [ -n "$NIX_TAG_WAS" ]; then
     docker tag "$NIX_TAG_WAS" "$NIX_TAG" || echo "warning: $NIX_TAG could not be put back onto $NIX_TAG_WAS" >&2
   else
-    docker rmi "$NIX_TAG" >/dev/null || echo "warning: $NIX_TAG could not be removed" >&2
+    # Removed only while it names the image loaded here.
+    now=$(docker image inspect --format '{{.Id}}' "$NIX_TAG" 2>/dev/null || true)
+    ours=$(docker image inspect --format '{{.Id}}' "$TAG" 2>/dev/null || true)
+    if [ -n "$now" ] && [ "$now" = "$ours" ]; then
+      docker rmi "$NIX_TAG" >/dev/null || echo "warning: $NIX_TAG could not be removed" >&2
+    fi
   fi
   NIX_TAG=
 }
@@ -207,15 +214,23 @@ echo "ok   127.0.0.1:$port"
 step "iroh-ssh"
 iroh_ssh=$CACHE/iroh-ssh-0.2.12/iroh-ssh
 if [ "$(uname -s)/$(uname -m)" = Linux/x86_64 ]; then
-  if [ ! -x "$iroh_ssh" ]; then
+  # fetch_iroh_ssh downloads the release into the cache.
+  fetch_iroh_ssh() {
     mkdir -p "$(dirname "$iroh_ssh")"
     curl -fsSL --retry 3 -o "$iroh_ssh.download" "$IROH_SSH_RELEASE"
     echo "$IROH_SSH_SHA256  $iroh_ssh.download" | sha256sum -c --quiet - || fail "$IROH_SSH_RELEASE is not the one this script knows"
     chmod +x "$iroh_ssh.download"
     mv "$iroh_ssh.download" "$iroh_ssh"
+  }
+  [ -x "$iroh_ssh" ] || fetch_iroh_ssh
+  # The cached one too is the one this script knows; one that is not is
+  # fetched again, once.
+  if ! echo "$IROH_SSH_SHA256  $iroh_ssh" | sha256sum -c --quiet - 2>/dev/null; then
+    echo "the cached $iroh_ssh is not the release this script knows: fetching it again"
+    rm -f "$iroh_ssh"
+    fetch_iroh_ssh
+    echo "$IROH_SSH_SHA256  $iroh_ssh" | sha256sum -c --quiet - || fail "$iroh_ssh is not the release this script knows"
   fi
-  # The cached one too is the one this script knows.
-  echo "$IROH_SSH_SHA256  $iroh_ssh" | sha256sum -c --quiet - || fail "$iroh_ssh is not the release this script knows"
   "$iroh_ssh" --help >/dev/null 2>&1 || {
     echo "the released iroh-ssh does not run here"
     iroh_ssh=
