@@ -1,5 +1,5 @@
-// Follows k9s's internal/render/pod.go (Apache-2.0), its PodStatus,
-// which follows kubectl's printPod.
+// Derived from k9s's internal/render/pod.go, Copyright Authors of K9s, Apache-2.0 (see LICENSES/Apache-2.0.txt); changed for kosh.
+// It is k9s's PodStatus, which follows kubectl's printPod.
 
 package render
 

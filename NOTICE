@@ -3,10 +3,11 @@ version 3 only. See LICENSE and COPYING.
 
 kosh's terminal UI behaves like k9s (https://github.com/derailed/k9s),
 and the columns of its tables, what their cells hold and what makes a
-row an error follow k9s's. Files of kosh whose logic follows a file of
-k9s closely say so at their top. k9s is
+row an error follow k9s's. Files of kosh derived from a file of k9s say
+so at their top, name that file, and say that they were changed for
+kosh. k9s is
 
     Copyright Authors of K9s
 
-and licensed under the Apache License, Version 2.0
-(http://www.apache.org/licenses/LICENSE-2.0).
+and licensed under the Apache License, Version 2.0, whose text is in
+LICENSES/Apache-2.0.txt (also http://www.apache.org/licenses/LICENSE-2.0).
