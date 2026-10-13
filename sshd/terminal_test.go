@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"golang.org/x/crypto/ssh"
 )
 
 // longWait is the deadline of a wait for work that takes the machine
@@ -1569,4 +1570,119 @@ func TestScreenCheck(t *testing.T) {
 	if n := h.repairs(); n != 1 {
 		t.Errorf("the screen of a session that has ended was repaired")
 	}
+}
+
+// TestSessionEndsWhileTheClientDoesNotRead removes the key of a session
+// whose command is in a write that the client does not take. The
+// command's context is done and its input ends at once; its write cannot
+// be ended before the connection is, which the end's timer does: the
+// client gets no message, and the log says what was waited for.
+func TestSessionEndsWhileTheClientDoesNotRead(t *testing.T) {
+	const endTimeout = 200 * time.Millisecond
+	type writing struct {
+		held
+		wrote <-chan error
+	}
+	runs := make(chan writing, 1)
+	hv := newHandover(func(ctx context.Context, tt Terminal) error {
+		wrote := make(chan error, 1)
+		go func() {
+			_, err := tt.Out.Write(make([]byte, 8<<20))
+			wrote <- err
+		}()
+		runs <- writing{held{ctx: ctx, t: tt}, wrote}
+		// As the contract asks: the command returns on its context, and
+		// does not wait for its write.
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	h := handoverHarness(t, hv, withServer(func(s *Server) { s.endTimeout = endTimeout }))
+	ann := h.key("ann", false)
+	cc := &countingConn{Conn: h.dialRaw()}
+	cl, err := connect(cc, h.addr, clientConfig("kosh", ssh.PublicKeys(ann)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	// A session whose output nobody reads.
+	sess, err := cl.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	if _, err := sess.StdoutPipe(); err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Shell(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.Write([]byte("!")); err != nil {
+		t.Fatal(err)
+	}
+	var run writing
+	select {
+	case run = <-runs:
+	case <-time.After(longWait):
+		t.Fatal("the command was not given the terminal")
+	}
+	// Stalled: the channel's window of 2 MB is full, and nothing more
+	// arrives for 200 ms.
+	last, since := cc.read.Load(), time.Now()
+	eventuallyWithin(t, longWait, "the command's output to stall", func() bool {
+		if n := cc.read.Load(); n != last {
+			last, since = n, time.Now()
+		}
+		return last > 2<<20 && time.Since(since) > 200*time.Millisecond
+	})
+	select {
+	case err := <-run.wrote:
+		t.Fatalf("the command's write of 8 MB returned (%v) though the client does not read", err)
+	default:
+	}
+
+	ended := time.Now()
+	setKeys(t, h.list)
+	select {
+	case <-run.ctx.Done():
+		if d := time.Since(ended); d > 2*time.Second {
+			t.Errorf("the command's context was done %v after the key was removed", d)
+		}
+	case <-time.After(longWait):
+		t.Fatal("the command's context is not done")
+	}
+	wantRead(t, "the command's Read after the session was ended", readOnce(run.t.In), "", io.EOF)
+	select {
+	case err := <-run.wrote:
+		if err == nil {
+			t.Error("the write that the client did not take returned without an error")
+		}
+		if d := time.Since(ended); d > endTimeout+2*time.Second {
+			t.Errorf("the write that the client did not take returned %v after the key was removed, want within the end's timeout of %v and a margin", d, endTimeout)
+		}
+	case <-time.After(longWait):
+		t.Fatal("the write that the client did not take has not returned")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- cl.Wait() }()
+	select {
+	case <-closed:
+	case <-time.After(longWait):
+		t.Fatal("the connection of the session that could not be told is open")
+	}
+
+	rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
+		return strings.HasPrefix(r.Msg, "session did not end in time")
+	})
+	if !strings.Contains(rec.Msg, "the client did not take what its command wrote") || rec.Attrs["key"] != "ann" || rec.Attrs["reason"] != MsgKeyRemoved {
+		t.Errorf("the line %v does not say that a write of the command's was waited for, or whose session it was and why it was ended", rec)
+	}
+	h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" && r.Attrs["reason"] == MsgKeyRemoved })
+	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
 }
