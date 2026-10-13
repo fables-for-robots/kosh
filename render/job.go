@@ -8,6 +8,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/duration"
 )
@@ -42,13 +43,10 @@ func (job) Row(obj runtime.Object, now time.Time) (Row, error) {
 	st := &j.Status
 	names, images := workloadContainers(&j.Spec.Template.Spec, true)
 
-	// A job is done when as many pods succeeded as it wants
-	// completions, and one when it names none.
-	wanted := int32(1)
-	if j.Spec.Completions != nil {
-		wanted = *j.Spec.Completions
-	}
-	done := st.Succeeded >= wanted
+	// A job is done when it says so, and not when its count of pods
+	// that succeeded reaches a number: a work queue has pods running
+	// after the first succeeded.
+	done := st.CompletionTime != nil || jobComplete(st)
 
 	valid := ""
 	if !done && st.Failed > 0 {
@@ -74,6 +72,16 @@ func (job) Row(obj runtime.Object, now time.Time) (Row, error) {
 		b.Health(Completed)
 	}
 	return b.Row(), nil
+}
+
+// jobComplete says whether the job's Complete condition is true.
+func jobComplete(st *batchv1.JobStatus) bool {
+	for _, c := range st.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // jobCompletions is the COMPLETIONS cell: the pods that succeeded of

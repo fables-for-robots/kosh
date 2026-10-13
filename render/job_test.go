@@ -36,9 +36,16 @@ func jobTest(name string, completions *int32, succeeded, failed int32, started, 
 
 func TestJobRows(t *testing.T) {
 	three, one := int32(3), int32(1)
-	workQueue := jobTest("queue", nil, 0, 0, time.Hour, 0)
 	parallel := int32(3)
-	workQueue.Spec.Parallelism = &parallel
+	queue := func(name string, succeeded, failed, active int32, took time.Duration) *batchv1.Job {
+		j := jobTest(name, nil, succeeded, failed, time.Hour, took)
+		j.Spec.Parallelism = &parallel
+		j.Status.Active = active
+		return j
+	}
+	workQueue := queue("queue", 0, 0, 3, 0)
+	completeByCondition := jobTest("by-condition", &one, 1, 0, time.Hour, 0)
+	completeByCondition.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: "True"}}
 
 	tests := []struct {
 		name   string
@@ -84,6 +91,36 @@ func TestJobRows(t *testing.T) {
 			name:   "a work queue",
 			job:    workQueue,
 			want:   map[string]string{"COMPLETIONS": "0/1 of 3", "VALID": ""},
+			health: OK,
+		},
+		{
+			name:   "a work queue, one pod succeeded and others still running",
+			job:    queue("queue-busy", 1, 0, 2, 0),
+			want:   map[string]string{"COMPLETIONS": "1/1 of 3", "DURATION": MissingValue, "VALID": ""},
+			health: OK,
+		},
+		{
+			name:   "a work queue, completed",
+			job:    queue("queue-done", 3, 0, 0, 20*time.Minute),
+			want:   map[string]string{"COMPLETIONS": "3/1 of 3", "DURATION": "20m", "VALID": ""},
+			health: Completed,
+		},
+		{
+			name:   "a work queue, pods failed while one succeeded",
+			job:    queue("queue-failing", 1, 2, 2, 0),
+			want:   map[string]string{"COMPLETIONS": "1/1 of 3", "VALID": "2 pods failed"},
+			health: Error,
+		},
+		{
+			name:   "complete by its condition, no completion time",
+			job:    completeByCondition,
+			want:   map[string]string{"COMPLETIONS": "1/1", "DURATION": MissingValue, "VALID": ""},
+			health: Completed,
+		},
+		{
+			name:   "as many succeeded as wanted, not yet complete",
+			job:    jobTest("finishing", &three, 3, 0, time.Hour, 0),
+			want:   map[string]string{"COMPLETIONS": "3/3", "VALID": ""},
 			health: OK,
 		},
 		{
