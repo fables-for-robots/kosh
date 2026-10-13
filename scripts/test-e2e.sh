@@ -110,8 +110,13 @@ step "the kind cluster $CLUSTER"
 CREATED_CLUSTER=1
 kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
 kind load docker-image "$TAG" --name "$CLUSTER"
+# A registry that does not answer at once is tried again, three times.
 sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml | while read -r image; do
-  docker exec "$CLUSTER-control-plane" crictl pull "$image" >/dev/null
+  for try in 1 2 3; do
+    docker exec "$CLUSTER-control-plane" crictl pull "$image" >/dev/null && break
+    [ "$try" != 3 ] || fail "$image could not be pulled into the node"
+    sleep 5
+  done
   echo "ok   $image is in the node"
 done
 
@@ -182,7 +187,7 @@ iroh_ssh=$CACHE/iroh-ssh-0.2.12/iroh-ssh
 if [ "$(uname -s)/$(uname -m)" = Linux/x86_64 ]; then
   if [ ! -x "$iroh_ssh" ]; then
     mkdir -p "$(dirname "$iroh_ssh")"
-    curl -fsSL -o "$iroh_ssh.download" "$IROH_SSH_RELEASE"
+    curl -fsSL --retry 3 -o "$iroh_ssh.download" "$IROH_SSH_RELEASE"
     echo "$IROH_SSH_SHA256  $iroh_ssh.download" | sha256sum -c --quiet - || fail "$IROH_SSH_RELEASE is not the one this script knows"
     chmod +x "$iroh_ssh.download"
     mv "$iroh_ssh.download" "$iroh_ssh"
