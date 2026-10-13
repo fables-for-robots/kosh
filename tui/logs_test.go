@@ -308,8 +308,19 @@ func TestLogWrap(t *testing.T) {
 
 func TestLogsOfAWorkload(t *testing.T) {
 	sess := newSession()
+	sess.SetTable(query("deployments", "default"), simpleTable("web"))
 	hs := newHarness(t, sess, 100, 30)
-	v, s := logOpenIn(t, hs, sess, kubetest.Ref("deployments", "default", "web"), kube.LogOptions{})
+	hs.command("deploy")
+	hs.press("l")
+	deploy := kubetest.Ref("deployments", "default", "web")
+	if ref, opts := logLastOpts(t, sess); ref.String() != deploy.String() || opts != (kube.LogOptions{}) {
+		t.Errorf("l called Logs(%s, %+v)", ref, opts)
+	}
+	v, ok := hs.root().top().(*logView)
+	if !ok {
+		t.Fatalf("l did not open the log: %T", hs.root().top())
+	}
+	s := sess.LogOf(deploy)
 	s.Send(
 		kube.LogLine{Pod: "web-1", Container: "app", Text: "one"},
 		kube.LogLine{Pod: "web-2", Container: "app", Text: "two"},
