@@ -113,8 +113,9 @@ type Server struct {
 	listeners map[net.Listener]struct{}
 	conns     map[*conn]struct{}
 	sessions  map[*session]struct{}
-	running   int           // sessions whose program runs
-	changed   chan struct{} // closed, and replaced, when conns or sessions change
+	windows   map[ssh.Session]*window // of session channels that asked for a terminal
+	running   int                     // sessions whose program runs
+	changed   chan struct{}           // closed, and replaced, when conns or sessions change
 }
 
 type noCopy struct{}
@@ -153,6 +154,7 @@ func New(cfg Config) (*Server, error) {
 		listeners:  map[net.Listener]struct{}{},
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},
+		windows:    map[ssh.Session]*window{},
 		changed:    make(chan struct{}),
 	}
 	// The host key goes first: without it wish would make one and write
@@ -173,6 +175,12 @@ func New(cfg Config) (*Server, error) {
 	srv.RequestHandlers = map[string]ssh.RequestHandler{}
 	srv.SubsystemHandlers = map[string]ssh.SubsystemHandler{}
 	srv.Handler = s.handle
+	// The library's emulated terminal, which is its default, made
+	// explicit so that its window can be drained from the start.
+	if err := srv.SetOption(ssh.EmulatePty()); err != nil {
+		return nil, fmt.Errorf("sshd: %w", err)
+	}
+	srv.PtyHandler = s.ptyHandler(srv.PtyHandler)
 	srv.HandshakeTimeout = cfg.HandshakeTimeout
 	srv.ServerConfigCallback = s.serverConfig
 	srv.ConnectionFailedCallback = s.connectionFailed

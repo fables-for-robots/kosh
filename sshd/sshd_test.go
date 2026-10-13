@@ -221,6 +221,7 @@ func TestNoTerminal(t *testing.T) {
 	if got := tm.stderr.String(); got != MsgNeedsTerminal+"\n" {
 		t.Errorf("error stream %q, want %q", got, MsgNeedsTerminal+"\n")
 	}
+	h.refusalLogged(MsgNeedsTerminal, "alice")
 	if h.models.Load() != 0 {
 		t.Error("a model was made")
 	}
@@ -229,6 +230,7 @@ func TestNoTerminal(t *testing.T) {
 func TestCommandIsRefused(t *testing.T) {
 	h := newHarness(t)
 	cl := h.dial(h.key("alice", false), "kosh")
+	defer h.refusalLogged(MsgNoCommands, "alice")
 	for _, pty := range []bool{false, true} {
 		tm := openSession(t, cl, pty, "ls")
 		if st := tm.exit(); st != 1 {
@@ -305,5 +307,18 @@ func TestNothingElseIsServed(t *testing.T) {
 		_ = ch.Reject(ssh.Prohibited, "test")
 		t.Error("the server opened an agent channel")
 	default:
+	}
+}
+
+// refusalLogged checks that a session refused with reason is logged with
+// the key's name and fingerprint.
+func (h *harness) refusalLogged(reason, name string) {
+	h.t.Helper()
+	rec := h.log.waitFor(h.t, "of the refused session", func(r logRecord) bool {
+		return r.Msg == "session refused" && r.Attrs["reason"] == reason
+	})
+	if rec.Attrs["key"] != name || !strings.HasPrefix(rec.Attrs["fingerprint"], "SHA256:") ||
+		rec.Attrs["transport"] != "tcp" || rec.Attrs["remote"] == "" {
+		h.t.Errorf("the refused session is logged as %v", rec)
 	}
 }

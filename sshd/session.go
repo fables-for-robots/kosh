@@ -47,7 +47,10 @@ func (s *Server) handle(ss ssh.Session) {
 // refuse ends a session before it has a program: msg and a line feed on
 // its error stream, and exit status 1.
 func (s *Server) refuse(c *conn, ss ssh.Session, msg string) {
-	s.log.Info("session refused", "transport", c.transport, "remote", c.remote, "reason", msg)
+	key := ss.PublicKey()
+	g, _ := s.cfg.Keys.Lookup(key)
+	s.log.Info("session refused", "transport", c.transport, "remote", c.remote,
+		"key", g.Name, "fingerprint", fingerprint(key), "reason", msg)
 	_, _ = io.WriteString(ss.Stderr(), msg+"\n")
 	_ = ss.Exit(1)
 }
@@ -77,12 +80,25 @@ type session struct {
 	// timer closes the connection when the session takes longer than
 	// srv.endTimeout to end after kosh ended it.
 	timer *time.Timer
+	// finished is set when the session has exited: end does nothing
+	// after that.
+	finished bool
 }
 
 // run gives the session its program, and ends it when the program ends.
 func (s *Server) run(c *conn, ss ssh.Session) {
 	ctx, cancel := context.WithCancel(ss.Context())
 	defer cancel()
+	// The session ends when the client closes its channel, even if the
+	// connection stays: nothing would end the program then.
+	win := s.windowOf(ss)
+	go func() {
+		select {
+		case <-win.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx}
 	s.register(sess)
 	defer s.unregister(sess)
@@ -115,7 +131,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			log.Info("session start")
 			began := time.Now()
 
-			go forwardWindow(ctx, ss, p)
+			go win.forward(ctx, p)
 			_, err := p.Run()
 			if errors.Is(err, tea.ErrProgramPanic) {
 				// A command's goroutine panicked, and Bubble Tea caught
@@ -133,7 +149,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 
 	// The program has stopped and given the terminal back, or there was
 	// none.
-	defer sess.stopTimer()
+	defer sess.finish()
 	if !started {
 		log.Info("session refused", "reason", sess.ending())
 	}
@@ -167,7 +183,7 @@ func (sess *session) start(p *tea.Program) bool {
 func (sess *session) end(msg string) bool {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if sess.reason != "" {
+	if sess.reason != "" || sess.finished {
 		return false
 	}
 	sess.reason = msg
@@ -185,10 +201,14 @@ func (sess *session) end(msg string) bool {
 	return true
 }
 
-// stopTimer stops the timer of end, once the session has ended.
-func (sess *session) stopTimer() {
+// finish marks the session as exited, and stops the timer of end. An end
+// that comes later, from a change of the key list that saw the session
+// before it was gone, does nothing: its timer would close a connection
+// that may have a new session by then.
+func (sess *session) finish() {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	sess.finished = true
 	if sess.timer != nil {
 		sess.timer.Stop()
 	}
@@ -281,19 +301,94 @@ func (sess *session) ending() string {
 	return sess.reason
 }
 
-// forwardWindow tells p each new size of the session's window, until ctx
-// is done.
-func forwardWindow(ctx context.Context, ss ssh.Session, p *tea.Program) {
-	_, windows, _ := ss.Pty()
+// window is the window of a session channel that asked for a terminal.
+//
+// The library puts the size of each window-change request on a channel
+// with room for one, and blocks its request loop on it when it is full:
+// a client could stop the loop, and leave its goroutine behind for good,
+// with two window changes nobody takes. So the channel is drained from
+// the moment pty-req makes it until the library closes it with the
+// session channel; the latest size is kept, for the program when one
+// runs.
+type window struct {
+	// closed is closed when the session channel is.
+	closed chan struct{}
+	// changed has a value when size has changed since it was taken.
+	changed chan struct{}
+
+	mu   sync.Mutex
+	size ssh.Window
+}
+
+// ptyHandler is the library's PtyHandler: the library's emulated
+// terminal, whose window is drained at once.
+func (s *Server) ptyHandler(emulate ssh.PtyHandler) ssh.PtyHandler {
+	return func(ctx ssh.Context, ss ssh.Session, pty ssh.Pty) (func() error, error) {
+		closer, err := emulate(ctx, ss, pty)
+		if err != nil {
+			return nil, err
+		}
+		_, sizes, ok := ss.Pty()
+		if !ok {
+			return closer, nil
+		}
+		w := &window{closed: make(chan struct{}), changed: make(chan struct{}, 1)}
+		s.mu.Lock()
+		s.windows[ss] = w
+		s.mu.Unlock()
+		go func() {
+			for size := range sizes {
+				w.mu.Lock()
+				w.size = size
+				w.mu.Unlock()
+				select {
+				case w.changed <- struct{}{}:
+				default:
+				}
+			}
+			s.mu.Lock()
+			delete(s.windows, ss)
+			s.mu.Unlock()
+			close(w.closed)
+		}()
+		return closer, nil
+	}
+}
+
+// closedWindow is the window of a session channel that is closed.
+var closedWindow = func() *window {
+	w := &window{closed: make(chan struct{}), changed: make(chan struct{})}
+	close(w.closed)
+	return w
+}()
+
+// windowOf returns the window of ss. pty-req makes it before the shell
+// or exec request that starts the handler, in the same request loop, and
+// it is forgotten only when the channel is closed: a session without one
+// has a closed channel.
+func (s *Server) windowOf(ss ssh.Session) *window {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w, ok := s.windows[ss]; ok {
+		return w
+	}
+	return closedWindow
+}
+
+// forward tells p each new size of the window, until ctx is done.
+func (w *window) forward(ctx context.Context, p *tea.Program) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case w, ok := <-windows:
-			if !ok {
-				return
-			}
-			p.Send(tea.WindowSizeMsg{Width: w.Width, Height: w.Height})
+		case <-w.closed:
+			return
+		case <-w.changed:
+			w.mu.Lock()
+			size := w.size
+			w.mu.Unlock()
+			// Send returns when the program takes it, or has ended.
+			p.Send(tea.WindowSizeMsg{Width: size.Width, Height: size.Height})
 		}
 	}
 }

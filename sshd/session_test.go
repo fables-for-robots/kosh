@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -265,5 +266,150 @@ func TestShutdown(t *testing.T) {
 	if c, err := net.Dial("tcp", h.addr); err == nil {
 		_ = c.Close()
 		t.Error("a new connection was accepted after Shutdown")
+	}
+}
+
+func TestClosingTheChannelEndsTheSession(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = idle }))
+	cl := h.dial(h.key("alice", false), "kosh")
+	tm := openTerm(t, cl)
+	tm.waitFor(testWord)
+	s := h.nextSession()
+
+	// The session channel is closed; the connection stays, as a client
+	// of a multiplexing master leaves it.
+	_ = tm.sess.Close()
+	closedAt := time.Now()
+	contextEnds(t, s, "after the client closed the session channel")
+	eventually(t, "Sessions() to be 0 after the channel was closed", func() bool { return h.srv.Sessions() == 0 })
+	if d := closedByTheServer(t, cl, "a connection whose session channel was closed").Sub(closedAt); d < idle/2 {
+		t.Errorf("the connection was closed %v after its session channel, want about %v", d, idle)
+	}
+}
+
+// windowChange sends a window-change request for cols by rows, without
+// waiting for an answer.
+func windowChange(t *testing.T, sess *ssh.Session, cols, rows uint32) {
+	t.Helper()
+	payload := ssh.Marshal(struct{ Columns, Rows, Width, Height uint32 }{cols, rows, 0, 0})
+	if _, err := sess.SendRequest("window-change", false, payload); err != nil {
+		t.Fatalf("window-change: %v", err)
+	}
+}
+
+func TestWindowChangeBeforeShell(t *testing.T) {
+	h := newHarness(t)
+	cl := h.dial(h.key("alice", false), "kosh")
+	sess, err := cl.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	out := &syncBuffer{}
+	sess.Stdout = out
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		windowChange(t, sess, 100+uint32(i), 30)
+	}
+	shell := make(chan error, 1)
+	go func() { shell <- sess.Shell() }()
+	select {
+	case err := <-shell:
+		if err != nil {
+			t.Fatalf("shell after window changes: %v", err)
+		}
+	case <-timeAfterWait():
+		t.Fatal("the shell request has no answer after window changes")
+	}
+	eventually(t, "the program", func() bool { return strings.Contains(out.String(), testWord) })
+	if _, err := stdin.Write([]byte("q")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Wait(); err != nil {
+		t.Errorf("the session: %v", err)
+	}
+}
+
+// pausedConn holds what it reads while it is paused.
+type pausedConn struct {
+	net.Conn
+	mu   sync.Mutex
+	gate chan struct{}
+}
+
+func (c *pausedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.mu.Lock()
+	gate := c.gate
+	c.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	return n, err
+}
+
+func (c *pausedConn) pause() {
+	c.mu.Lock()
+	c.gate = make(chan struct{})
+	c.mu.Unlock()
+}
+
+func (c *pausedConn) resume() {
+	c.mu.Lock()
+	close(c.gate)
+	c.gate = nil
+	c.mu.Unlock()
+}
+
+// After the handler has returned, the session channel stays open until
+// the client answers its close; window changes until then are dropped.
+func TestWindowChangeAfterTheSession(t *testing.T) {
+	h := newHarness(t)
+	key := h.key("alice", false)
+	pc := &pausedConn{Conn: h.dialRaw()}
+	cl, err := connect(pc, h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	sess, err := cl.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	if err := sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Start("ls"); err != nil {
+		t.Fatal(err)
+	}
+	// The client reads nothing more: it does not answer the close.
+	pc.pause()
+	h.log.waitFor(t, "of the refused command", func(r logRecord) bool { return r.Msg == "session refused" })
+	for i := range 3 {
+		windowChange(t, sess, 100+uint32(i), 30)
+	}
+	pc.resume()
+	if st := exitStatus(t, sess.Wait()); st != 1 {
+		t.Errorf("exit status %d, want 1", st)
+	}
+}
+
+func TestEndAfterTheSessionFinishedDoesNothing(t *testing.T) {
+	h := newHarness(t)
+	sess := &session{srv: h.srv, conn: &conn{srv: h.srv}}
+	sess.finish()
+	if sess.end(MsgGrantChanged) {
+		t.Error("end ended a session that had finished")
+	}
+	if sess.timer != nil || sess.ending() != "" {
+		t.Error("end armed its timer, or set a reason, on a session that had finished")
 	}
 }
