@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1149,6 +1150,172 @@ func TestIrohSSHReadOnly(t *testing.T) {
 	if status := p.exitedWith(wait); status != 0 {
 		t.Errorf("iroh-ssh exited with status %d after :q; the screen:\n%s", status, p.scr)
 	}
+}
+
+// sshPTY runs the real ssh to kosh over the forwarded port as k, on a
+// pseudo-terminal of w by h, as a user runs it.
+func sshPTY(t *testing.T, k key, w, h int) *ptySession {
+	t.Helper()
+	return startPTY(t, sshCommand(t, k, []string{"-t"}), w, h)
+}
+
+// resize changes the pseudo-terminal's size, as a terminal's window
+// does: the program on it is told by SIGWINCH.
+func (p *ptySession) resize(w, h int) {
+	p.t.Helper()
+	p.scr.resize(w, h)
+	if err := pty.Setsize(p.ptmx, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)}); err != nil {
+		p.t.Fatal(err)
+	}
+}
+
+// shellDefaultEnd is how the dialog's Command field shows the default
+// command: scrolled to its end, where the cursor is.
+const shellDefaultEnd = `exec bash || exec sh"`
+
+// shellPrompt is the prompt of busybox's sh as root, without its blank.
+const shellPrompt = "/ #"
+
+// dialogLines returns the lines inside the dialog's box, without its
+// borders and the blanks at their ends, or nil when no dialog is drawn.
+func dialogLines(lines []string) []string {
+	for i, l := range lines {
+		r := []rune(l)
+		left := slices.Index(r, '╭')
+		right := slices.Index(r, '╮')
+		if left < 0 || right <= left {
+			continue
+		}
+		var inside []string
+		for _, l := range lines[i+1:] {
+			r := []rune(l)
+			if len(r) <= right || r[left] == '╰' {
+				break
+			}
+			inside = append(inside, strings.TrimSpace(string(r[left+1:right])))
+		}
+		return inside
+	}
+	return nil
+}
+
+// dialogField returns the value of the dialog's field label as drawn, and
+// whether the field has the focus; "" when there is no such field.
+func dialogField(lines []string, label string) (value string, focused bool) {
+	for _, l := range dialogLines(lines) {
+		focused := strings.HasPrefix(l, "▸ ")
+		l = strings.TrimSpace(strings.TrimPrefix(l, "▸ "))
+		if rest, ok := strings.CutPrefix(l, label+"  "); ok {
+			return strings.TrimSpace(rest), focused
+		}
+	}
+	return "", false
+}
+
+// shellDialog presses s on the row under the cursor and waits for the
+// shell's dialog for pod (namespace/name) with container chosen, as the
+// field shows it, and the default command, in the field that has the
+// focus.
+func (c *term) shellDialog(pod, container string) {
+	c.t.Helper()
+	c.send("s")
+	c.waitUntil(wait, fmt.Sprintf("the shell's dialog for %s, container %s, the default command", pod, container), func(lines []string) bool {
+		got, _ := dialogField(lines, "Container")
+		cmd, focused := dialogField(lines, "Command")
+		return lineWith(dialogLines(lines), "A shell in pod "+pod) && got == container &&
+			focused && strings.HasSuffix(cmd, shellDefaultEnd)
+	})
+}
+
+// shellLine is the line kosh writes when a shell starts.
+func shellLine(pod, container string) string {
+	return fmt.Sprintf("kosh: a shell in pod %s, container %s. It ends with exit or ctrl-d.", pod, container)
+}
+
+// lastLine returns the index of the last line that is not blank, or -1.
+func lastLine(lines []string) int {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			return i
+		}
+	}
+	return -1
+}
+
+// prompted reports whether the last line that is not blank is the
+// shell's prompt alone, after line from (a command's end).
+func prompted(lines []string, from int) bool {
+	i := lastLine(lines)
+	return i > from && strings.TrimSpace(lines[i]) == shellPrompt
+}
+
+// inShell waits for kosh's line for pod and container, and the shell's
+// prompt after it.
+func (c *term) inShell(pod, container string) {
+	c.t.Helper()
+	want := shellLine(pod, container)
+	c.waitUntil(wait, "kosh's line "+want+", then the prompt", func(lines []string) bool {
+		for i, l := range lines {
+			if strings.TrimSpace(l) == want {
+				return prompted(lines, i)
+			}
+		}
+		return false
+	})
+}
+
+// shellRun types command into the shell, and waits for a line that is
+// want alone, and the prompt after it.
+func (c *term) shellRun(command, want string) {
+	c.t.Helper()
+	c.send(command + keyEnter)
+	c.waitUntil(wait, fmt.Sprintf("%s shows %s, then the prompt", command, want), func(lines []string) bool {
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.TrimRight(lines[i], " ") == want {
+				return prompted(lines, i)
+			}
+		}
+		return false
+	})
+}
+
+// openShell presses s on marker, the first row of the pods of default,
+// and enter, and waits for the shell.
+func (c *term) openShell() {
+	c.t.Helper()
+	c.waitRow("marker", "Running")
+	c.shellDialog("default/marker", "marker")
+	c.send(keyEnter)
+	c.inShell("default/marker", "marker")
+}
+
+// backFromShell types exit, and waits for the pods table, whole, and
+// marker in it.
+func (c *term) backFromShell(w, h int) {
+	c.t.Helper()
+	c.send("exit" + keyEnter)
+	c.fills(w, h)
+	c.waitRow("marker", "Running")
+}
+
+func TestShell(t *testing.T) {
+	inCluster(t)
+	p := sshPTY(t, fullKey(t), 120, 40)
+	p.waitRow("marker", "Running")
+	p.waitUntil(wait, "the hint <s> Shell", func(lines []string) bool { return lineWith(headerLines(lines), "<s> Shell") })
+	p.openShell()
+	p.shellRun("echo kosh-$((6*7))", "kosh-42")
+	p.shellRun("stty size", "40 120")
+	p.resize(100, 30)
+	p.shellRun("stty size", "30 100")
+	p.backFromShell(100, 30)
+
+	// The table follows the cluster again.
+	const pod = "shell-follows"
+	kubectl(t, "--namespace", "default", "run", pod, "--image=registry.k8s.io/pause:3.10",
+		"--image-pull-policy=IfNotPresent", "--restart=Never")
+	t.Cleanup(func() { kubectl(t, "--namespace", "default", "delete", "pod", pod, "--wait=false") })
+	p.waitRow(pod)
 }
 
 // setKeys installs the chart again with the key list of lines, keeping
