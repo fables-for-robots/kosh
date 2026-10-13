@@ -1,18 +1,25 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -315,6 +322,602 @@ func TestExecRequest(t *testing.T) {
 		r := <-got
 		if _, ok := r.URL.Query()["container"]; ok {
 			t.Errorf("a container was asked for: %s", r.URL.RawQuery)
+		}
+	})
+}
+
+// execOut is a terminal's output: it keeps what was written to it and
+// says when something was.
+type execOut struct {
+	mu    sync.Mutex
+	b     bytes.Buffer
+	wrote chan struct{}
+}
+
+func newExecOut() *execOut { return &execOut{wrote: make(chan struct{}, 1)} }
+
+func (o *execOut) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	o.b.Write(p)
+	o.mu.Unlock()
+	select {
+	case o.wrote <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func (o *execOut) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.b.String()
+}
+
+// waitFor waits a minute at most for the output to be want.
+func (o *execOut) waitFor(t *testing.T, want string) {
+	t.Helper()
+	deadline := time.After(time.Minute)
+	for {
+		got := o.String()
+		if got == want {
+			return
+		}
+		if len(got) >= len(want) {
+			t.Fatalf("output %q, want %q", got, want)
+		}
+		select {
+		case <-o.wrote:
+		case <-deadline:
+			t.Fatalf("output %q within a minute, want %q", got, want)
+		}
+	}
+}
+
+// receive returns what comes from c within a minute, or fails the test.
+func receive[T any](t *testing.T, what string, c <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-c:
+		return v
+	case <-time.After(time.Minute):
+		t.Fatalf("not within a minute: %s", what)
+		var zero T
+		return zero
+	}
+}
+
+// execTerminal is the terminal Exec is given in a test: its input is a
+// pipe the test writes to, its size is what the test sets.
+type execTerminal struct {
+	in      *io.PipeReader
+	type_   *io.PipeWriter
+	out     *execOut
+	resized chan struct{}
+	asked   chan remotecommand.TerminalSize // each size Size returned
+
+	mu   sync.Mutex
+	w, h int
+}
+
+func newExecTerminal(t *testing.T, w, h int) *execTerminal {
+	pr, pw := io.Pipe()
+	// The caller's reader ends with its turn: what Exec's stream may
+	// still read is ended with the test.
+	t.Cleanup(func() { pw.Close() })
+	return &execTerminal{in: pr, type_: pw, out: newExecOut(), resized: make(chan struct{}, 1), asked: make(chan remotecommand.TerminalSize, 16), w: w, h: h}
+}
+
+func (term *execTerminal) size() (int, int) {
+	term.mu.Lock()
+	w, h := term.w, term.h
+	term.mu.Unlock()
+	term.asked <- remotecommand.TerminalSize{Width: uint16(max(w, 0)), Height: uint16(max(h, 0))}
+	return w, h
+}
+
+// resize sets the size and says it changed, and waits until Size was
+// asked for it.
+func (term *execTerminal) resize(t *testing.T, w, h int) {
+	t.Helper()
+	term.mu.Lock()
+	term.w, term.h = w, h
+	term.mu.Unlock()
+	term.resized <- struct{}{}
+	receive(t, "the size is asked for", term.asked)
+}
+
+func (term *execTerminal) options(command ...string) ExecOptions {
+	return ExecOptions{Container: "web", Command: command, Stdin: term.in, Stdout: term.out, Size: term.size, Resized: term.resized}
+}
+
+// execStart calls Exec in a goroutine; what it returns comes on the
+// channel.
+type execReturn struct {
+	res ExecResult
+	err error
+}
+
+func execStart(ctx context.Context, s *session, pod ObjectRef, opts ExecOptions) <-chan execReturn {
+	done := make(chan execReturn, 1)
+	go func() {
+		res, err := s.Exec(ctx, pod, opts)
+		done <- execReturn{res, err}
+	}()
+	return done
+}
+
+func TestExecStream(t *testing.T) {
+	const printed = "hello\nworld\r\n\x1b[2J\x00\xff"
+	const typed = "ls -l\r\x03\x04"
+	firstSize := make(chan remotecommand.TerminalSize, 1)
+	nextSize := make(chan remotecommand.TerminalSize, 1)
+	gotInput := make(chan string, 1)
+	f := execEnv(t, serveExec(t, func(st *execStreams) {
+		s, ok := <-st.sizes
+		if !ok {
+			t.Error("no first size")
+			return
+		}
+		firstSize <- s
+		if _, err := st.stdout.Write([]byte(printed)); err != nil {
+			t.Errorf("writing stdout: %v", err)
+			return
+		}
+		b := make([]byte, len(typed))
+		if _, err := io.ReadFull(st.stdin, b); err != nil {
+			t.Errorf("reading stdin: %v", err)
+			return
+		}
+		gotInput <- string(b)
+		s, ok = <-st.sizes
+		if !ok {
+			t.Error("no second size")
+			return
+		}
+		nextSize <- s
+		if err := st.exit(execSuccess); err != nil {
+			t.Errorf("writing the status: %v", err)
+		}
+	}))
+	term := newExecTerminal(t, 80, 24)
+	done := execStart(context.Background(), f.s, f.pod("web"), term.options("sh"))
+
+	if s := receive(t, "the first size", firstSize); s != (remotecommand.TerminalSize{Width: 80, Height: 24}) {
+		t.Errorf("first size %+v, want 80x24", s)
+	}
+	term.out.waitFor(t, printed)
+	if _, err := term.type_.Write([]byte(typed)); err != nil {
+		t.Fatal(err)
+	}
+	if in := receive(t, "the input", gotInput); in != typed {
+		t.Errorf("stdin %q, want %q", in, typed)
+	}
+	receive(t, "the first size was asked for", term.asked)
+	// A size of zero is not sent; the one after it is.
+	term.resize(t, 0, 0)
+	term.resize(t, 100, 30)
+	if s := receive(t, "the next size", nextSize); s != (remotecommand.TerminalSize{Width: 100, Height: 30}) {
+		t.Errorf("next size %+v, want 100x30", s)
+	}
+	out := receive(t, "Exec returns", done)
+	if out.err != nil {
+		t.Fatalf("Exec: %v", out.err)
+	}
+	if out.res != (ExecResult{Started: true, Status: 0}) {
+		t.Errorf("result %+v", out.res)
+	}
+}
+
+func TestExecSizes(t *testing.T) {
+	size := func(w, h int) func() (int, int) { return func() (int, int) { return w, h } }
+	next := func(q remotecommand.TerminalSizeQueue) <-chan *remotecommand.TerminalSize {
+		c := make(chan *remotecommand.TerminalSize, 1)
+		go func() { c <- q.Next() }()
+		return c
+	}
+
+	t.Run("no Size sends no size", func(t *testing.T) {
+		if q := execSizes(context.Background(), ExecOptions{}); q != nil {
+			t.Errorf("a queue %v", q)
+		}
+	})
+
+	t.Run("no Resized sends the first size only", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		q := execSizes(ctx, ExecOptions{Size: size(80, 24)})
+		if s := receive(t, "the first size", next(q)); s == nil || *s != (remotecommand.TerminalSize{Width: 80, Height: 24}) {
+			t.Fatalf("first %v", s)
+		}
+		second := next(q)
+		select {
+		case s := <-second:
+			t.Fatalf("a second size %v", s)
+		default:
+		}
+		cancel()
+		if s := receive(t, "the queue ends", second); s != nil {
+			t.Errorf("after the end %v", s)
+		}
+	})
+
+	t.Run("sizes of zero or less are not sent", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var mu sync.Mutex
+		sizes := [][2]int{{0, 24}, {80, 0}, {-1, -1}, {81, 25}}
+		resized := make(chan struct{}, len(sizes))
+		for range sizes[1:] {
+			resized <- struct{}{}
+		}
+		q := execSizes(ctx, ExecOptions{Resized: resized, Size: func() (int, int) {
+			mu.Lock()
+			defer mu.Unlock()
+			s := sizes[0]
+			sizes = sizes[1:]
+			return s[0], s[1]
+		}})
+		if s := receive(t, "a size", next(q)); s == nil || *s != (remotecommand.TerminalSize{Width: 81, Height: 25}) {
+			t.Errorf("size %v, want 81x25", s)
+		}
+	})
+
+	t.Run("a size too large for the protocol is its largest", func(t *testing.T) {
+		q := execSizes(context.Background(), ExecOptions{Size: size(1<<20, 70000)})
+		if s := receive(t, "a size", next(q)); s == nil || *s != (remotecommand.TerminalSize{Width: 65535, Height: 65535}) {
+			t.Errorf("size %v", s)
+		}
+	})
+
+	t.Run("the queue ends with the context while it waits for a change", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		q := execSizes(ctx, ExecOptions{Size: size(0, 0), Resized: make(chan struct{})})
+		first := next(q)
+		cancel()
+		if s := receive(t, "the queue ends", first); s != nil {
+			t.Errorf("size %v", s)
+		}
+	})
+}
+
+func TestExecStatus(t *testing.T) {
+	f := execEnv(t, serveExec(t, func(st *execStreams) {
+		if _, err := st.stdout.Write([]byte("bye\r\n")); err != nil {
+			t.Errorf("writing stdout: %v", err)
+		}
+		if err := st.exit(execExitCode("7")); err != nil {
+			t.Errorf("writing the status: %v", err)
+		}
+	}))
+	term := newExecTerminal(t, 80, 24)
+	res, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh"))
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if res != (ExecResult{Started: true, Status: 7}) {
+		t.Errorf("result %+v, want started with 7", res)
+	}
+}
+
+// The texts of the probe's runs on containerd 2.2.0, as the WebSocket
+// stream gave them.
+const (
+	execNoShell     = `Internal error occurred: Internal error occurred: error executing command in container: failed to exec in container: failed to start exec "80c33c691f999d15757aae25dad85857e38b44fe3f1e4008648e46a3a2716f75": OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH`
+	execNoContainer = `Internal error occurred: unable to upgrade connection: container not found ("web")`
+)
+
+func TestExecNotStarted(t *testing.T) {
+	long := "Internal error occurred: " + strings.Repeat("é", 2048)
+	tests := []struct {
+		name    string
+		handler func(t *testing.T) http.HandlerFunc
+		want    string // the end of the error's text
+	}{
+		{"no such program", func(t *testing.T) http.HandlerFunc {
+			return serveExec(t, func(st *execStreams) { _ = st.exit(execInternal(execNoShell)) })
+		}, `: exec: "sh": executable file not found in $PATH`},
+		{"the container is not running", func(t *testing.T) http.HandlerFunc {
+			return serveExec(t, func(st *execStreams) { _ = st.exit(execInternal(execNoContainer)) })
+		}, `: unable to upgrade connection: container not found ("web")`},
+		{"a reason of 4 KiB", func(t *testing.T) http.HandlerFunc {
+			return serveExec(t, func(st *execStreams) { _ = st.exit(execInternal(long)) })
+		}, strings.Repeat("é", 512)},
+		{"an upgrade that fails without a status", func(t *testing.T) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "the proxy is down", http.StatusBadGateway)
+			}
+		}, "the proxy is down"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := execEnv(t, tt.handler(t))
+			term := newExecTerminal(t, 80, 24)
+			res, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh"))
+			if !errors.Is(err, ErrExecNotStarted) {
+				t.Fatalf("error %v, want ErrExecNotStarted", err)
+			}
+			if res.Started {
+				t.Errorf("result %+v, want not started", res)
+			}
+			text := err.Error()
+			if !strings.HasSuffix(text, tt.want) {
+				t.Errorf("error %q, want it to end with %q", text, tt.want)
+			}
+			if strings.Contains(text, "Internal error occurred") {
+				t.Errorf("error %q", text)
+			}
+			if strings.Contains(text, "80c33c691f999d15757aae25dad85857e38b44fe3f1e4008648e46a3a2716f75") {
+				t.Errorf("error %q holds the exec's id", text)
+			}
+			if reason := strings.TrimPrefix(text, ErrExecNotStarted.Error()+": "); len(reason) > 1024 || !utf8.ValidString(reason) {
+				t.Errorf("a reason of %d bytes, valid %v", len(reason), utf8.ValidString(reason))
+			}
+		})
+	}
+
+	t.Run("the same after output", func(t *testing.T) {
+		f := execEnv(t, serveExec(t, func(st *execStreams) {
+			if _, err := st.stdout.Write([]byte("$ ")); err != nil {
+				t.Errorf("writing stdout: %v", err)
+			}
+			_ = st.exit(execInternal(execNoContainer))
+		}))
+		term := newExecTerminal(t, 80, 24)
+		res, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh"))
+		if err == nil || errors.Is(err, ErrExecNotStarted) {
+			t.Fatalf("error %v, want the stream's", err)
+		}
+		if !strings.Contains(err.Error(), `container not found ("web")`) {
+			t.Errorf("error %q", err)
+		}
+		if res != (ExecResult{Started: true}) {
+			t.Errorf("result %+v, want started", res)
+		}
+	})
+}
+
+// apiRefuses answers every request with err's status, as the API
+// answers an upgrade it refuses.
+func apiRefuses(t *testing.T, err *apierrors.StatusError) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		st := err.ErrStatus
+		st.TypeMeta = metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(int(st.Code))
+		if err := json.NewEncoder(w).Encode(st); err != nil {
+			t.Errorf("writing the status: %v", err)
+		}
+	}
+}
+
+func TestExecRefusedByTheAPI(t *testing.T) {
+	pods := schema.GroupResource{Resource: "pods"}
+	tests := []struct {
+		name string
+		err  *apierrors.StatusError
+		is   func(error) bool
+	}{
+		{"forbidden", apierrors.NewForbidden(pods, "web", errors.New(`User "system:serviceaccount:kosh:kosh" cannot get resource "pods/exec"`)), apierrors.IsForbidden},
+		{"not found", apierrors.NewNotFound(pods, "web"), apierrors.IsNotFound},
+		{"bad request", apierrors.NewBadRequest("container nosuch is not valid for pod web"), apierrors.IsBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := execEnv(t, apiRefuses(t, tt.err))
+			term := newExecTerminal(t, 80, 24)
+			res, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh"))
+			if !tt.is(err) {
+				t.Fatalf("error %v (%T)", err, err)
+			}
+			if errors.Is(err, ErrExecNotStarted) {
+				t.Errorf("error %v is ErrExecNotStarted", err)
+			}
+			if res != (ExecResult{}) {
+				t.Errorf("result %+v", res)
+			}
+		})
+	}
+}
+
+// execHolds is a command that prints a prompt, says on open that it
+// has, and runs until its connection ends.
+func execHolds(t *testing.T, open chan<- struct{}) http.HandlerFunc {
+	return serveExec(t, func(st *execStreams) {
+		if _, err := st.stdout.Write([]byte("$ ")); err != nil {
+			t.Errorf("writing stdout: %v", err)
+			return
+		}
+		open <- struct{}{}
+		_, _ = io.Copy(io.Discard, st.stdin)
+	})
+}
+
+func TestExecEndsWithItsContext(t *testing.T) {
+	for _, by := range []string{"the caller", "the session"} {
+		t.Run(by, func(t *testing.T) {
+			open := make(chan struct{}, 1)
+			f := execEnv(t, execHolds(t, open))
+			term := newExecTerminal(t, 80, 24)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := execStart(ctx, f.s, f.pod("web"), term.options("sh"))
+			receive(t, "the stream is open", open)
+			term.out.waitFor(t, "$ ")
+			if by == "the caller" {
+				cancel()
+			} else {
+				f.end()
+			}
+			var out execReturn
+			select {
+			case out = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("Exec has not returned a second after its context ended")
+			}
+			if !errors.Is(out.err, context.Canceled) {
+				t.Errorf("error %v, want context.Canceled", out.err)
+			}
+			if ended := errors.Is(out.err, errSessionEnded); ended != (by == "the session") {
+				t.Errorf("error %v: that the session ended is %v", out.err, ended)
+			}
+			if out.res != (ExecResult{Started: true}) {
+				t.Errorf("result %+v, want started", out.res)
+			}
+		})
+	}
+}
+
+// streamGoroutines returns how many goroutines run code of a stream:
+// client-go's exec stream, the WebSocket library, or Exec's own
+// terminal.
+func streamGoroutines() int {
+	buf := make([]byte, 4<<20)
+	n := 0
+	for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+		if strings.Contains(g, "k8s.io/client-go/tools/remotecommand") ||
+			strings.Contains(g, "github.com/gorilla/websocket") ||
+			strings.Contains(g, "kube.(*execSizeQueue)") ||
+			strings.Contains(g, "kube.(*execOutput)") ||
+			strings.Contains(g, "kube.(*execInput)") {
+			n++
+		}
+	}
+	return n
+}
+
+// goroutinesBefore waits a minute at most for the streams of tests run
+// before to have ended, and returns how many goroutines run then.
+func goroutinesBefore(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for streamGoroutines() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the streams of tests run before have not ended within a minute")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return runtime.NumGoroutine()
+}
+
+// goroutinesBack waits a minute at most for the goroutines to be no
+// more than before, and none to run code of a stream. client-go's
+// heartbeat of a stream ends at its next beat, 5 seconds after the
+// stream.
+func goroutinesBack(t *testing.T, before int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for runtime.NumGoroutine() > before || streamGoroutines() > 0 {
+		if time.Now().After(deadline) {
+			buf := make([]byte, 1<<20)
+			t.Fatalf("%d goroutines a minute after Exec returned, %d before:\n%s", runtime.NumGoroutine(), before, buf[:runtime.Stack(buf, true)])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestExecLeavesNothing(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"a normal end", func(t *testing.T) {
+			f := execEnv(t, execSucceeds(t))
+			term := newExecTerminal(t, 80, 24)
+			before := goroutinesBefore(t)
+			if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh")); err != nil {
+				t.Fatalf("Exec: %v", err)
+			}
+			term.type_.Close() // the caller's reader ends with its turn
+			goroutinesBack(t, before)
+		}},
+		// The stream is cancelled once it runs. Cancelled in the moment
+		// between its upgrade and the start of its reading, client-go
+		// v0.37.1 leaves the stream's goroutines blocked for good: its
+		// readDemuxLoop cannot set its first read deadline on the closed
+		// connection and returns without closing the streams' pipes.
+		{"a cancelled context", func(t *testing.T) {
+			open := make(chan struct{}, 1)
+			f := execEnv(t, execHolds(t, open))
+			term := newExecTerminal(t, 80, 24)
+			before := goroutinesBefore(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := execStart(ctx, f.s, f.pod("web"), term.options("sh"))
+			receive(t, "the stream is open", open)
+			term.out.waitFor(t, "$ ")
+			cancel()
+			if out := receive(t, "Exec returns", done); !errors.Is(out.err, context.Canceled) {
+				t.Fatalf("Exec: %v", out.err)
+			}
+			term.type_.Close()
+			goroutinesBack(t, before)
+		}},
+		{"the session's end", func(t *testing.T) {
+			open := make(chan struct{}, 1)
+			f := execEnv(t, execHolds(t, open))
+			term := newExecTerminal(t, 80, 24)
+			before := goroutinesBefore(t)
+			done := execStart(context.Background(), f.s, f.pod("web"), term.options("sh"))
+			receive(t, "the stream is open", open)
+			term.out.waitFor(t, "$ ")
+			f.end()
+			if out := receive(t, "Exec returns", done); !errors.Is(out.err, errSessionEnded) {
+				t.Fatalf("Exec: %v", out.err)
+			}
+			term.type_.Close()
+			goroutinesBack(t, before)
+		}},
+		{"a refused upgrade", func(t *testing.T) {
+			f := execEnv(t, apiRefuses(t, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "web")))
+			term := newExecTerminal(t, 80, 24)
+			before := goroutinesBefore(t)
+			if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh")); !apierrors.IsNotFound(err) {
+				t.Fatalf("Exec: %v", err)
+			}
+			term.type_.Close()
+			goroutinesBack(t, before)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
+	}
+}
+
+func TestExecTerminalIsLetGoWhenExecReturns(t *testing.T) {
+	t.Run("output", func(t *testing.T) {
+		out := newExecOut()
+		o := &execOutput{w: out}
+		if _, err := o.Write([]byte("ab")); err != nil {
+			t.Fatal(err)
+		}
+		o.letGo()
+		if _, err := o.Write([]byte("cd")); err == nil {
+			t.Error("a write after Exec returned was taken")
+		}
+		if got := out.String(); got != "ab" {
+			t.Errorf("the terminal got %q", got)
+		}
+		if n := o.written(); n != 2 {
+			t.Errorf("counted %d bytes, want 2", n)
+		}
+	})
+	t.Run("no output", func(t *testing.T) {
+		o := &execOutput{}
+		if n, err := o.Write([]byte("ab")); n != 2 || err != nil {
+			t.Errorf("Write %d, %v", n, err)
+		}
+		if n := o.written(); n != 2 {
+			t.Errorf("counted %d bytes, want 2", n)
+		}
+	})
+	t.Run("input", func(t *testing.T) {
+		in := &execInput{r: strings.NewReader("abcd")}
+		b := make([]byte, 2)
+		if n, err := in.Read(b); n != 2 || err != nil {
+			t.Fatalf("Read %d, %v", n, err)
+		}
+		in.letGo()
+		if n, err := in.Read(b); n != 0 || err != io.EOF {
+			t.Errorf("a read after Exec returned: %d, %v", n, err)
 		}
 	})
 }
