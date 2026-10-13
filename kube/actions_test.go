@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -339,6 +340,18 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+// actionJSON decodes JSON for comparison, numbers as written.
+func actionJSON(t *testing.T, b []byte) any {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("%s: %v", b, err)
+	}
+	return v
+}
+
 func TestUpdateTakesOneDocument(t *testing.T) {
 	const (
 		parse  = "the YAML does not parse"
@@ -349,33 +362,52 @@ func TestUpdateTakesOneDocument(t *testing.T) {
 		name string
 		text func(obj string) string // obj: the object's YAML, edited
 		want string                  // the refusal; empty: accepted
-		// extra is the top-level field extra of the object sent.
-		extra string
+		// extra, when not nil, is what the top-level field extra must be
+		// in what was sent, as JSON.
+		extra any
 	}{
-		{"a single document", func(o string) string { return o }, "", ""},
-		{"a leading ---", func(o string) string { return "---\n" + o }, "", ""},
-		{"a comment and ---", func(o string) string { return "# edited\n---\n" + o }, "", ""},
-		{"a trailing --- and nothing after it", func(o string) string { return o + "---\n" }, "", ""},
-		{"a second document that is only a comment", func(o string) string { return "---\n" + o + "---\n# nothing more\n" }, "", ""},
-		{"an end marker and a comment", func(o string) string { return o + "...\n# the end\n" }, "", ""},
-		{"a %YAML 1.1 preamble", func(o string) string { return "%YAML 1.1\n---\n" + o }, "", ""},
+		{"a single document", func(o string) string { return o }, "", nil},
+		{"a leading ---", func(o string) string { return "---\n" + o }, "", nil},
+		{"a comment and ---", func(o string) string { return "# edited\n---\n" + o }, "", nil},
+		{"a trailing --- and nothing after it", func(o string) string { return o + "---\n" }, "", nil},
+		{"a second document that is only a comment", func(o string) string { return "---\n" + o + "---\n# nothing more\n" }, "", nil},
+		{"a second document that is null", func(o string) string { return o + "---\nnull\n" }, "", nil},
+		{"a second document that is an anchored null", func(o string) string { return o + "---\n&a ~\n" }, "", nil},
+		{"an end marker and a comment", func(o string) string { return o + "...\n# the end\n" }, "", nil},
+		{"a %YAML 1.1 preamble", func(o string) string { return "%YAML 1.1\n---\n" + o }, "", nil},
 		{"--- in a block scalar", func(o string) string { return o + "extra: |\n  a\n  ---\n  b\n" }, "", "a\n---\nb\n"},
 		{"--- in a quoted string", func(o string) string { return o + "extra: \"a\n  ---\n  b\"\n" }, "", "a --- b"},
+		{"folded, a more-indented line", func(o string) string { return o + "extra: >\n  a\n   b\n  c\n" }, "", "a\n b\nc\n"},
+		{"folded, strip, a more-indented line", func(o string) string { return o + "extra: >-\n  a\n   b\n  c\n" }, "", "a\n b\nc"},
+		{"folded, keep, a more-indented line", func(o string) string { return o + "extra: >+\n  a\n   b\n  c\n\n" }, "", "a\n b\nc\n\n"},
+		{"folded, a tab-led line", func(o string) string { return o + "extra: >\n  a\n  \tb\n  c\n" }, "", nil},
+		{"folded, a blank line before an indented one", func(o string) string { return o + "extra: >\n  a\n\n   b\n  c\n" }, "", nil},
+		{"literal, trailing spaces", func(o string) string { return o + "extra: |\n  a  \n  b \n\n" }, "", "a  \nb \n"},
+		{"literal, strip", func(o string) string { return o + "extra: |-\n  a  \n  b \n\n" }, "", "a  \nb "},
+		{"literal, keep", func(o string) string { return o + "extra: |+\n  a  \n  b \n\n" }, "", "a  \nb \n\n"},
+		{"YAML 1.1 booleans", func(o string) string { return o + "extra: {a: yes, b: on, c: Off}\n" }, "", nil},
+		{"numbers", func(o string) string { return o + "extra: {a: 0123, b: \"0123\", c: 1e3, d: 0x1f}\n" }, "", nil},
+		{"tags", func(o string) string { return o + "extra: {a: !!binary aGVsbG8=, b: !!str 0123}\n" }, "", nil},
+		{"an anchor, an alias and a merge", func(o string) string {
+			return o + "base: &b {x: 1, y: 2}\nextra:\n  <<: *b\n  y: 3\n  z: *b\n"
+		}, "", nil},
+		{"a duplicate key", func(o string) string { return o + "extra: one\nextra: two\n" }, "", "two"},
+		{"a multi-line plain string", func(o string) string { return o + "extra: this is\n  a plain\n\n  string\n" }, "", "this is a plain\nstring"},
 
-		{"a second document after ---", func(o string) string { return o + "---\nkind: B\n" }, more, ""},
-		{"the same document twice", func(o string) string { return o + "---\n" + o }, more, ""},
-		{"a second document that is null", func(o string) string { return o + "---\nnull\n" }, more, ""},
-		{"... kind: B", func(o string) string { return o + "... kind: B\n" }, parse, ""},
-		{"... {kind: B}", func(o string) string { return o + "... {kind: B}\n" }, more, ""},
-		{"... and a line of %", func(o string) string { return o + "...\n%password: x\n" }, parse, ""},
-		{"... and more YAML", func(o string) string { return o + "...\nkind: B\n" }, more, ""},
-		{"... and text that is not YAML", func(o string) string { return o + "...\n[[[ not yaml\n" }, more, ""},
-		{"... and another document", func(o string) string { return o + "...\n%YAML 1.1\n---\nkind: B\n" }, more, ""},
-		{"a %YAML 1.2 preamble, which the decoder does not know", func(o string) string { return "%YAML 1.2\n---\n" + o }, parse, ""},
-		{"a list", func(string) string { return "- just\n- a list\n" }, object, ""},
-		{"a scalar", func(string) string { return "just a word\n" }, object, ""},
-		{"nothing", func(string) string { return "" }, object, ""},
-		{"only a comment", func(string) string { return "# nothing\n" }, object, ""},
+		{"a second document after ---", func(o string) string { return o + "---\nkind: B\n" }, more, nil},
+		{"the same document twice", func(o string) string { return o + "---\n" + o }, more, nil},
+		{"a second document that does not parse", func(o string) string { return o + "---\n[[[\n" }, more, nil},
+		{"... kind: B", func(o string) string { return o + "... kind: B\n" }, more, nil},
+		{"... {kind: B}", func(o string) string { return o + "... {kind: B}\n" }, more, nil},
+		{"... and a line of %", func(o string) string { return o + "...\n%password: x\n" }, more, nil},
+		{"... and more YAML", func(o string) string { return o + "...\nkind: B\n" }, more, nil},
+		{"... and text that is not YAML", func(o string) string { return o + "...\n[[[ not yaml\n" }, more, nil},
+		{"... and another document", func(o string) string { return o + "...\n%YAML 1.1\n---\nkind: B\n" }, more, nil},
+		{"a %YAML 1.2 preamble, which the parser does not know", func(o string) string { return "%YAML 1.2\n---\n" + o }, parse, nil},
+		{"a list", func(string) string { return "- just\n- a list\n" }, object, nil},
+		{"a scalar", func(string) string { return "just a word\n" }, object, nil},
+		{"nothing", func(string) string { return "" }, object, nil},
+		{"only a comment", func(string) string { return "# nothing\n" }, object, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -384,7 +416,8 @@ func TestUpdateTakesOneDocument(t *testing.T) {
 			obj := actionYAML(t, f, ref, func(m map[string]any) {
 				_ = unstructured.SetNestedField(m, int64(9), "spec", "replicas")
 			})
-			err := f.s.Update(context.Background(), ref, tt.text(obj))
+			text := tt.text(obj)
+			err := f.s.Update(context.Background(), ref, text)
 			if tt.want != "" {
 				if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
 					t.Errorf("%v, want %q", err, tt.want)
@@ -397,13 +430,31 @@ func TestUpdateTakesOneDocument(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
-			u := got.(*unstructured.Unstructured).Object
-			if n, _, _ := unstructured.NestedInt64(u, "spec", "replicas"); n != 9 {
+			var sent *unstructured.Unstructured
+			for _, a := range f.dyn.Actions() {
+				if u, ok := a.(k8stesting.UpdateAction); ok {
+					sent = u.GetObject().(*unstructured.Unstructured)
+				}
+			}
+			if sent == nil {
+				t.Fatal("nothing was sent")
+			}
+			got, err := json.Marshal(sent.Object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := yaml.YAMLToJSON([]byte(text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(actionJSON(t, got), actionJSON(t, want)) {
+				t.Errorf("sent\n%s\nwant what sigs.k8s.io/yaml makes of the text\n%s", got, want)
+			}
+			if n, _, _ := unstructured.NestedInt64(sent.Object, "spec", "replicas"); n != 9 {
 				t.Errorf("replicas %d, want 9", n)
 			}
-			if extra, _, _ := unstructured.NestedString(u, "extra"); extra != tt.extra {
-				t.Errorf("extra %q, want %q", extra, tt.extra)
+			if tt.extra != nil && !reflect.DeepEqual(sent.Object["extra"], tt.extra) {
+				t.Errorf("extra %q, want %q", sent.Object["extra"], tt.extra)
 			}
 		})
 	}

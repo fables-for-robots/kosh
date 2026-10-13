@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	yaml2 "go.yaml.in/yaml/v2"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,7 +25,6 @@ import (
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"sigs.k8s.io/yaml"
-	yaml3 "sigs.k8s.io/yaml/goyaml.v3"
 )
 
 // objectClient returns the dynamic client of ref's resource, in
@@ -159,11 +159,10 @@ func (e *editRefusal) Error() string {
 // parseObject returns the object that text, YAML, says, when it is the
 // object ref as it was read.
 func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error) {
-	doc, err := oneDocument(text)
-	if err != nil {
+	if err := oneDocument(text); err != nil {
 		return nil, err
 	}
-	js, err := yaml.YAMLToJSON(doc)
+	js, err := yaml.YAMLToJSON([]byte(text))
 	if err != nil {
 		return nil, &editRefusal{"the YAML does not parse", err.Error()}
 	}
@@ -188,53 +187,36 @@ func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error)
 	return obj, nil
 }
 
-// oneDocument returns the one document of the YAML stream text, which
-// must be a mapping, as the text of that document alone.
+// oneDocument refuses text unless it is one YAML document that is a
+// mapping, followed by nothing but documents that carry nothing (a "---"
+// with nothing or only comments after it, or a null).
 //
-// A YAML decoder decides what the documents are: the first must be a
-// mapping, and after it there may be nothing but documents that are
-// empty (a "---" with nothing or only comments after it). The first
-// document's node is then written out again by itself, and that text is
-// what parseObject reads with sigs.k8s.io/yaml, as kubectl does: what is
-// checked and what is sent are one parse of one document, and nothing of
-// the text after it can be dropped unseen.
-func oneDocument(text string) ([]byte, error) {
-	dec := yaml3.NewDecoder(strings.NewReader(text))
-	var first yaml3.Node
+// The documents are counted with the decoder of go.yaml.in/yaml/v2, the
+// library and version sigs.k8s.io/yaml's YAMLToJSON parses with: the two
+// cannot disagree about where the first document ends, so YAMLToJSON of
+// the whole text, which is what is sent, is that document and nothing of
+// what follows it is dropped unseen.
+func oneDocument(text string) error {
+	dec := yaml2.NewDecoder(strings.NewReader(text))
+	var first any
 	if err := dec.Decode(&first); err == io.EOF {
-		return nil, &editRefusal{"the YAML is not an object", ""}
+		return &editRefusal{"the YAML is not an object", ""}
 	} else if err != nil {
-		return nil, &editRefusal{"the YAML does not parse", err.Error()}
+		return &editRefusal{"the YAML does not parse", err.Error()}
 	}
-	if len(first.Content) != 1 || first.Content[0].Kind != yaml3.MappingNode {
-		return nil, &editRefusal{"the YAML is not an object", ""}
+	if _, ok := first.(map[any]any); !ok {
+		return &editRefusal{"the YAML is not an object", ""}
 	}
 	for {
-		var next yaml3.Node
+		var next any
 		err := dec.Decode(&next)
 		if err == io.EOF {
-			break
+			return nil
 		}
-		if err != nil || !emptyDocument(&next) {
-			return nil, &editRefusal{"the YAML holds more than one document", ""}
+		if err != nil || next != nil {
+			return &editRefusal{"the YAML holds more than one document", ""}
 		}
 	}
-	doc, err := yaml3.Marshal(first.Content[0])
-	if err != nil {
-		return nil, &editRefusal{"the YAML does not parse", err.Error()}
-	}
-	return doc, nil
-}
-
-// emptyDocument reports whether a document holds nothing: what the
-// decoder makes of a "---" followed by nothing but comments. An explicit
-// null ("null", "~") is not empty.
-func emptyDocument(doc *yaml3.Node) bool {
-	if len(doc.Content) == 0 {
-		return true
-	}
-	n := doc.Content[0]
-	return len(doc.Content) == 1 && n.Kind == yaml3.ScalarNode && n.ShortTag() == "!!null" && n.Value == "" && n.Anchor == ""
 }
 
 // scaleClient is the scale subresource of one kind, in one namespace.
