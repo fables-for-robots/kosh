@@ -25,6 +25,10 @@ Connect:
 
   iroh-ssh kosh@<endpoint ID>
 {{- end }}
+{{- if and .Values.iroh.hostNetwork .Values.ssh.enabled }}
+
+iroh.hostNetwork puts the pod on the node's network: SSH listens on port {{ .Values.ssh.port }} of every address of the node, whatever service.type is.
+{{- end }}
 
 authorizedKeys is the list of who may connect; a key with the option
 read-only is read-only. A full key is as powerful as the ClusterRole
