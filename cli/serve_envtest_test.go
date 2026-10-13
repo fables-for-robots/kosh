@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -812,5 +813,81 @@ func TestServeStopIsBounded(t *testing.T) {
 	}
 	if warned == nil || !strings.Contains(warned.Attrs["waiting_for"], "the SSH server") {
 		t.Errorf("no warning that names the SSH server:\n%s", k.log.dump())
+	}
+}
+
+// What Go's standard log package prints, as quic-go prints a warning
+// about the UDP receive buffer, is a record of kosh's log.
+func TestStandardLogGoesToTheLog(t *testing.T) {
+	out, flags := stdlog.Writer(), stdlog.Flags()
+	t.Cleanup(func() {
+		stdlog.SetOutput(out)
+		stdlog.SetFlags(flags)
+		// The next serve routes the standard log again.
+		stdlogOnce = sync.Once{}
+	})
+	cfg := startAPIServer(t)
+	alice := newUser(t, "alice", false)
+	k := startKosh(t, envOptions(t, cfg, alice))
+
+	stdlog.Print("marker line")
+	var got []record
+	for _, r := range k.log.records() {
+		if strings.Contains(r.Msg, "marker line") {
+			got = append(got, r)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("%d records of the line, want one:\n%s", len(got), k.log.dump())
+	}
+	if r := got[0]; r.Level != slog.LevelWarn || r.Msg != "marker line" || r.Attrs["source"] != "log" {
+		t.Errorf("%v, want the line at warn level with source=log", r)
+	}
+}
+
+// A kosh with iroh on, stopped as it is asked to, warns of nothing.
+func TestServeStopIsQuiet(t *testing.T) {
+	cfg := startAPIServer(t)
+	alice := newUser(t, "alice", false)
+	o := envOptions(t, cfg, alice)
+	o.iroh = true
+	o.irohLocal = true
+	k := startKosh(t, o)
+	if k.serving.ssh == nil || k.serving.iroh == nil {
+		t.Fatalf("serving %+v, want TCP and iroh", k.serving)
+	}
+	// A session on each transport, which the stop ends.
+	dialTCP(t, k, alice).waitFor(t, "Pods(default)")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := irohnet.DialLocal(ctx, k.serving.iroh.ID(), k.serving.iroh.LocalAddrs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := connect(k, conn, alice)
+	if err != nil {
+		t.Fatalf("connecting over iroh: %v\nlog:\n%s", err, k.log.dump())
+	}
+	defer func() { _ = c.ssh.Close() }()
+	c.waitFor(t, "Pods(default)")
+
+	k.cancel()
+	select {
+	case err := <-k.done:
+		if err != nil {
+			t.Errorf("serve returned %v after a stop that was asked for", err)
+		}
+	case <-time.After(stopTimeout):
+		t.Fatalf("serve has not returned %v after its context was cancelled", stopTimeout)
+	}
+	k.done <- nil // for the cleanup
+
+	if _, ok := k.log.find("kosh has stopped"); !ok {
+		t.Errorf("no line kosh has stopped:\n%s", k.log.dump())
+	}
+	for _, r := range k.log.records() {
+		if r.Level >= slog.LevelWarn {
+			t.Errorf("a clean stop logged %v", r)
+		}
 	}
 }

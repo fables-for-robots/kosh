@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -490,10 +492,11 @@ current-context: silent
 	addr := freePort(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	var log recorder
 	go func() {
 		done <- serve(ctx, serveOptions{
 			sshListen: addr, stateDir: t.TempDir(), authorizedKeys: keyListFile(t),
-			kubeconfig: kubeconfig, log: (&recorder{}).logger(),
+			kubeconfig: kubeconfig, log: log.logger(),
 		})
 	}()
 	select {
@@ -513,6 +516,9 @@ current-context: silent
 		t.Fatal("serve has not returned 2 seconds after its context was cancelled")
 	}
 	portIsFree(t, addr)
+	if r, ok := log.find("kosh has stopped before it served"); !ok || !strings.Contains(r.Attrs["err"], "the cluster could not be reached") {
+		t.Errorf("the stop during the start does not say why:\n%s", log.dump())
+	}
 	// net/http goes on with a TLS handshake it began, for its pool,
 	// after the request was cancelled; the API server that never
 	// answers ends it here.
@@ -521,5 +527,23 @@ current-context: silent
 		_ = c.Close()
 	}
 	mu.Unlock()
-	noGoroutinesLeft(t, before+1) // the API server's Accept
+	// The API server's Accept, which runs on, was counted in before.
+	noGoroutinesLeft(t, before)
+}
+
+// Of an error of the API, the line of a stop during the start holds only
+// its code; any other error as it is.
+func TestLoggableStartError(t *testing.T) {
+	status := &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status: metav1.StatusFailure, Code: 401, Reason: metav1.StatusReasonUnauthorized,
+		Message: "the text " + "of the API",
+	}}
+	err := fmt.Errorf("the cluster could not be reached: %w", fmt.Errorf("the API server at https://x could not be reached: %w", status))
+	if got, want := loggableStartError(err), "the cluster could not be reached: the API answered (401)"; got != want {
+		t.Errorf("an API error: %q, want %q", got, want)
+	}
+	err = fmt.Errorf("the cluster could not be reached: %w", context.Canceled)
+	if got := loggableStartError(err); got != err.Error() {
+		t.Errorf("another error: %q, want %q", got, err.Error())
+	}
 }
