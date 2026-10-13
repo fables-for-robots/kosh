@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -486,15 +487,27 @@ var (
 // prints a warning about the UDP receive buffer, to log: each line one
 // record at warn level, with source=log. The standard logger is set once
 // for the process, without its own date; after that only the log it goes
-// to changes. log is not slog.Default(), whose handler writes through
-// the standard logger: that would be a loop.
+// to changes.
+//
+// A log whose handler is Go's default slog handler, which writes through
+// the standard logger, is never where the standard logger's lines go: a
+// line would wait for the standard logger's lock, which its Print holds,
+// for ever. The routing is then left as it is, and a debug line says so.
 func routeStdlog(log *slog.Logger) {
+	if reflect.TypeOf(log.Handler()) == defaultSlogHandler {
+		log.Debug("the standard log is not routed: kosh's log is Go's default slog, which writes through it")
+		return
+	}
 	stdlogTo.Store(log)
 	stdlogOnce.Do(func() {
 		stdlog.SetFlags(0)
 		stdlog.SetOutput(stdlogWriter{})
 	})
 }
+
+// defaultSlogHandler is the type of Go's default slog handler, taken
+// before anything could call slog.SetDefault.
+var defaultSlogHandler = reflect.TypeOf(slog.Default().Handler())
 
 // unrouteStdlog is called when the serve of log returns: unless another
 // serve has started since, the standard log's lines go to standard error

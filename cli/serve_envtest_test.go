@@ -874,7 +874,10 @@ func TestStandardLogLineIsCut(t *testing.T) {
 	}
 }
 
-// A kosh with iroh on, stopped as it is asked to, warns of nothing.
+// A kosh with iroh on, stopped as it is asked to, warns of nothing while
+// it stops. What its start logged is not looked at: quic-go warns once a
+// process, through the standard log, when it cannot have the UDP receive
+// buffer it asks for, which depends on the machine.
 func TestServeStopIsQuiet(t *testing.T) {
 	cfg := startAPIServer(t)
 	alice := newUser(t, "alice", false)
@@ -900,6 +903,10 @@ func TestServeStopIsQuiet(t *testing.T) {
 	defer func() { _ = c.ssh.Close() }()
 	c.waitFor(t, "Pods(default)")
 
+	// Every record of the start is in the log by now: startKosh returned
+	// after started, which serve calls after the endpoint is bound and
+	// the last line of the start is logged; the sessions began after.
+	before := len(k.log.records())
 	k.cancel()
 	select {
 	case err := <-k.done:
@@ -914,9 +921,70 @@ func TestServeStopIsQuiet(t *testing.T) {
 	if _, ok := k.log.find("kosh has stopped"); !ok {
 		t.Errorf("no line kosh has stopped:\n%s", k.log.dump())
 	}
-	for _, r := range k.log.records() {
+	for _, r := range k.log.records()[before:] {
 		if r.Level >= slog.LevelWarn {
 			t.Errorf("a clean stop logged %v", r)
 		}
+	}
+}
+
+// When kosh's log is Go's default slog, whose handler writes through the
+// standard logger, the standard logger is not routed into it: a line of
+// it would wait for the standard logger's lock, which it holds.
+func TestStandardLogIsNotRoutedIntoTheDefaultSlog(t *testing.T) {
+	out, flags := stdlog.Writer(), stdlog.Flags()
+	t.Cleanup(func() {
+		stdlog.SetOutput(out)
+		stdlog.SetFlags(flags)
+		stdlogOnce = sync.Once{}
+	})
+	// The routing is installed, to a log of the test, as an earlier
+	// serve of the process would have left it.
+	var earlier recorder
+	routeStdlog(earlier.logger())
+
+	cfg := startAPIServer(t)
+	alice := newUser(t, "alice", false)
+	o := envOptions(t, cfg, alice)
+	k := &kosh{opts: o, log: &recorder{}, done: make(chan error, 1)}
+	o.log = slog.New(slog.Default().Handler())
+	started := make(chan serving, 1)
+	o.started = func(s serving) { started <- s }
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { k.done <- serve(ctx, o) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-k.done:
+		case <-time.After(15 * time.Second):
+			t.Error("serve has not returned 15 seconds after its context was cancelled")
+		}
+	})
+	select {
+	case <-started:
+	case err := <-k.done:
+		t.Fatalf("serve: %v", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("serve has not started in 20 seconds: it hangs")
+	}
+	printed := make(chan struct{})
+	go func() {
+		stdlog.Print("a line of the standard logger")
+		close(printed)
+	}()
+	select {
+	case <-printed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("log.Print hangs")
+	}
+	// The default slog's lines, and the standard logger's, went where the
+	// routing was left.
+	var serving, line bool
+	for _, r := range earlier.records() {
+		serving = serving || strings.Contains(r.Msg, "kosh is serving")
+		line = line || r.Msg == "a line of the standard logger"
+	}
+	if !serving || !line {
+		t.Errorf("the lines did not go where the routing was left:\n%s", earlier.dump())
 	}
 }

@@ -23,6 +23,7 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	metadatafake "k8s.io/client-go/metadata/fake"
 
 	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/render"
@@ -292,6 +293,7 @@ func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 	}
 	opts.Renderers = e.renderers.For
 	e.c = newCluster(nil, e.typed, e.dyn, e.disc, nil, opts)
+	e.c.meta = metadataFake(objs)
 	e.c.zeroOf = testZero
 	t.Cleanup(e.c.Close)
 	return e
@@ -377,4 +379,39 @@ func (c *Cluster) running(gvr schema.GroupVersionResource) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.caches[gvr] != nil
+}
+
+// metadataFake returns a fake metadata client that holds the metadata
+// of objs.
+func metadataFake(objs []runtime.Object) *metadatafake.FakeMetadataClient {
+	scheme := testScheme()
+	metaScheme := metadatafake.NewTestScheme()
+	var metas []runtime.Object
+	for _, o := range objs {
+		gvk := o.GetObjectKind().GroupVersionKind()
+		if gvk.Empty() {
+			gvks, _, err := scheme.ObjectKinds(o)
+			if err != nil {
+				panic(err)
+			}
+			gvk = gvks[0]
+		}
+		if !metaScheme.Recognizes(gvk) {
+			metaScheme.AddKnownTypeWithName(gvk, &metav1.PartialObjectMetadata{})
+			metaScheme.AddKnownTypeWithName(gvk.GroupVersion().WithKind(gvk.Kind+"List"), &metav1.PartialObjectMetadataList{})
+		}
+		m, err := meta.Accessor(o)
+		if err != nil {
+			panic(err)
+		}
+		metas = append(metas, &metav1.PartialObjectMetadata{
+			TypeMeta: metav1.TypeMeta{APIVersion: gvk.GroupVersion().String(), Kind: gvk.Kind},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: m.GetNamespace(), Name: m.GetName(), UID: m.GetUID(),
+				ResourceVersion: m.GetResourceVersion(), Labels: m.GetLabels(),
+				OwnerReferences: m.GetOwnerReferences(),
+			},
+		})
+	}
+	return metadatafake.NewSimpleMetadataClient(metaScheme, metas...)
 }
