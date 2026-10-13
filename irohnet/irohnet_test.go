@@ -431,6 +431,65 @@ func TestCloseUnblocksWrite(t *testing.T) {
 	}
 }
 
+// The SSH library sets the deadline of the connection at every Read and
+// Write, clearing it when it has no idle timeout: that must not undo the
+// deadline Close sets to wake a blocked Write.
+func TestCloseUnblocksWriteWhileDeadlinesAreCleared(t *testing.T) {
+	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: time.Minute})
+	c := dial(t, l)
+	s := accept(t, l, c, "hello")
+
+	written := make(chan error, 1)
+	go func() {
+		_, err := s.Write(make([]byte, 64<<20))
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		t.Fatalf("a Write of 64 MiB to a client that does not read returned: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	stop := make(chan struct{})
+	clearing := make(chan struct{})
+	go func() {
+		defer close(clearing)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s.SetDeadline(time.Time{})
+			s.SetWriteDeadline(time.Time{})
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-clearing
+	}()
+
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+	for _, what := range []string{"Close", "the blocked Write"} {
+		ch := closed
+		if what == "the blocked Write" {
+			ch = written
+		}
+		select {
+		case err := <-ch:
+			if what == "the blocked Write" && err == nil {
+				t.Fatal("the blocked Write returned no error after Close")
+			}
+		case <-time.After(wait):
+			t.Fatalf("%s did not return while deadlines were being cleared", what)
+		}
+	}
+	if err := s.SetDeadline(time.Time{}); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("SetDeadline after Close: %v, want net.ErrClosed", err)
+	}
+}
+
 func TestDeadlines(t *testing.T) {
 	l, _ := testListener(t, defaultTimeouts)
 	c := dial(t, l)

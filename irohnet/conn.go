@@ -36,7 +36,10 @@ type conn struct {
 
 	// wmu is held by Write while it writes, and by Close while it closes
 	// the stream: the stream may not be closed while a Write runs.
-	wmu    sync.Mutex
+	wmu sync.Mutex
+	// dmu is held while a deadline is set, and by Close while it marks
+	// the connection closed and sets its own: no deadline is set after.
+	dmu    sync.Mutex
 	closed atomic.Bool
 
 	closeOnce sync.Once
@@ -55,12 +58,34 @@ func (c *conn) Write(p []byte) (int, error) {
 
 var _ net.Conn = (*conn)(nil)
 
-func (c *conn) Read(p []byte) (int, error)         { return c.stream.Read(p) }
-func (c *conn) LocalAddr() net.Addr                { return c.local }
-func (c *conn) RemoteAddr() net.Addr               { return c.remote }
-func (c *conn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
-func (c *conn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
-func (c *conn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
+func (c *conn) Read(p []byte) (int, error) { return c.stream.Read(p) }
+func (c *conn) LocalAddr() net.Addr        { return c.local }
+func (c *conn) RemoteAddr() net.Addr       { return c.remote }
+
+// SetDeadline, SetReadDeadline and SetWriteDeadline are the stream's.
+// Once Close has begun they do nothing and return net.ErrClosed: the
+// deadline Close sets to wake a blocked Write must stay, and the SSH
+// library sets the deadline at every Read and Write.
+func (c *conn) SetDeadline(t time.Time) error {
+	return c.setDeadline(c.stream.SetDeadline, t)
+}
+
+func (c *conn) SetReadDeadline(t time.Time) error {
+	return c.setDeadline(c.stream.SetReadDeadline, t)
+}
+
+func (c *conn) SetWriteDeadline(t time.Time) error {
+	return c.setDeadline(c.stream.SetWriteDeadline, t)
+}
+
+func (c *conn) setDeadline(set func(time.Time) error, t time.Time) error {
+	c.dmu.Lock()
+	defer c.dmu.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return set(t)
+}
 
 // Close closes the stream; a Read or a Write that is blocked returns at
 // once. A connection of a Listener is closed after the peer has closed
@@ -72,8 +97,10 @@ func (c *conn) Close() error {
 		// A Write that is blocked returns at once with a timeout; what
 		// Writes have handed the stream so far is still sent, and the
 		// stream ends after it.
+		c.dmu.Lock()
 		c.closed.Store(true)
 		c.stream.SetWriteDeadline(time.Unix(1, 0))
+		c.dmu.Unlock()
 		c.wmu.Lock()
 		c.closeErr = c.stream.Close()
 		c.wmu.Unlock()
