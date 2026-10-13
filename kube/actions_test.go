@@ -294,6 +294,28 @@ func TestUpdate(t *testing.T) {
 		}
 	})
 
+	for _, wrap := range []struct{ name, before, after string }{
+		{"a directive before the document", "%YAML 1.2\n---\n", ""},
+		{"a directive and a comment before it", "# edited\n%YAML 1.2\n%TAG ! tag:example.com,2000:\n---\n", ""},
+		{"an end marker and comments after it", "", "...\n# the end\n\n   \n"},
+		{"an end marker and a directive", "%YAML 1.2\n---\n", "... # done\n"},
+	} {
+		t.Run(wrap.name, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
+			ref := f.ref(t, "apps", "deployments", "default", "web")
+			text := actionYAML(t, f, ref, func(m map[string]any) {
+				_ = unstructured.SetNestedField(m, int64(8), "spec", "replicas")
+			})
+			if err := f.s.Update(context.Background(), ref, wrap.before+text+wrap.after); err != nil {
+				t.Fatal(err)
+			}
+			obj, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
+			if n, _, _ := unstructured.NestedInt64(obj.(*unstructured.Unstructured).Object, "spec", "replicas"); n != 8 {
+				t.Errorf("replicas %d, want 8", n)
+			}
+		})
+	}
+
 	t.Run("a cluster-scoped object", func(t *testing.T) {
 		n := actionNode("n1")
 		n.ResourceVersion = "4"
@@ -339,6 +361,15 @@ func TestUpdate(t *testing.T) {
 		{"the same document twice", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			text := actionYAML(t, f, ref, nil)
 			return text + "---\n" + text
+		}, "the YAML holds more than one document"},
+		{"another document after its end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
+			return actionYAML(t, f, ref, nil) + "...\nkind: B\n"
+		}, "the YAML holds more than one document"},
+		{"text that is no YAML after the end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
+			return actionYAML(t, f, ref, nil) + "...\n[[[ not yaml\n"
+		}, "the YAML holds more than one document"},
+		{"a directive and a document after the end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
+			return actionYAML(t, f, ref, nil) + "...\n%YAML 1.2\n---\nkind: B\n"
 		}, "the YAML holds more than one document"},
 		{"no resourceVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { unstructured.RemoveNestedField(m, "metadata", "resourceVersion") })

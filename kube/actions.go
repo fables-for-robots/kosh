@@ -177,8 +177,10 @@ func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error)
 }
 
 // oneDocument returns the one YAML document of text. Documents that hold
-// nothing but comments do not count.
+// nothing but comments and directives do not count; anything but those
+// after a document's end marker "..." is another document.
 func oneDocument(text string) ([]byte, error) {
+	more := &editRefusal{"the YAML holds more than one document", ""}
 	r := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(text)))
 	var docs [][]byte
 	for {
@@ -189,7 +191,11 @@ func oneDocument(text string) ([]byte, error) {
 		if err != nil {
 			return nil, &editRefusal{"the YAML does not parse", err.Error()}
 		}
-		if hasContent(doc) {
+		content, after := documentContent(doc)
+		if after {
+			return nil, more
+		}
+		if content {
 			docs = append(docs, doc)
 		}
 	}
@@ -199,19 +205,41 @@ func oneDocument(text string) ([]byte, error) {
 	case 1:
 		return docs[0], nil
 	}
-	return nil, &editRefusal{"the YAML holds more than one document", ""}
+	return nil, more
 }
 
-// hasContent reports whether a YAML document holds more than blank lines,
-// comments and the document separator.
-func hasContent(doc []byte) bool {
+// documentContent reports whether a part of a YAML stream between two
+// "---" holds more than blank lines, comments, directives and markers,
+// and whether anything of that kind follows a document end marker "...".
+// Both markers and directives are only those at the start of a line,
+// where nothing else can be.
+func documentContent(doc []byte) (content, afterEnd bool) {
+	ended := false
 	for _, line := range strings.Split(string(doc), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && line != "---" && !strings.HasPrefix(line, "#") {
-			return true
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case isMarker(line, "..."):
+			ended = true
+			continue
+		case isMarker(line, "---"), strings.HasPrefix(line, "%"):
+			continue
 		}
+		if t := strings.TrimSpace(line); t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		if ended {
+			return content, true
+		}
+		content = true
 	}
-	return false
+	return content, false
+}
+
+// isMarker reports whether line is the marker, alone or before white
+// space.
+func isMarker(line, marker string) bool {
+	rest, ok := strings.CutPrefix(line, marker)
+	return ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t')
 }
 
 // scaleClient is the scale subresource of one kind, in one namespace.

@@ -30,6 +30,9 @@ func actionAPIServer(t *testing.T) *actionAPI {
 	t.Helper()
 	cfg := startAPIServer(t)
 	c := newEnvCluster(t, cfg, Options{})
+	if _, ok := c.cfg.WarningHandlerWithContext.(*apiWarnings); !ok {
+		t.Errorf("New left the API's warnings to client-go: %T", c.cfg.WarningHandlerWithContext)
+	}
 	return &actionAPI{
 		c:     c,
 		s:     c.Session(context.Background(), fullGrant),

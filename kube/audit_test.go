@@ -3,10 +3,16 @@ package kube
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,6 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -427,4 +435,196 @@ func TestDeleteOfASecretLogsNoContents(t *testing.T) {
 			auditNoMarker(t, f)
 		})
 	}
+}
+
+// auditWebhookStatus is an error as the API server passes on a webhook's
+// denial: its reason and its causes' fields are the webhook's own text.
+func auditWebhookStatus(code int32, reason string, causes ...metav1.StatusCause) error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    code,
+		Reason:  metav1.StatusReason(reason),
+		Message: "admission webhook denied the request: " + auditMarker,
+		Details: &metav1.StatusDetails{Causes: causes},
+	}}
+}
+
+func TestLoggableError(t *testing.T) {
+	many := make([]*field.Error, 0, 10)
+	for i := 0; i < 10; i++ {
+		many = append(many, field.Invalid(field.NewPath("spec", "containers").Index(i).Child(fmt.Sprintf("f%d", i)), auditMarker, "bad"))
+	}
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"a plain error", errors.New(auditMarker), "update failed"},
+		{"an edit refusal", &editRefusal{"the YAML does not parse", auditMarker}, "the YAML does not parse"},
+		{"a validation error", apierrors.NewInvalid(schema.GroupKind{Kind: "Secret"}, "creds", field.ErrorList{
+			field.Invalid(field.NewPath("data").Key("password"), auditMarker, "bad"),
+			field.Invalid(field.NewPath("spec", "containers").Index(0).Child("image"), auditMarker, "bad"),
+			field.Invalid(field.NewPath("spec", "containers").Index(1).Child("image"), auditMarker, "bad"),
+			field.Invalid(field.NewPath("metadata", "annotations").Key("example.com/a.b"), auditMarker, "bad"),
+		}), "the API answered Invalid (422) at data[*], spec.containers[*].image, metadata.annotations[*]"},
+		{"a webhook's reason", auditWebhookStatus(400, "password "+auditMarker+" not allowed"), "the API answered unknown (400)"},
+		{"a webhook's reason that looks like a word", auditWebhookStatus(400, auditMarker), "the API answered unknown (400)"},
+		{"a webhook's fields", auditWebhookStatus(422, "Invalid",
+			metav1.StatusCause{Field: "data[" + auditMarker + "]", Message: auditMarker},
+			metav1.StatusCause{Field: "the password is " + auditMarker, Message: "x"},
+			metav1.StatusCause{Field: "data[x].y[" + auditMarker + "][z]", Message: "x"},
+			metav1.StatusCause{Field: "a..b", Message: "x"},
+			metav1.StatusCause{Field: "[" + auditMarker + "]", Message: "x"},
+			metav1.StatusCause{Field: "a[b", Message: "x"},
+		), "the API answered Invalid (422) at data[*], data[*].y[*][*]"},
+		{"a code out of range", auditWebhookStatus(7, "Forbidden"), "the API answered Forbidden"},
+		{"another code out of range", auditWebhookStatus(600, "Forbidden"), "the API answered Forbidden"},
+		{"no reason", auditWebhookStatus(500, ""), "the API answered unknown (500)"},
+		{"at most eight fields", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "p", many),
+			"the API answered Invalid (422) at " +
+				"spec.containers[*].f0, spec.containers[*].f1, spec.containers[*].f2, spec.containers[*].f3, " +
+				"spec.containers[*].f4, spec.containers[*].f5, spec.containers[*].f6, spec.containers[*].f7"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := loggableError(actUpdate, tt.err)
+			text := ""
+			if got != nil {
+				text = got.Error()
+			}
+			if text != tt.want {
+				t.Errorf("%q, want %q", text, tt.want)
+			}
+			if strings.Contains(text, auditMarker) {
+				t.Errorf("%q holds the marker", text)
+			}
+		})
+	}
+}
+
+func TestWebhookDenialOfASecretIsNotLogged(t *testing.T) {
+	denial := auditWebhookStatus(400, "password "+auditMarker+" not allowed",
+		metav1.StatusCause{Field: "data[" + auditMarker + "]", Message: "the value " + auditMarker + " is weak"},
+		metav1.StatusCause{Field: "password " + auditMarker, Message: auditMarker},
+	)
+	secret := &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "creds", ResourceVersion: "5"},
+		Data:       map[string][]byte{"password": []byte(auditMarker)},
+	}
+	for _, verb := range []string{"update", "delete"} {
+		t.Run(verb, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, func(e *env) {
+				e.dyn.PrependReactor(verb, "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, denial
+				})
+			}, secret)
+			ref := f.ref(t, "", "secrets", "default", "creds")
+			var err error
+			if verb == "update" {
+				err = f.s.Update(context.Background(), ref, actionYAML(t, f, ref, nil))
+			} else {
+				err = f.s.Delete(context.Background(), ref, DeleteOptions{})
+			}
+			if err == nil || !strings.Contains(err.Error(), auditMarker) {
+				t.Errorf("the caller's error %v is not the API's", err)
+			}
+			if got, _ := auditOneAction(t, f).attr("error"); got != "the API answered unknown (400) at data[*]" {
+				t.Errorf("logged error %q", got)
+			}
+			auditNoMarker(t, f)
+		})
+	}
+}
+
+// auditStderr runs fn with standard error going to a pipe, and returns
+// what was written there.
+func auditStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	was := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = was
+	w.Close()
+	b, _ := io.ReadAll(r)
+	r.Close()
+	return string(b)
+}
+
+func TestAPIWarningsAreNotLogged(t *testing.T) {
+	log := newAuditLog()
+	cfg := &rest.Config{}
+	quietWarnings(cfg, log.logger())
+	if cfg.WarningHandlerWithContext == nil || cfg.WarningHandler == nil {
+		t.Fatal("the config has no warning handler")
+	}
+	h := cfg.WarningHandlerWithContext.(*apiWarnings)
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	ctx := context.Background()
+	text := "the password " + auditMarker + " is weak"
+
+	printed := auditStderr(t, func() {
+		cfg.WarningHandlerWithContext.HandleWarningHeaderWithContext(ctx, 299, "-", text) // logged
+		now = now.Add(100 * time.Millisecond)
+		cfg.WarningHandler.HandleWarningHeader(299, "-", text) // counted
+		now = now.Add(500 * time.Millisecond)
+		cfg.WarningHandlerWithContext.HandleWarningHeaderWithContext(ctx, 299, "-", text) // counted
+		now = now.Add(time.Second)
+		cfg.WarningHandlerWithContext.HandleWarningHeaderWithContext(ctx, 299, "-", text) // logged, of three
+	})
+	if printed != "" {
+		t.Errorf("printed %q", printed)
+	}
+	recs := log.all()
+	if len(recs) != 2 {
+		t.Fatalf("records %+v, want two", recs)
+	}
+	for i, want := range []string{"1", "3"} {
+		r := recs[i]
+		if r.Level != slog.LevelDebug || r.Message != "the API sent a warning" {
+			t.Errorf("record %+v", r)
+		}
+		if code, _ := r.attr("code"); code != "299" {
+			t.Errorf("code %q", code)
+		}
+		if n, _ := r.attr("warnings"); n != want {
+			t.Errorf("warnings %q, want %s", n, want)
+		}
+	}
+	auditNoMarker(t, &actionFixture{log: log})
+}
+
+func TestAPIWarningsOfAClient(t *testing.T) {
+	text := "the password " + auditMarker + " is weak"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Add("Warning", `299 - "`+text+`"`)
+		fmt.Fprint(w, `{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"default"}}`)
+	}))
+	defer srv.Close()
+	log := newAuditLog()
+	cfg := &rest.Config{Host: srv.URL}
+	quietWarnings(cfg, log.logger())
+	typed, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	printed := auditStderr(t, func() {
+		if _, err := typed.CoreV1().Namespaces().Get(context.Background(), "default", metav1.GetOptions{}); err != nil {
+			t.Error(err)
+		}
+	})
+	if printed != "" {
+		t.Errorf("printed %q", printed)
+	}
+	if recs := log.with("the API sent a warning"); len(recs) != 1 {
+		t.Errorf("records %+v, want one", log.all())
+	}
+	auditNoMarker(t, &actionFixture{log: log})
 }
