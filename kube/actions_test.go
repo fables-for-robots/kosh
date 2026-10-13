@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -665,4 +667,112 @@ func TestRollback(t *testing.T) {
 			t.Errorf("sent %v", a)
 		}
 	})
+}
+
+func actionCronJob(namespace, name string) *batchv1.CronJob {
+	return &batchv1.CronJob{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "batch/v1", Kind: "CronJob"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, UID: types.UID(name + "-uid"), Labels: map[string]string{"of": "cronjob"}},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 3 * * *",
+			JobTemplate: batchv1.JobTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"team": "night"}, Annotations: map[string]string{"note": "from the template"}},
+				Spec: batchv1.JobSpec{
+					BackoffLimit: actionPtr[int32](2),
+					Template:     actionTemplate(map[string]string{"team": "night"}, "task"),
+				},
+			},
+		},
+	}
+}
+
+func TestTrigger(t *testing.T) {
+	cj := actionCronJob("default", "nightly")
+	f := actionEnv(t, fullGrant, nil, cj)
+	name, err := f.s.Trigger(context.Background(), f.ref(t, "batch", "cronjobs", "default", "nightly"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^nightly-manual-[a-z0-9]{5}$`).MatchString(name) {
+		t.Errorf("name %q", name)
+	}
+	obj, err := f.typed.Tracker().Get(f.resource(t, "batch", "jobs").GVR, "default", name)
+	if err != nil {
+		t.Fatalf("the job: %v", err)
+	}
+	job := obj.(*batchv1.Job)
+	if !reflect.DeepEqual(job.Spec, cj.Spec.JobTemplate.Spec) {
+		t.Errorf("spec %+v, want the template's", job.Spec)
+	}
+	if !reflect.DeepEqual(job.Labels, cj.Spec.JobTemplate.Labels) {
+		t.Errorf("labels %v, want the template's", job.Labels)
+	}
+	if want := map[string]string{"note": "from the template", "cronjob.kubernetes.io/instantiate": "manual"}; !reflect.DeepEqual(job.Annotations, want) {
+		t.Errorf("annotations %v, want %v", job.Annotations, want)
+	}
+	owner := metav1.GetControllerOf(job)
+	if owner == nil || owner.APIVersion != "batch/v1" || owner.Kind != "CronJob" || owner.Name != "nightly" || owner.UID != cj.UID {
+		t.Errorf("owner references %+v", job.OwnerReferences)
+	}
+
+	long := strings.Repeat("a", 60)
+	f = actionEnv(t, fullGrant, nil, actionCronJob("default", long))
+	name, err = f.s.Trigger(context.Background(), f.ref(t, "batch", "cronjobs", "default", long))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(name) > 63 || !regexp.MustCompile(`^a+-manual-[a-z0-9]{5}$`).MatchString(name) {
+		t.Errorf("name %q, of %d characters", name, len(name))
+	}
+	if _, err := f.typed.Tracker().Get(f.resource(t, "batch", "jobs").GVR, "default", name); err != nil {
+		t.Errorf("the job: %v", err)
+	}
+}
+
+func TestSetSuspended(t *testing.T) {
+	f := actionEnv(t, fullGrant, nil, actionCronJob("default", "nightly"))
+	ref := f.ref(t, "batch", "cronjobs", "default", "nightly")
+	for _, on := range []bool{true, false} {
+		if err := f.s.SetSuspended(context.Background(), ref, on); err != nil {
+			t.Fatal(err)
+		}
+		obj, err := f.typed.Tracker().Get(ref.Resource.GVR, "default", "nightly")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := obj.(*batchv1.CronJob).Spec.Suspend; s == nil || *s != on {
+			t.Errorf("suspend %v, want %v", s, on)
+		}
+	}
+}
+
+func TestWrongKindIsRefusedBeforeAnythingIsSent(t *testing.T) {
+	f := actionEnv(t, fullGrant, nil, actionConfigMap("default", "settings"))
+	ctx := context.Background()
+	ref := f.ref(t, "", "configmaps", "default", "settings")
+	tests := []struct {
+		verb string
+		call func() error
+	}{
+		{"kill", func() error { return f.s.Kill(ctx, ref) }},
+		{"scale", func() error { return f.s.Scale(ctx, ref, 1) }},
+		{"restart", func() error { return f.s.Restart(ctx, ref) }},
+		{"set the images of", func() error { return f.s.SetImages(ctx, ref, map[string]string{"app": "app:2"}) }},
+		{"roll back to", func() error { return f.s.Rollback(ctx, ref) }},
+		{"trigger", func() error { _, err := f.s.Trigger(ctx, ref); return err }},
+		{"suspend", func() error { return f.s.SetSuspended(ctx, ref, true) }},
+		{"resume", func() error { return f.s.SetSuspended(ctx, ref, false) }},
+		{"cordon", func() error { return f.s.Cordon(ctx, ref, true) }},
+		{"uncordon", func() error { return f.s.Cordon(ctx, ref, false) }},
+		{"drain", func() error { return f.s.Drain(ctx, ref, DefaultDrainOptions()) }},
+	}
+	for _, tt := range tests {
+		err := tt.call()
+		if want := "cannot " + tt.verb + " configmaps/default/settings"; err == nil || err.Error() != want {
+			t.Errorf("%s: %v, want %q", tt.verb, err, want)
+		}
+	}
+	if a := f.sent(); len(a) != 0 {
+		t.Errorf("sent %v", a)
+	}
 }

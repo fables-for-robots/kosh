@@ -12,18 +12,18 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/dynamic"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"sigs.k8s.io/yaml"
 )
-
-var errNotYet = errors.New("not implemented")
 
 // objectClient returns the dynamic client of ref's resource, in
 // ref.Namespace when the resource is namespaced.
@@ -292,7 +292,55 @@ func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (string, error
 	if err := s.begin(ctx, actTrigger, cronJob); err != nil {
 		return "", err
 	}
-	return "", errNotYet
+	if err := kindIs("trigger", cronJob, cronJobKinds...); err != nil {
+		return "", err
+	}
+	cj, err := s.c.typed.BatchV1().CronJobs(cronJob.Namespace).Get(ctx, cronJob.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	job, err := s.c.typed.BatchV1().Jobs(cj.Namespace).Create(ctx, jobFromCronJob(cj, manualJobName(cj.Name)), metav1.CreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	return job.Name, nil
+}
+
+// manualJobName returns the name of a job that is triggered by hand from
+// the cronjob: "<cronjob>-manual-xxxxx", of at most 63 characters.
+func manualJobName(cronJob string) string {
+	const suffix, random = "-manual-", 5
+	if max := 63 - len(suffix) - random; len(cronJob) > max {
+		cronJob = cronJob[:max]
+	}
+	return cronJob + suffix + utilrand.String(random)
+}
+
+// jobFromCronJob returns the job named name that kubectl create job
+// --from=cronjob/… makes of cj.
+func jobFromCronJob(cj *batchv1.CronJob, name string) *batchv1.Job {
+	annotations := map[string]string{"cronjob.kubernetes.io/instantiate": "manual"}
+	for k, v := range cj.Spec.JobTemplate.Annotations {
+		annotations[k] = v
+	}
+	controller := true
+	return &batchv1.Job{
+		TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   cj.Namespace,
+			Name:        name,
+			Labels:      cj.Spec.JobTemplate.Labels,
+			Annotations: annotations,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1",
+				Kind:       "CronJob",
+				Name:       cj.Name,
+				UID:        cj.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: cj.Spec.JobTemplate.Spec,
+	}
 }
 
 func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended bool) error {
@@ -303,7 +351,15 @@ func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended
 	if err := s.begin(ctx, action, cronJob); err != nil {
 		return err
 	}
-	return errNotYet
+	if err := kindIs(action, cronJob, cronJobKinds...); err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]any{"spec": map[string]any{"suspend": suspended}})
+	if err != nil {
+		return err
+	}
+	_, err = s.c.typed.BatchV1().CronJobs(cronJob.Namespace).Patch(ctx, cronJob.Name, types.MergePatchType, body, metav1.PatchOptions{})
+	return err
 }
 
 // describeObject names an object as "apps/v1 Deployment default/web".
