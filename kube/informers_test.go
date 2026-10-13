@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,6 +193,46 @@ func TestKindCacheStatus(t *testing.T) {
 			t.Error("the listed pod is not kept")
 		}
 	})
+	t.Run("a list that works after one that failed", func(t *testing.T) {
+		var lists atomic.Int32
+		e := newEnv(t, envConfig{before: func(e *env) {
+			e.dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				if lists.Add(1) == 1 {
+					return true, nil, apierrors.NewForbidden(podsResource, "", nil)
+				}
+				return false, nil, nil
+			})
+		}}, pod("default", "a", nil))
+		k := acquire(t, e, render.Pods)
+		eventually(t, "the first list's error", func() bool {
+			_, _, err := k.status()
+			return err != nil
+		})
+		eventually(t, "the error cleared by the next list", func() bool {
+			s, _, err := k.status()
+			return s && err == nil && lists.Load() >= 2
+		})
+	})
+	t.Run("a watch that opens after one that broke", func(t *testing.T) {
+		var watches atomic.Int32
+		e := newEnv(t, envConfig{before: func(e *env) {
+			e.dyn.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+				if watches.Add(1) == 1 {
+					return true, nil, apierrors.NewTooManyRequests("the API is busy", 1)
+				}
+				return false, nil, nil
+			})
+		}}, pod("default", "a", nil))
+		k := acquire(t, e, render.Pods)
+		eventually(t, "stale after the first watch", func() bool {
+			_, stale, _ := k.status()
+			return stale
+		})
+		eventually(t, "stale cleared by the next watch", func() bool {
+			_, stale, _ := k.status()
+			return !stale && watches.Load() >= 2
+		})
+	})
 	t.Run("a watch that ends with an error", func(t *testing.T) {
 		var fw atomic.Pointer[watch.FakeWatcher]
 		var watches atomic.Int32
@@ -293,6 +334,33 @@ func TestCloseStopsEverything(t *testing.T) {
 	eventually(t, "the goroutines of the Cluster are gone", func() bool {
 		return runtime.NumGoroutine() <= before
 	})
+}
+
+func TestCloseWaitsForIdleTimers(t *testing.T) {
+	e := newEnv(t, envConfig{opts: Options{IdleStop: time.Millisecond}})
+	k := acquire(t, e, render.Pods)
+	j := acquire(t, e, render.Jobs)
+	eventually(t, "the first lists", func() bool { return synced(k) && synced(j) })
+
+	// The timers fire while Close waits for c.mu, so that their functions
+	// run after Close has seen them; Close returns only after they ended.
+	e.c.mu.Lock()
+	e.c.mu.Unlock()
+	e.c.release(k)
+	e.c.release(j)
+	e.c.mu.Lock()
+	closed := make(chan struct{})
+	go func() {
+		e.c.Close()
+		close(closed)
+	}()
+	time.Sleep(20 * time.Millisecond) // the timers fire, and wait for c.mu
+	e.c.mu.Unlock()
+	<-closed
+	buf := make([]byte, 1<<20)
+	if stack := string(buf[:runtime.Stack(buf, true)]); strings.Contains(stack, "stopIdle") {
+		t.Errorf("an idle timer's function runs after Close:\n%s", stack)
+	}
 }
 
 func drain(ch <-chan struct{}) {
