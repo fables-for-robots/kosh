@@ -26,7 +26,11 @@ func (v *tableView) Update(msg tea.Msg) (view, tea.Cmd) { return v, nil }
 func (v *tableView) View(w, h int) string               { return "" }
 func (v *tableView) Title() string {
 	r := v.q.Resource.GVR.Resource
-	return strings.ToUpper(r[:1]) + r[1:] + "(" + v.q.Namespace + ")[0]"
+	ns := v.q.Namespace
+	if ns == "" {
+		ns = "all"
+	}
+	return strings.ToUpper(r[:1]) + r[1:] + "(" + ns + ")[0]"
 }
 func (v *tableView) Crumb() string      { return v.q.Resource.GVR.Resource }
 func (v *tableView) Hints() []hint      { return nil }
