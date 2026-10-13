@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -98,6 +99,8 @@ type Server struct {
 	// that does not read cannot keep a session kosh has ended.
 	endTimeout time.Duration
 
+	handshakes atomic.Int64 // connections in the handshake, over every listener
+
 	mu        sync.Mutex
 	closing   bool // Shutdown has been called
 	listeners map[net.Listener]struct{}
@@ -179,7 +182,8 @@ func (s *Server) keyAccepted(_ ssh.Context, key ssh.PublicKey) bool {
 // one connection.
 func (s *Server) serverConfig(ssh.Context) *gossh.ServerConfig {
 	return &gossh.ServerConfig{
-		MaxAuthTries: maxAuthTries,
+		MaxAuthTries:    maxAuthTries,
+		AuthLogCallback: authLog,
 	}
 }
 
@@ -189,13 +193,14 @@ func (s *Server) connectionFailed(nc net.Conn, err error) {
 	if c == nil {
 		return
 	}
-	s.logRefused(c.transport, c.remote, err.Error())
+	s.logRefused(slog.LevelInfo, c.transport, c.remote, failureReason(err))
 }
 
 // logRefused logs a connection that is closed without having
 // authenticated.
-func (s *Server) logRefused(transport, remote, reason string) {
-	s.log.Info("connection closed before authenticating", "transport", transport, "remote", remote, "reason", reason)
+func (s *Server) logRefused(level slog.Level, transport, remote, reason string) {
+	s.log.Log(context.Background(), level, "connection closed before authenticating",
+		"transport", transport, "remote", remote, "reason", reason)
 }
 
 // Serve accepts connections from l until l is closed or Shutdown is
@@ -233,11 +238,20 @@ func (s *Server) Serve(l net.Listener, transport string) error {
 			return err
 		}
 		delay = 0
-		c := newConn(nc, transport)
+		if !s.enterHandshake() {
+			_ = nc.Close()
+			remote := ""
+			if a := nc.RemoteAddr(); a != nil {
+				remote = a.String()
+			}
+			s.logRefused(slog.LevelWarn, transport, remote, reasonTooManyHandshakes)
+			continue
+		}
+		c := newConn(s, nc, transport)
 		s.mu.Lock()
 		if s.closing {
 			s.mu.Unlock()
-			_ = nc.Close()
+			_ = c.Close()
 			continue
 		}
 		s.conns[c] = struct{}{}
