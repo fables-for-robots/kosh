@@ -13,6 +13,9 @@ import (
 // client and returns the containers of its pod template, init
 // containers first. Any other kind is an error.
 func (s *session) Images(ctx context.Context, ref ObjectRef) ([]ContainerImage, error) {
+	if err := checkRef(ref); err != nil {
+		return nil, err
+	}
 	get := metav1.GetOptions{}
 	var spec *corev1.PodSpec
 	switch {
@@ -50,6 +53,9 @@ func (s *session) Images(ctx context.Context, ref ObjectRef) ([]ContainerImage, 
 // Replicas returns spec.replicas of the scale subresource of a
 // deployment, statefulset or replicaset. Any other kind is an error.
 func (s *session) Replicas(ctx context.Context, ref ObjectRef) (int32, error) {
+	if err := checkRef(ref); err != nil {
+		return 0, err
+	}
 	get := metav1.GetOptions{}
 	var (
 		scale *autoscalingv1.Scale

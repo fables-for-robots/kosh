@@ -24,6 +24,9 @@ func (s *session) watchPseudo(q Query) (Watch, error) {
 		return nil, ErrNoRelation
 	}
 	of := *q.Of
+	if err := checkRef(of); err != nil {
+		return nil, err
+	}
 	switch {
 	case q.Resource.Is(Containers.GVR.Group, Containers.GVR.Resource) && of.Resource.Is("", "pods"):
 		return s.watchContainers(of)

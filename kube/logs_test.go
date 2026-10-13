@@ -312,8 +312,11 @@ func TestLogLineCutKeepsRunesWhole(t *testing.T) {
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
 	got := readFlatten(readCollect(t, ls))
-	if len(got) != 1 || len(got[0].Text) > 64<<10 || !strings.HasSuffix(got[0].Text, "ü…") {
-		t.Errorf("got %d lines; the first of %d bytes, want one cut after a whole rune", len(got), len(got[0].Text))
+	if len(got) != 1 {
+		t.Fatalf("got %d lines, want one", len(got))
+	}
+	if len(got[0].Text) > 64<<10 || !strings.HasSuffix(got[0].Text, "ü…") {
+		t.Errorf("a line of %d bytes, want one cut after a whole rune", len(got[0].Text))
 	}
 }
 
@@ -615,4 +618,115 @@ func TestLogsOfAnotherKind(t *testing.T) {
 	if len(f.calls()) != 0 {
 		t.Errorf("opened %+v", f.calls())
 	}
+}
+
+func TestLogLineOfExactly64KiBIsWhole(t *testing.T) {
+	line := strings.Repeat("y", 64<<10)
+	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
+		return readNewStream(strings.NewReader(line+"\nafter\n"), false), nil
+	}}
+	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
+	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
+	got := readFlatten(readCollect(t, ls))
+	if len(got) != 2 || got[0].Text != line || got[1].Text != "after" {
+		t.Errorf("got %d lines; want the line of 64 KiB whole, then the next", len(got))
+	}
+}
+
+func TestLogBatchesHoldAtMostAMegabyte(t *testing.T) {
+	line := strings.Repeat("z", 64<<10)
+	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
+		return readNewStream(strings.NewReader(strings.Repeat(line+"\n", 40)), false), nil
+	}}
+	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
+	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
+	n := 0
+	for _, b := range readCollect(t, ls) {
+		size := 0
+		for _, l := range b {
+			size += len(l.Text)
+		}
+		if size > 1<<20+64<<10 {
+			t.Errorf("a batch of %d lines and %d bytes, want at most 1 MiB and one line", len(b), size)
+		}
+		n += len(b)
+	}
+	if n != 40 {
+		t.Errorf("%d lines, want 40", n)
+	}
+}
+
+func TestLogsOfAWorkloadPreferMainContainers(t *testing.T) {
+	objs := []k8sruntime.Object{readDeployment("default", "web", "web")}
+	for i := range 20 {
+		p := readPodWith("default", fmt.Sprintf("web-%02d", i), map[string]string{"app": "web"}, "a", "b")
+		p.Spec.InitContainers = []corev1.Container{{Name: "init"}}
+		p.Spec.EphemeralContainers = []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug"}}}
+		objs = append(objs, p)
+	}
+	f := &readFakeLogs{}
+	e := readLogEnv(t, f, objs...)
+	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "apps", "deployments"), Namespace: "default", Name: "web"}, LogOptions{})
+	readCollect(t, ls)
+	calls := f.calls()
+	if len(calls) != LogMaxContainers || ls.Skipped() != 50 {
+		t.Errorf("%d opened, %d skipped; want 30 and 50", len(calls), ls.Skipped())
+	}
+	for _, c := range calls {
+		if c.opts.Container != "a" && c.opts.Container != "b" || c.pod >= "web-15" {
+			t.Errorf("opened %s/%s, want the main containers of the first 15 pods", c.pod, c.opts.Container)
+		}
+	}
+
+	// With fewer pods, ephemeral containers come before init containers.
+	f = &readFakeLogs{}
+	e = readLogEnv(t, f, objs[:15]...) // 14 pods: 28 main containers
+	ls = readLogs(t, e, ObjectRef{Resource: e.resource(t, "apps", "deployments"), Namespace: "default", Name: "web"}, LogOptions{})
+	readCollect(t, ls)
+	kinds := map[string]int{}
+	for _, c := range f.calls() {
+		kinds[c.opts.Container]++
+	}
+	if kinds["a"] != 14 || kinds["b"] != 14 || kinds["debug"] != 2 || kinds["init"] != 0 || ls.Skipped() != 26 {
+		t.Errorf("opened %v, skipped %d; want 14 a, 14 b, 2 debug and 26 skipped", kinds, ls.Skipped())
+	}
+}
+
+func TestLogCloseWithABatchInFlight(t *testing.T) {
+	var text strings.Builder
+	for i := range 10 {
+		fmt.Fprintf(&text, "line %d\n", i)
+	}
+	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
+		return readNewStream(strings.NewReader(text.String()), true), nil
+	}}
+	e := readLogEnv(t, f, readPodWith("default", "web", nil, "a", "b"))
+	before := runtime.NumGoroutine()
+	ls, err := e.session(t).Logs(context.Background(), ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{AllContainers: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "both logs are opened", func() bool { return len(f.calls()) == 2 })
+	// Nobody reads Lines: after the batch's wait, both batchers are
+	// blocked sending.
+	time.Sleep(4 * logBatchWait)
+	closed := make(chan struct{})
+	go func() {
+		ls.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close has not returned within 5s")
+	}
+	if !f.allClosed() {
+		t.Error("a stream is not closed")
+	}
+	if _, ok := <-ls.Lines(); ok {
+		t.Error("Lines is not closed after Close")
+	}
+	eventually(t, "the goroutines of the stream are gone", func() bool {
+		return runtime.NumGoroutine() <= before
+	})
 }

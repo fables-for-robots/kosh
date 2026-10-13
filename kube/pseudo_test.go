@@ -265,3 +265,48 @@ func TestRulesErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestPseudoWatchesEndWithTheSession(t *testing.T) {
+	e := newEnv(t, envConfig{opts: Options{IdleStop: 10 * time.Millisecond, TablePoll: 10 * time.Millisecond}},
+		readPodWith("default", "web", nil, "app"), readRole("default", "reader", readRule("", "pods", "get")))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := e.c.Session(ctx, fullGrant)
+	pod := ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}
+	containers, err := s.Watch(Query{Resource: Containers, Of: &pod})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowsWhen(t, containers, "default/app")
+	role := ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "roles"), Namespace: "default", Name: "reader"}
+	rules, err := s.Watch(Query{Resource: Rules, Of: &role})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readRulesWhen(t, rules, readRule("", "pods", "get"))
+
+	cancel()
+	eventually(t, "the pods' cache is released and stopped", func() bool { return !e.c.running(render.Pods) })
+	eventually(t, "the rules' poll has ended", func() bool {
+		select {
+		case <-rules.(*rulesWatch).done:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+func TestRulesOfABindingWhoseRoleIsGone(t *testing.T) {
+	e := newEnv(t, envConfig{}, &rbacv1.RoleBinding{ObjectMeta: objMeta("default", "orphan"),
+		RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "gone"}})
+	of := ObjectRef{Resource: readRoleBindings, Namespace: "default", Name: "orphan"}
+	w := watchOf(t, e.session(t), Query{Resource: Rules, Of: &of})
+	eventually(t, "Err", func() bool {
+		tab := w.Table(time.Now())
+		return tab.Err != nil && len(tab.Rows) == 0
+	})
+	if err := w.Table(time.Now()).Err; !apierrors.IsNotFound(err) {
+		t.Errorf("Err %v, want the role's not found", err)
+	}
+}

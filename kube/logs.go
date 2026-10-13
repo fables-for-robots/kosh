@@ -23,9 +23,12 @@ const (
 	// with logCut.
 	logMaxLine = 64 << 10
 	logCut     = "…"
-	// A container's lines are delivered when logBatchLines are in, or
-	// logBatchWait after the first of them, whichever is first.
+	// A container's lines are delivered when logBatchLines are in, when
+	// they hold logBatchBytes of text, or logBatchWait after the first
+	// of them, whichever is first: a batch holds at most logBatchBytes
+	// and one line.
 	logBatchLines = 256
+	logBatchBytes = 1 << 20
 	logBatchWait  = 50 * time.Millisecond
 )
 
@@ -36,9 +39,13 @@ type logSource struct {
 
 // Logs reads the log of a pod, or of every container of every pod a
 // workload or service selects now. It reads at most LogMaxContainers
-// containers; the stream ends with Close, with the session's context
+// containers, of a workload its pods' containers before their ephemeral
+// and init containers; the stream ends with Close, with the session's context
 // and with the Cluster.
 func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (LogStream, error) {
+	if err := checkRef(ref); err != nil {
+		return nil, err
+	}
 	var (
 		namespace string
 		sources   []logSource
@@ -75,13 +82,15 @@ func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (Log
 		pods := list.Items
 		sort.Slice(pods, func(i, j int) bool { return pods[i].Name < pods[j].Name })
 		namespace = ns
-		for i := range pods {
+		var selected []corev1.Pod
+		for _, p := range pods {
 			// labels.Nothing() is "" as a string, which the API reads as
 			// everything.
-			if sel.Matches(labels.Set(pods[i].Labels)) {
-				sources = append(sources, containersOf(&pods[i])...)
+			if sel.Matches(labels.Set(p.Labels)) {
+				selected = append(selected, p)
 			}
 		}
+		sources = workloadContainers(selected)
 	default:
 		return nil, fmt.Errorf("%s has no log: logs are of pods, and of the pods of a deployment, replicaset, statefulset, daemonset, job or service", ref)
 	}
@@ -112,6 +121,26 @@ func containersOf(p *corev1.Pod) []logSource {
 		out = append(out, logSource{pod: p.Name, container: c.Name})
 	}
 	return out
+}
+
+// workloadContainers returns every container of pods in the order the
+// limit of LogMaxContainers cuts the least interesting first: every
+// pod's containers, then their ephemeral containers, then their init
+// containers.
+func workloadContainers(pods []corev1.Pod) []logSource {
+	var main, ephemeral, init []logSource
+	for _, p := range pods {
+		for _, c := range p.Spec.Containers {
+			main = append(main, logSource{pod: p.Name, container: c.Name})
+		}
+		for _, c := range p.Spec.EphemeralContainers {
+			ephemeral = append(ephemeral, logSource{pod: p.Name, container: c.Name})
+		}
+		for _, c := range p.Spec.InitContainers {
+			init = append(init, logSource{pod: p.Name, container: c.Name})
+		}
+	}
+	return append(append(main, ephemeral...), init...)
 }
 
 // podLogOptions are the options every container's log is opened with,
@@ -312,10 +341,12 @@ func (ls *logStream) read(ctx context.Context, namespace string, src logSource, 
 }
 
 // batch delivers what comes from in in batches: when logBatchLines are
-// in, or logBatchWait after the first of them.
+// in, when they hold logBatchBytes, or logBatchWait after the first of
+// them.
 func (ls *logStream) batch(ctx context.Context, in <-chan LogLine) {
 	var (
 		pending []LogLine
+		size    int // of the text of pending
 		timer   = time.NewTimer(logBatchWait)
 		wait    <-chan time.Time
 	)
@@ -329,7 +360,7 @@ func (ls *logStream) batch(ctx context.Context, in <-chan LogLine) {
 		}
 		n, last := ls.take(len(pending))
 		b := pending[:n]
-		pending = nil
+		pending, size = nil, 0
 		if n > 0 {
 			select {
 			case ls.lines <- b:
@@ -352,11 +383,12 @@ func (ls *logStream) batch(ctx context.Context, in <-chan LogLine) {
 				return
 			}
 			pending = append(pending, l)
+			size += len(l.Text)
 			if len(pending) == 1 {
 				timer.Reset(logBatchWait)
 				wait = timer.C
 			}
-			if len(pending) >= logBatchLines && !flush() {
+			if (len(pending) >= logBatchLines || size >= logBatchBytes) && !flush() {
 				return
 			}
 		case <-wait:
