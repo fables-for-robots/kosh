@@ -39,7 +39,7 @@ func (roleBinding) Row(obj runtime.Object, now time.Time) (Row, error) {
 	return NewRow(rb).
 		Text(rb.Namespace).
 		Text(rb.Name).
-		Text(rb.RoleRef.Name).
+		Text(Or(rb.RoleRef.Name)).
 		Text(kind).
 		Text(subjects).
 		Map(rb.Labels).

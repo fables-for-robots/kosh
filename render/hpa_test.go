@@ -128,6 +128,61 @@ func TestHorizontalPodAutoscalersRows(t *testing.T) {
 			want: map[string]string{"REFERENCE": "StatefulSet/db", "TARGETS": MissingValue},
 		},
 		{
+			name: "a container resource metric",
+			obj: &autoscalingv2.HorizontalPodAutoscaler{
+				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+					Metrics: []autoscalingv2.MetricSpec{
+						{Type: autoscalingv2.ContainerResourceMetricSourceType, ContainerResource: &autoscalingv2.ContainerResourceMetricSource{
+							Name: corev1.ResourceCPU, Container: "app",
+							Target: autoscalingv2.MetricTarget{Type: autoscalingv2.UtilizationMetricType, AverageUtilization: hpaInt32(60)},
+						}},
+					},
+				},
+				Status: autoscalingv2.HorizontalPodAutoscalerStatus{
+					CurrentMetrics: []autoscalingv2.MetricStatus{
+						{Type: autoscalingv2.ContainerResourceMetricSourceType, ContainerResource: &autoscalingv2.ContainerResourceMetricStatus{
+							Name: corev1.ResourceCPU, Container: "app", Current: autoscalingv2.MetricValueStatus{AverageUtilization: hpaInt32(41)},
+						}},
+					},
+				},
+			},
+			want: map[string]string{"TARGETS": "cpu: 41%/60%"},
+		},
+		{
+			name: "the status metric at the position is of another type",
+			obj: &autoscalingv2.HorizontalPodAutoscaler{
+				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+					Metrics: []autoscalingv2.MetricSpec{
+						{Type: autoscalingv2.ResourceMetricSourceType, Resource: &autoscalingv2.ResourceMetricSource{
+							Name:   corev1.ResourceCPU,
+							Target: autoscalingv2.MetricTarget{Type: autoscalingv2.UtilizationMetricType, AverageUtilization: hpaInt32(80)},
+						}},
+					},
+				},
+				Status: autoscalingv2.HorizontalPodAutoscalerStatus{
+					CurrentMetrics: []autoscalingv2.MetricStatus{
+						{Type: autoscalingv2.PodsMetricSourceType, Pods: &autoscalingv2.PodsMetricStatus{
+							Metric:  autoscalingv2.MetricIdentifier{Name: "x"},
+							Current: autoscalingv2.MetricValueStatus{AverageValue: hpaQty("5")},
+						}},
+					},
+				},
+			},
+			want: map[string]string{"TARGETS": "cpu: <unknown>/80%"},
+		},
+		{
+			name: "a reference with a kind only",
+			obj: &autoscalingv2.HorizontalPodAutoscaler{Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{Kind: "Deployment"}}},
+			want: map[string]string{"REFERENCE": "Deployment/" + MissingValue},
+		},
+		{
+			name: "a reference with a name only",
+			obj: &autoscalingv2.HorizontalPodAutoscaler{Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{Name: "web"}}},
+			want: map[string]string{"REFERENCE": MissingValue + "/web"},
+		},
+		{
 			name: "metadata only",
 			obj:  &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: "h"}},
 			want: map[string]string{
@@ -164,5 +219,19 @@ func TestHorizontalPodAutoscalersOrder(t *testing.T) {
 		if orderOf(t, HorizontalPodAutoscalers, a, col) >= orderOf(t, HorizontalPodAutoscalers, b, col) {
 			t.Errorf("%s: the smaller should sort before the larger", col)
 		}
+	}
+}
+
+func TestHorizontalPodAutoscalersUnsetMinPodsSortsAsOne(t *testing.T) {
+	unset, _ := rowOf(t, HorizontalPodAutoscalers, &autoscalingv2.HorizontalPodAutoscaler{})
+	zero, _ := rowOf(t, HorizontalPodAutoscalers, &autoscalingv2.HorizontalPodAutoscaler{Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: hpaInt32(0)}})
+	one, _ := rowOf(t, HorizontalPodAutoscalers, &autoscalingv2.HorizontalPodAutoscaler{Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: hpaInt32(1)}})
+	two, _ := rowOf(t, HorizontalPodAutoscalers, &autoscalingv2.HorizontalPodAutoscaler{Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: hpaInt32(2)}})
+	u := orderOf(t, HorizontalPodAutoscalers, unset, "MINPODS")
+	if u != orderOf(t, HorizontalPodAutoscalers, one, "MINPODS") {
+		t.Errorf("unset sorts as %v, want 1", u)
+	}
+	if !(orderOf(t, HorizontalPodAutoscalers, zero, "MINPODS") < u && u < orderOf(t, HorizontalPodAutoscalers, two, "MINPODS")) {
+		t.Error("unset should sort between 0 and 2")
 	}
 }

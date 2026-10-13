@@ -55,13 +55,13 @@ func (horizontalPodAutoscaler) Row(obj runtime.Object, now time.Time) (Row, erro
 		Row(), nil
 }
 
-// hpaReference returns "Kind/name" of the scale target, or MissingValue
-// when it names nothing.
+// hpaReference returns "Kind/name" of the scale target; one it lacks is
+// MissingValue, and so is the whole when it names nothing.
 func hpaReference(ref autoscalingv2.CrossVersionObjectReference) string {
 	if ref.Kind == "" && ref.Name == "" {
 		return MissingValue
 	}
-	return ref.Kind + "/" + ref.Name
+	return Or(ref.Kind) + "/" + Or(ref.Name)
 }
 
 // hpaTargets returns one "name: current/target" for each metric of the

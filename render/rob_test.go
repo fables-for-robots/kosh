@@ -62,7 +62,7 @@ func TestRoleBindingsRows(t *testing.T) {
 			name: "metadata only",
 			obj:  &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
 			want: map[string]string{
-				"NAME": "m", "ROLE": "", "KIND": NAValue, "SUBJECTS": MissingValue,
+				"NAME": "m", "ROLE": MissingValue, "KIND": NAValue, "SUBJECTS": MissingValue,
 				"LABELS": MissingValue, "VALID": "", "AGE": UnknownValue,
 			},
 		},

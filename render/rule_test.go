@@ -43,8 +43,12 @@ func ruleWantRow(t *testing.T, got Row, name, group string, marks []string, extr
 	if strings.Join(got.Cells, "|") != strings.Join(want, "|") {
 		t.Errorf("row:\n got %q\nwant %q", got.Cells, want)
 	}
-	if got.Name != name {
-		t.Errorf("Name = %q, want %q", got.Name, name)
+	wantName := name
+	if group != "core" && group != NAValue {
+		wantName += "." + group
+	}
+	if got.Name != wantName {
+		t.Errorf("Name = %q, want %q", got.Name, wantName)
 	}
 	if got.Namespace != "" {
 		t.Errorf("Namespace = %q, want none", got.Namespace)
@@ -165,5 +169,64 @@ func TestRuleRowsExtrasAreCut(t *testing.T) {
 	}
 	if !strings.HasPrefix(extras, "impersonate,escalate,bind,") {
 		t.Errorf("extras = %q", extras)
+	}
+}
+
+func TestRuleRowsLimitedRuleAlone(t *testing.T) {
+	rows := RuleRows([]rbacv1.PolicyRule{{
+		APIGroups: []string{""}, Resources: []string{"secrets"},
+		ResourceNames: []string{"db-password"}, Verbs: []string{"get"},
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("%d rows, want 1: %v", len(rows), rows)
+	}
+	ruleWantRow(t, rows[0], "secrets[db-password]", "core", ruleMarks("get"), "")
+}
+
+func TestRuleRowsLimitedBesideUnlimited(t *testing.T) {
+	rows := RuleRows([]rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"b", "a"}, Verbs: []string{"delete"}},
+	})
+	if len(rows) != 2 {
+		t.Fatalf("%d rows, want 2: %v", len(rows), rows)
+	}
+	ruleWantRow(t, rows[0], "secrets", "core", ruleMarks("get", "list"), "")
+	ruleWantRow(t, rows[1], "secrets[a,b]", "core", ruleMarks("delete"), "")
+}
+
+func TestRuleRowsSameNamesInAnyOrderMerge(t *testing.T) {
+	rows := RuleRows([]rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"configmaps"}, ResourceNames: []string{"a", "b"}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"configmaps"}, ResourceNames: []string{"b", "a"}, Verbs: []string{"update"}},
+	})
+	if len(rows) != 1 {
+		t.Fatalf("%d rows, want 1: %v", len(rows), rows)
+	}
+	ruleWantRow(t, rows[0], "configmaps[a,b]", "core", ruleMarks("get", "update"), "")
+}
+
+func TestRuleRowsSameResourceInTwoGroupsHasUniqueNames(t *testing.T) {
+	rows := RuleRows([]rbacv1.PolicyRule{
+		{APIGroups: []string{"apps", ""}, Resources: []string{"deployments"}, Verbs: []string{"get"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, ResourceNames: []string{"x"}, Verbs: []string{"get"}},
+	})
+	var names, cells []string
+	for _, r := range rows {
+		names = append(names, r.Name)
+		cells = append(cells, r.Cells[0]+"/"+r.Cells[1])
+	}
+	if got, want := strings.Join(names, "|"), "deployments.apps|deployments|leases[x].coordination.k8s.io"; got != want {
+		t.Errorf("Names = %s, want %s", got, want)
+	}
+	if got, want := strings.Join(cells, "|"), "deployments/apps|deployments/core|leases[x]/coordination.k8s.io"; got != want {
+		t.Errorf("cells = %s, want %s", got, want)
+	}
+}
+
+func TestRuleRowsNonResourceURLName(t *testing.T) {
+	rows := RuleRows([]rbacv1.PolicyRule{{NonResourceURLs: []string{"healthz"}, Verbs: []string{"get"}}})
+	if len(rows) != 1 || rows[0].Name != "/healthz" {
+		t.Errorf("rows = %v, want one named /healthz", rows)
 	}
 }

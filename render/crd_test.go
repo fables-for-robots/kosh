@@ -145,6 +145,7 @@ func TestCustomResourceDefinitionsRows(t *testing.T) {
 			want: map[string]string{
 				"NAME": "m.example.com", "GROUP": MissingValue, "KIND": MissingValue, "VERSIONS": NAValue, "SCOPE": MissingValue,
 				"ALIASES": NAValue, "LABELS": MissingValue, "AGE": UnknownValue,
+				"VALID": "unable to assert CRD servers versions for m.example.com - CRD m.example.com is not established",
 			},
 			health: Error,
 		},

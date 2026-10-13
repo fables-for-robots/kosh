@@ -35,7 +35,7 @@ func (clusterRoleBinding) Row(obj runtime.Object, now time.Time) (Row, error) {
 	kind, subjects := rbacSubjects(crb.Subjects)
 	return NewRow(crb).
 		Text(crb.Name).
-		Text(crb.RoleRef.Name).
+		Text(Or(crb.RoleRef.Name)).
 		Text(kind).
 		Text(subjects).
 		Map(crb.Labels).

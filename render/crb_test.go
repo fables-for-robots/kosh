@@ -38,7 +38,7 @@ func TestClusterRoleBindingsRows(t *testing.T) {
 			name: "metadata only",
 			obj:  &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
 			want: map[string]string{
-				"NAME": "m", "CLUSTERROLE": "", "SUBJECT-KIND": NAValue, "SUBJECTS": MissingValue,
+				"NAME": "m", "CLUSTERROLE": MissingValue, "SUBJECT-KIND": NAValue, "SUBJECTS": MissingValue,
 				"LABELS": MissingValue, "AGE": UnknownValue,
 			},
 		},
