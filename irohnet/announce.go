@@ -236,6 +236,13 @@ func isLAN(flags net.Flags) bool {
 		flags&net.FlagPointToPoint == 0 && flags&net.FlagLoopback == 0
 }
 
+// announcesOn reports whether the addresses of the interface name with
+// flags are announced: a LAN interface that is not one of Docker's
+// bridges. mDNS joins and sends on these interfaces alone.
+func announcesOn(name string, flags net.Flags) bool {
+	return isLAN(flags) && !isDockerBridge(name)
+}
+
 // ifaceIPs returns the unicast addresses of ifc, an IPv4 address written
 // as IPv6 as IPv4.
 func ifaceIPs(ifc iface) []netip.Addr {
@@ -264,7 +271,7 @@ func announcedAddrs(ifaces []iface, local netip.AddrPort) []netip.AddrPort {
 	var out []netip.AddrPort
 	seen := make(map[netip.Addr]bool)
 	for _, ifc := range ifaces {
-		if !isLAN(ifc.flags) || isDockerBridge(ifc.name) {
+		if !announcesOn(ifc.name, ifc.flags) {
 			continue
 		}
 		for _, ip := range ifaceIPs(ifc) {

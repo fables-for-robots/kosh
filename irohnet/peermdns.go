@@ -12,15 +12,14 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	irohkey "github.com/tmc/go-iroh/key"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -46,6 +45,7 @@ const (
 // when the announcer starts and whenever its addresses change.
 var mdnsRepeats = []time.Duration{0, time.Second, 2 * time.Second}
 
+// mdnsGroup4 is where announcements and answers are sent.
 var mdnsGroup4 = &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
 
 // mdnsAnnouncer announces an endpoint on the local network over IPv4
@@ -58,6 +58,8 @@ type mdnsAnnouncer struct {
 	pc   net.PacketConn
 	p    *ipv4.PacketConn
 	kick chan struct{}
+	// send multicasts a packet: multicast, unless a test says otherwise.
+	send func(packet []byte)
 
 	// sendMu makes the choice of the interface and the write of one
 	// packet one step.
@@ -66,61 +68,22 @@ type mdnsAnnouncer struct {
 	mu sync.Mutex
 	// joined are the interfaces the group was joined on, by index.
 	joined map[int]net.Interface
-	// announcement and goodbye are the packets for the current
-	// addresses; nil while there is none.
+	// addrs are the addresses announced, and announcement and goodbye
+	// their packets; nil while there is none.
+	addrs                 []netip.AddrPort
 	announcement, goodbye []byte
 }
 
-// listenMDNS binds the mDNS port, sharing it with other responders on
-// the machine, and joins the group on every interface that is up,
-// multicast, and neither a tunnel nor loopback. It fails when that cannot
-// be had: the port taken without sharing, or no interface to join on.
-func listenMDNS(ctx context.Context, id irohkey.EndpointID, log *slog.Logger) (*mdnsAnnouncer, error) {
-	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
-		var serr error
-		err := c.Control(func(fd uintptr) {
-			if serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); serr != nil {
-				return
-			}
-			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-		})
-		if err != nil {
-			return err
-		}
-		return serr
-	}}
-	pc, err := lc.ListenPacket(ctx, "udp4", "0.0.0.0:5353")
-	if err != nil {
-		return nil, fmt.Errorf("mdns: listen: %w", err)
-	}
-	p := ipv4.NewPacketConn(pc)
-	_ = p.SetMulticastLoopback(true) // clients on this machine must hear it
-	_ = p.SetMulticastTTL(255)
-	m := &mdnsAnnouncer{
-		id:     id,
-		log:    log,
-		pc:     pc,
-		p:      p,
-		kick:   make(chan struct{}, 1),
-		joined: make(map[int]net.Interface),
-	}
-	if m.join() == 0 {
-		pc.Close()
-		return nil, errors.New("mdns: no multicast interface")
-	}
-	return m, nil
-}
-
-// join joins the group on every fit interface it has not joined on yet,
-// and returns on how many it is joined.
+// join joins the group on every interface whose addresses are announced
+// and that it has not joined on yet, and returns on how many it is
+// joined.
 func (m *mdnsAnnouncer) join() int {
 	all, _ := net.Interfaces()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := range all {
 		ifc := all[i]
-		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagMulticast == 0 ||
-			ifc.Flags&net.FlagPointToPoint != 0 || ifc.Flags&net.FlagLoopback != 0 {
+		if !announcesOn(ifc.Name, ifc.Flags) {
 			continue
 		}
 		if _, ok := m.joined[ifc.Index]; ok {
@@ -133,9 +96,9 @@ func (m *mdnsAnnouncer) join() int {
 	return len(m.joined)
 }
 
-// setAddrs makes addrs what is announced, and announces them anew. With
-// no address it says goodbye to what it announced before, and then
-// announces nothing.
+// setAddrs makes addrs what is announced, and announces them anew when
+// they differ from what was announced. With no address it says goodbye
+// to what it announced before, and then announces nothing.
 func (m *mdnsAnnouncer) setAddrs(addrs []netip.AddrPort) {
 	var announcement, goodbye []byte
 	if len(addrs) > 0 {
@@ -149,13 +112,20 @@ func (m *mdnsAnnouncer) setAddrs(addrs []netip.AddrPort) {
 		}
 	}
 	m.mu.Lock()
+	if slices.Equal(m.addrs, addrs) && m.addrs != nil {
+		m.mu.Unlock()
+		return
+	}
 	old := m.goodbye
+	m.addrs = slices.Clone(addrs)
 	m.announcement, m.goodbye = announcement, goodbye
 	m.mu.Unlock()
 	if announcement == nil && old != nil {
 		m.send(old)
 	}
-	m.join()
+	if m.p != nil {
+		m.join()
+	}
 	select {
 	case m.kick <- struct{}{}:
 	default:
@@ -169,8 +139,8 @@ func (m *mdnsAnnouncer) packets() (announcement, goodbye []byte) {
 	return m.announcement, m.goodbye
 }
 
-// send multicasts packet on every interface the group was joined on.
-func (m *mdnsAnnouncer) send(packet []byte) {
+// multicast sends packet on every interface the group was joined on.
+func (m *mdnsAnnouncer) multicast(packet []byte) {
 	if packet == nil {
 		return
 	}
@@ -234,53 +204,82 @@ func (m *mdnsAnnouncer) announce(ctx context.Context) {
 	}
 }
 
-// answer reads questions until the socket is closed, and answers those
-// about the endpoint's names at most once per mdnsBurst, and a browse of
-// the whole service at most once per mdnsBrowseInterval, with the whole
-// record set.
+// answer reads packets until the socket is closed, and answers those
+// mdnsShouldAnswer says to answer with the whole record set.
 func (m *mdnsAnnouncer) answer(ctx context.Context) {
 	instance, host := mdnsNames(m.id)
-	browse := strings.ToLower(mdnsService)
-	own := []string{strings.ToLower(instance), strings.ToLower(host)}
 	var lastSent time.Time
 	buf := make([]byte, 9000)
 	for {
-		n, src, err := m.pc.ReadFrom(buf)
+		n, cm, src, err := m.p.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
 				m.log.Warn("mDNS no longer answers questions; it still announces", "error", err)
 			}
 			return
 		}
-		var parser dnsmessage.Parser
-		hdr, err := parser.Start(buf[:n])
-		if err != nil || hdr.Response {
-			continue
+		var dst netip.Addr
+		if cm != nil {
+			dst, _ = netip.AddrFromSlice(cm.Dst)
+			dst = dst.Unmap()
 		}
-		questions, err := parser.AllQuestions()
-		if err != nil {
-			continue
-		}
-		wait := time.Duration(-1) // no question of ours
-		for _, q := range questions {
-			switch qname := strings.ToLower(q.Name.String()); {
-			case qname == own[0] || qname == own[1]:
-				wait = mdnsBurst
-			case qname == browse && wait < 0:
-				wait = mdnsBrowseInterval
-			}
-		}
-		if wait < 0 || time.Since(lastSent) < wait {
+		now := time.Now()
+		if ok, _ := mdnsShouldAnswer(buf[:n], dst, now, lastSent, instance, host); !ok {
 			continue
 		}
 		announcement, _ := m.packets()
 		if announcement == nil {
 			continue
 		}
-		lastSent = time.Now()
-		m.log.Debug("mDNS answering", "from", src, "question", questions[0].Name.String(), "type", questions[0].Type)
+		lastSent = now
+		m.log.Debug("mDNS answering", "from", src)
 		m.send(announcement)
 	}
+}
+
+// mdnsGroup is the address of the mDNS group.
+var mdnsGroup = netip.MustParseAddr("224.0.0.251")
+
+// mdnsShouldAnswer decides whether the answering loop answers packet,
+// which arrived for dst at now, when it last answered at lastSent, and
+// says why not. It answers only a query sent to the mDNS group (not one
+// sent to the machine's address, which anyone who reaches its port 5353
+// could send), with a question about instance or host, at most once per
+// mdnsBurst, or a browse of the whole service, at most once per
+// mdnsBrowseInterval. A response, or what cannot be parsed, is never
+// answered.
+func mdnsShouldAnswer(packet []byte, dst netip.Addr, now, lastSent time.Time, instance, host string) (bool, string) {
+	if dst != mdnsGroup {
+		return false, "not sent to the mDNS group"
+	}
+	var parser dnsmessage.Parser
+	hdr, err := parser.Start(packet)
+	if err != nil {
+		return false, "malformed header"
+	}
+	if hdr.Response {
+		return false, "a response"
+	}
+	questions, err := parser.AllQuestions()
+	if err != nil {
+		return false, "malformed questions"
+	}
+	wait := time.Duration(-1) // no question of ours
+	for _, q := range questions {
+		switch qname := q.Name.String(); {
+		case strings.EqualFold(qname, instance) || strings.EqualFold(qname, host):
+			wait = mdnsBurst
+		case strings.EqualFold(qname, mdnsService) && wait < 0:
+			wait = mdnsBrowseInterval
+		}
+	}
+	if wait < 0 {
+		return false, "no question about this endpoint"
+	}
+	if now.Sub(lastSent) < wait {
+		return false, "answered a moment ago"
+	}
+	return true, ""
 }
 
 // mdnsNames returns the instance and the host name of id: its z-base-32

@@ -1,11 +1,15 @@
 package irohnet
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -147,5 +151,113 @@ func TestMDNSPacket(t *testing.T) {
 
 	if _, err := mdnsPacket(id, nil, mdnsTTL); err == nil {
 		t.Error("a packet without an address was built")
+	}
+}
+
+// question builds an mDNS query for name and type, or a response when
+// response is set.
+func question(t *testing.T, name string, typ dnsmessage.Type, response bool) []byte {
+	t.Helper()
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: response})
+	if err := b.StartQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Question(dnsmessage.Question{Name: dnsmessage.MustNewName(name), Type: typ, Class: dnsmessage.ClassINET}); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packet
+}
+
+func TestMDNSAnswersWhatItShould(t *testing.T) {
+	id := newKey(t).Public().EndpointID()
+	instance, host := mdnsNames(id)
+	group := netip.MustParseAddr("224.0.0.251")
+	now := time.Now()
+	long := now.Add(-time.Hour)
+	other := newKey(t).Public().EndpointID()
+	otherInstance, _ := mdnsNames(other)
+
+	for _, tc := range []struct {
+		name     string
+		packet   []byte
+		dst      netip.Addr
+		lastSent time.Time
+		want     bool
+	}{
+		{"its instance", question(t, instance, dnsmessage.TypeSRV, false), group, long, true},
+		{"its host", question(t, host, dnsmessage.TypeA, false), group, long, true},
+		{"its host in capitals", question(t, strings.ToUpper(host[:10])+host[10:], dnsmessage.TypeA, false), group, long, true},
+		{"its instance, within the burst", question(t, instance, dnsmessage.TypeTXT, false), group, now.Add(-mdnsBurst / 2), false},
+		{"its instance, after the burst", question(t, instance, dnsmessage.TypeTXT, false), group, now.Add(-mdnsBurst), true},
+		{"a browse", question(t, mdnsService, dnsmessage.TypePTR, false), group, long, true},
+		{"a browse, within the second", question(t, mdnsService, dnsmessage.TypePTR, false), group, now.Add(-mdnsBrowseInterval / 2), false},
+		{"a browse, after the second", question(t, mdnsService, dnsmessage.TypePTR, false), group, now.Add(-mdnsBrowseInterval), true},
+		{"another endpoint", question(t, otherInstance, dnsmessage.TypeSRV, false), group, long, false},
+		{"another service", question(t, "_http._tcp.local.", dnsmessage.TypePTR, false), group, long, false},
+		{"a response", question(t, instance, dnsmessage.TypeSRV, true), group, long, false},
+		{"malformed", []byte{0x00, 0x01, 0x02}, group, long, false},
+		{"truncated question", question(t, instance, dnsmessage.TypeSRV, false)[:20], group, long, false},
+		{"unicast", question(t, instance, dnsmessage.TypeSRV, false), netip.MustParseAddr("192.168.1.92"), long, false},
+		{"no destination", question(t, instance, dnsmessage.TypeSRV, false), netip.Addr{}, long, false},
+	} {
+		got, why := mdnsShouldAnswer(tc.packet, tc.dst, now, tc.lastSent, instance, host)
+		if got != tc.want {
+			t.Errorf("%s: answer %v (%s), want %v", tc.name, got, why, tc.want)
+		}
+		if !got && why == "" {
+			t.Errorf("%s: not answered, and no reason given", tc.name)
+		}
+	}
+}
+
+func TestMDNSSetAddrs(t *testing.T) {
+	id := newKey(t).Public().EndpointID()
+	var sent [][]byte
+	m := &mdnsAnnouncer{
+		id:   id,
+		log:  slog.New(slog.DiscardHandler),
+		kick: make(chan struct{}, 1),
+		send: func(p []byte) { sent = append(sent, p) },
+	}
+	kicked := func() bool {
+		select {
+		case <-m.kick:
+			return true
+		default:
+			return false
+		}
+	}
+	a := addrPorts("192.168.1.50:4435", "10.0.0.2:4435")
+	b := addrPorts("192.168.1.50:4435")
+
+	m.setAddrs(a)
+	announcement, goodbye := m.packets()
+	wantA, _ := mdnsPacket(id, a, mdnsTTL)
+	byeA, _ := mdnsPacket(id, a, 0)
+	if !kicked() || !bytes.Equal(announcement, wantA) || !bytes.Equal(goodbye, byeA) || len(sent) != 0 {
+		t.Fatalf("first addresses: kicked, announcement and goodbye of them, nothing sent yet; sent %d", len(sent))
+	}
+
+	m.setAddrs(slices.Clone(a))
+	if kicked() || len(sent) != 0 {
+		t.Fatal("the same addresses again announced anew")
+	}
+
+	m.setAddrs(b)
+	announcement, _ = m.packets()
+	wantB, _ := mdnsPacket(id, b, mdnsTTL)
+	if !kicked() || !bytes.Equal(announcement, wantB) || len(sent) != 0 {
+		t.Fatal("changed addresses are not announced anew")
+	}
+
+	m.setAddrs(nil)
+	announcement, goodbye = m.packets()
+	byeB, _ := mdnsPacket(id, b, 0)
+	if announcement != nil || goodbye != nil || len(sent) != 1 || !bytes.Equal(sent[0], byeB) {
+		t.Fatalf("no addresses: want the goodbye of the last ones sent and nothing announced; sent %d", len(sent))
 	}
 }
