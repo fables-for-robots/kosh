@@ -31,7 +31,7 @@ type readStream struct {
 	closed    atomic.Bool
 }
 
-func newReadStream(r io.Reader, block bool) *readStream {
+func readNewStream(r io.Reader, block bool) *readStream {
 	return &readStream{r: r, block: block, closedCh: make(chan struct{})}
 }
 
@@ -92,7 +92,7 @@ func (f *readFakeLogs) open(_ context.Context, namespace, pod string, opts *core
 		return nil, err
 	}
 	if rc == nil {
-		rc = newReadStream(strings.NewReader(""), false)
+		rc = readNewStream(strings.NewReader(""), false)
 	}
 	if s, ok := rc.(*readStream); ok {
 		f.mu.Lock()
@@ -187,7 +187,7 @@ func readLogs(t *testing.T, e *env, ref ObjectRef, opts LogOptions) LogStream {
 	return ls
 }
 
-func int64p(n int64) *int64 { return &n }
+func readInt64p(n int64) *int64 { return &n }
 
 func TestLogsOfAPod(t *testing.T) {
 	p := readPodWith("default", "web", nil, "app", "sidecar")
@@ -200,15 +200,15 @@ func TestLogsOfAPod(t *testing.T) {
 		want []corev1.PodLogOptions
 	}{
 		{"tail", LogOptions{}, []corev1.PodLogOptions{
-			{Container: "app", Follow: true, Timestamps: true, TailLines: int64p(LogTailLines)}}},
+			{Container: "app", Follow: true, Timestamps: true, TailLines: readInt64p(LogTailLines)}}},
 		{"head", LogOptions{From: LogHead}, []corev1.PodLogOptions{
 			{Container: "app", Timestamps: true}}},
 		{"since", LogOptions{From: LogSince, Since: 5 * time.Minute}, []corev1.PodLogOptions{
-			{Container: "app", Follow: true, Timestamps: true, SinceSeconds: int64p(300)}}},
+			{Container: "app", Follow: true, Timestamps: true, SinceSeconds: readInt64p(300)}}},
 		{"previous", LogOptions{Previous: true}, []corev1.PodLogOptions{
-			{Container: "app", Previous: true, Timestamps: true, TailLines: int64p(LogTailLines)}}},
+			{Container: "app", Previous: true, Timestamps: true, TailLines: readInt64p(LogTailLines)}}},
 		{"a named container", LogOptions{Container: "sidecar"}, []corev1.PodLogOptions{
-			{Container: "sidecar", Follow: true, Timestamps: true, TailLines: int64p(LogTailLines)}}},
+			{Container: "sidecar", Follow: true, Timestamps: true, TailLines: readInt64p(LogTailLines)}}},
 		{"all containers", LogOptions{AllContainers: true, From: LogHead}, []corev1.PodLogOptions{
 			{Container: "init", Timestamps: true},
 			{Container: "app", Timestamps: true},
@@ -249,7 +249,7 @@ func TestLogsOfAPod(t *testing.T) {
 
 func TestLogLinesAreParsed(t *testing.T) {
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
-		return newReadStream(strings.NewReader(
+		return readNewStream(strings.NewReader(
 			"2026-10-13T09:00:00.123456789Z hello world\n"+
 				"no time here\n"+
 				"2026-10-13T09:00:01Z \n"+
@@ -288,7 +288,7 @@ func TestLogLinesAreParsed(t *testing.T) {
 func TestLogLongLineIsCut(t *testing.T) {
 	long := strings.Repeat("x", 1<<20)
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
-		return newReadStream(strings.NewReader(long+"\nafter\n"), false), nil
+		return readNewStream(strings.NewReader(long+"\nafter\n"), false), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
@@ -307,7 +307,7 @@ func TestLogLongLineIsCut(t *testing.T) {
 func TestLogLineCutKeepsRunesWhole(t *testing.T) {
 	long := strings.Repeat("ü", 1<<16) // two bytes each: the cut falls in one
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
-		return newReadStream(strings.NewReader(long+"\n"), false), nil
+		return readNewStream(strings.NewReader(long+"\n"), false), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
@@ -341,7 +341,7 @@ func TestLogWithoutLineFeedIsBounded(t *testing.T) {
 	const size = 8 << 20
 	src := &readEndless{size: size}
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
-		return newReadStream(src, true), nil
+		return readNewStream(src, true), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ref := ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}
@@ -377,7 +377,7 @@ func TestLogBatches(t *testing.T) {
 	pr, pw := io.Pipe()
 	defer pw.Close()
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
-		return newReadStream(pr, false), nil
+		return readNewStream(pr, false), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
@@ -420,7 +420,7 @@ func TestLogHeadEnds(t *testing.T) {
 	}
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
 		// It does not end by itself.
-		return newReadStream(strings.NewReader(text.String()), true), nil
+		return readNewStream(strings.NewReader(text.String()), true), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{From: LogHead})
@@ -442,7 +442,7 @@ func readDeployment(namespace, name, app string) *appsv1.Deployment {
 
 func TestLogsOfAWorkload(t *testing.T) {
 	f := &readFakeLogs{give: func(pod, container string) (io.ReadCloser, error) {
-		return newReadStream(strings.NewReader("from "+pod+"/"+container+"\n"), false), nil
+		return readNewStream(strings.NewReader("from "+pod+"/"+container+"\n"), false), nil
 	}}
 	e := readLogEnv(t, f,
 		readDeployment("default", "web", "web"),
@@ -502,7 +502,7 @@ func TestLogContainerThatCannotBeOpened(t *testing.T) {
 		if container == "a" {
 			return nil, errors.New(`container "a" in pod "web" is waiting to start: ContainerCreating`)
 		}
-		return newReadStream(strings.NewReader("hello from b\n"), false), nil
+		return readNewStream(strings.NewReader("hello from b\n"), false), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "a", "b"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{AllContainers: true})
@@ -546,7 +546,7 @@ func (r *readBreaking) Read(p []byte) (int, error) {
 func TestLogStreamBreaks(t *testing.T) {
 	broken := errors.New("connection reset by peer")
 	f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
-		return newReadStream(&readBreaking{text: "one\ntwo\n", err: broken}, false), nil
+		return readNewStream(&readBreaking{text: "one\ntwo\n", err: broken}, false), nil
 	}}
 	e := readLogEnv(t, f, readPodWith("default", "web", nil, "app"))
 	ls := readLogs(t, e, ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}, LogOptions{})
@@ -564,7 +564,7 @@ func TestLogClose(t *testing.T) {
 		t.Run(how, func(t *testing.T) {
 			f := &readFakeLogs{give: func(_, _ string) (io.ReadCloser, error) {
 				pr, _ := io.Pipe() // nothing is ever written
-				return newReadStream(pr, false), nil
+				return readNewStream(pr, false), nil
 			}}
 			e := readLogEnv(t, f, readPodWith("default", "web", nil, "a", "b"))
 			before := runtime.NumGoroutine()
