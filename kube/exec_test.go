@@ -1247,13 +1247,15 @@ func TestExecLog(t *testing.T) {
 			} else {
 				f.end()
 			}
-			receive(t, "Exec returns", done)
-			_, end := execRecords(t, f)
-			if by == "the caller" {
-				wantAttrs(t, end, map[string]string{"started": "true", "error": "context canceled"}, "status", "ended")
-			} else {
-				wantAttrs(t, end, map[string]string{"started": "true", "ended": "the session ended"}, "status", "error")
+			out := receive(t, "Exec returns", done)
+			// What Exec returns tells the two apart; the log does not:
+			// in kosh the caller's context is the session's turn, which
+			// ends only with the session.
+			if ended := errors.Is(out.err, errSessionEnded); !errors.Is(out.err, context.Canceled) || ended != (by == "the session") {
+				t.Errorf("Exec returned %v", out.err)
 			}
+			_, end := execRecords(t, f)
+			wantAttrs(t, end, map[string]string{"started": "true", "ended": "the session ended"}, "status", "error")
 		})
 	}
 

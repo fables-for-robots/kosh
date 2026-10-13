@@ -415,6 +415,9 @@ type Actions interface {
 	// the API's own error when it refused (not found, forbidden: the
 	// ServiceAccount needs get and create on pods/exec); and the
 	// context's when ctx or the session ended first.
+	//
+	// ctx is the session's turn, whose end is the session's end: a
+	// command that ctx ended is logged as one the session ended.
 	Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error)
 }
 

@@ -42,6 +42,12 @@ const (
 // terminal is logged. A call that the checks refuse is logged once, as
 // the action's failure.
 //
+// The ctx Exec is given is its session's turn, which ends only when the
+// session does: an end of the stream by ctx is logged as
+// ended="the session ended", as an end by the session's own context
+// is. What Exec returns still tells them apart: the context's error,
+// with the session's end as its cause when it was that.
+//
 // When ctx or the session ends, the stream is closed at once, and Exec
 // returns as soon as a write to opts.Stdout that is under way has
 // returned: it waits for that write, so that nothing of the command's
@@ -68,28 +74,28 @@ func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (Ex
 	if err == nil {
 		attrs = append(attrs, slog.Int("status", res.Status))
 	}
-	s.logAction(ctx, actExec, pod, nil, append(attrs, execLogged(err)...)...)
+	s.logAction(ctx, actExec, pod, nil, append(attrs, execLogged(err, ctx.Err() != nil)...)...)
 	return res, err
 }
 
 // execLogged is how the end of an Exec logs its error, in words that
 // hold nothing of the error's text, which may be a webhook's or the
-// runtime's and quote the command: the session's end as
-// ended="the session ended"; ErrExecNotStarted as itself, without the
-// runtime's reason; the caller's context's end as its error; an API
-// error as its reason and code; any other as "exec failed".
-func execLogged(err error) []slog.Attr {
+// runtime's and quote the command. An end by the context (byContext:
+// the action's context was done, and err is the context's) is
+// ended="the session ended", whether the caller's context or the
+// session's own ended first: in kosh the caller is a session's turn,
+// whose context ends with the session, and whoever revokes a key looks
+// for this line. ErrExecNotStarted is logged as itself, without the
+// runtime's reason; an API error as its reason and code; any other as
+// "exec failed".
+func execLogged(err error, byContext bool) []slog.Attr {
 	switch {
 	case err == nil:
 		return nil
-	case errors.Is(err, errSessionEnded):
-		return []slog.Attr{slog.String("ended", "the session ended")}
 	case errors.Is(err, ErrExecNotStarted):
 		return []slog.Attr{slog.String("error", ErrExecNotStarted.Error())}
-	case errors.Is(err, context.Canceled):
-		return []slog.Attr{slog.String("error", context.Canceled.Error())}
-	case errors.Is(err, context.DeadlineExceeded):
-		return []slog.Attr{slog.String("error", context.DeadlineExceeded.Error())}
+	case byContext && (errors.Is(err, errSessionEnded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
+		return []slog.Attr{slog.String("ended", "the session ended")}
 	}
 	return []slog.Attr{slog.String("error", loggableError(actExec, err).Error())}
 }
