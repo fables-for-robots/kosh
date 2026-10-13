@@ -79,9 +79,8 @@
           # The one program. Without cgo it is linked statically on Linux,
           # and runs in an image that has no libc.
           #
-          # gonixgo asks `go list` while Nix evaluates which packages
-          # cmd/kosh is made of, without build tags: cli/pin.go, which is
-          # built only with the tag pin, is not among them.
+          # gonixgo resolves the packages cmd/kosh is made of, asking
+          # `go list` while Nix evaluates.
           kosh = goEnv.buildGoApplication {
             pname = "kosh";
             src = ./.;
