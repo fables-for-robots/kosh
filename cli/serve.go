@@ -46,6 +46,9 @@ type serveOptions struct {
 	irohLocal bool
 	// idleStop is kube.Options.IdleStop. Zero means its default.
 	idleStop time.Duration
+	// wrapTCP, when it is set, is given the TCP listener and returns
+	// the listener the SSH server is given in its place.
+	wrapTCP func(net.Listener) net.Listener
 	// started, when it is set, is called once kosh serves, with what it
 	// serves on.
 	started func(serving)
@@ -233,7 +236,11 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		if err != nil {
 			return fmt.Errorf("kosh serve: the SSH port could not be bound: %w", err)
 		}
-		r.serve(r.tcp, "tcp")
+		l := r.tcp
+		if o.wrapTCP != nil {
+			l = o.wrapTCP(l)
+		}
+		r.serve(l, "tcp")
 	}
 
 	if o.iroh {

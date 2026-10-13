@@ -677,3 +677,66 @@ func TestServeFailsWhenIrohCannotBind(t *testing.T) {
 	failsLeavingNothing(t, o, "kosh serve: the iroh endpoint could not be bound")
 	portIsFree(t, o.sshListen)
 }
+
+// failingListener is a listener whose Accept fails, once it is told to,
+// with an error that is not temporary.
+type failingListener struct {
+	net.Listener
+	fail chan struct{}
+}
+
+var errAcceptBroke = errors.New("the listener broke")
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		c, err := l.Listener.Accept()
+		got <- result{c, err}
+	}()
+	select {
+	case r := <-got:
+		return r.c, r.err
+	case <-l.fail:
+		return nil, errAcceptBroke
+	}
+}
+
+// A listener that fails ends serve with its error, and everything is
+// stopped as for a stop that was asked for.
+func TestServeListenerFails(t *testing.T) {
+	cfg := startAPIServer(t)
+	alice := newUser(t, "alice", false)
+	o := envOptions(t, cfg, alice)
+	fl := &failingListener{fail: make(chan struct{})}
+	o.wrapTCP = func(l net.Listener) net.Listener {
+		fl.Listener = l
+		return fl
+	}
+	k := startKosh(t, o)
+	c := dialTCP(t, k, alice)
+	c.waitFor(t, "Pods(default)")
+
+	close(fl.fail)
+	select {
+	case err := <-k.done:
+		if !errors.Is(err, errAcceptBroke) || !strings.HasPrefix(err.Error(), "kosh serve: ") {
+			t.Errorf("serve returned %v, want the listener's error", err)
+		}
+	case <-time.After(stopTimeout):
+		t.Fatalf("serve has not returned %v after its listener failed", stopTimeout)
+	}
+	k.done <- nil // for the cleanup
+	if err := c.ended(t, time.Second); err == nil {
+		t.Error("the session ended with status 0")
+	}
+	if text := c.screen.text(); !strings.Contains(text, "kosh is shutting down") {
+		t.Errorf("the session was not told:\n%s", text)
+	}
+	if _, ok := k.log.find("kosh has stopped"); !ok {
+		t.Errorf("no line kosh has stopped:\n%s", k.log.dump())
+	}
+}
