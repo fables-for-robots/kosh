@@ -1,8 +1,42 @@
 package tui
 
 import (
+	"fmt"
+	"slices"
+
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/fables-for-robots/kosh/kube"
 )
+
+// tableKeys are the keys a table handles itself, and the root's keys
+// besides, which a table never sees. A binding may not take one of them
+// (checkBindings).
+var tableKeys = []string{
+	"up", "k", "down", "j", "pgup", "ctrl+b", "pgdown", "ctrl+f",
+	"g", "home", "G", "end", "left", "right",
+	"N", "A", "S", "O", "ctrl+w", "ctrl+z",
+	"space", "ctrl+space", "ctrl+\\",
+	"esc", "ctrl+r", "enter", "J",
+	"0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+	// The root's.
+	":", "/", "?", "ctrl+a", "ctrl+e", "[", "]", "-", "ctrl+c",
+}
+
+// checkBindings returns an error naming every binding of bs whose key is
+// one the table handles itself: such a binding would never run.
+func checkBindings(bs []binding) error {
+	var taken []string
+	for _, b := range bs {
+		if slices.Contains(tableKeys, b.Key) {
+			taken = append(taken, fmt.Sprintf("%q (%s)", b.Key, b.Hint.Text))
+		}
+	}
+	if len(taken) > 0 {
+		return fmt.Errorf("bindings of keys the table handles itself: %v", taken)
+	}
+	return nil
+}
 
 // key handles a key press: the table's own keys first, then the keys
 // other parts bind.
@@ -54,8 +88,49 @@ func (v *tableView) key(k tea.KeyPressMsg) tea.Cmd {
 		return popView()
 	case "ctrl+r":
 		return v.readNow()
+	case "enter":
+		return v.enter()
+	case "J":
+		return v.owner()
+	case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		return v.useShortcut(int(k.String()[0] - '0'))
+	default:
+		return v.runBinding(k.String())
 	}
 	return nil
+}
+
+// runBinding runs the binding of key, when the table has one, with the
+// marked rows that are shown, or with the cursor's row when none of them
+// is. A table without rows runs nothing.
+func (v *tableView) runBinding(key string) tea.Cmd {
+	b, ok := v.bindingOf(key)
+	if !ok || len(v.shown) == 0 {
+		return nil
+	}
+	var refs []kube.ObjectRef
+	for _, i := range v.shown {
+		if r := &v.data.rows[i]; v.marks[r.key] {
+			refs = append(refs, v.ref(r))
+		}
+	}
+	if len(refs) == 0 {
+		refs = []kube.ObjectRef{v.ref(&v.data.rows[v.shown[v.cursor]])}
+	}
+	return b.Run(v.e, v.q, refs)
+}
+
+// bindingOf returns the table's binding of key.
+func (v *tableView) bindingOf(key string) (binding, bool) {
+	if v.plain {
+		return binding{}, false
+	}
+	for _, b := range bindingsFor(v.q.Resource, v.grant) {
+		if b.Key == key && b.Run != nil {
+			return b, true
+		}
+	}
+	return binding{}, false
 }
 
 // toggleMark marks the cursor's row, or unmarks it.
@@ -115,6 +190,14 @@ func (v *tableView) Hints() []hint {
 		hint{"/", "Filter"},
 		hint{"space", "Mark"},
 	)
+	if !v.plain {
+		hs = append(hs, hint{"shift-j", "Owner"})
+	}
 	hs = append(hs, hint{"?", "Help"})
+	if !v.plain {
+		for _, b := range bindingsFor(v.q.Resource, v.grant) {
+			hs = append(hs, b.Hint)
+		}
+	}
 	return hs
 }

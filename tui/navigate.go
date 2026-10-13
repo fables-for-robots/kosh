@@ -146,3 +146,148 @@ func (r *root) resolved(msg resolvedMsg) tea.Cmd {
 	}
 	return tea.Batch(append(cmds, r.replace(newTableView(r.e, q, "")))...)
 }
+
+// ref returns the reference of a row: of the table's resource, in the
+// row's namespace, or for a container the pod's.
+func (v *tableView) ref(r *trow) kube.ObjectRef {
+	ref := kube.ObjectRef{Resource: v.q.Resource, Namespace: r.Namespace, Name: r.Name}
+	if v.q.Resource.Is(kube.Containers.GVR.Group, kube.Containers.GVR.Resource) && v.q.Of != nil {
+		ref.Namespace = v.q.Of.Namespace
+	}
+	return ref
+}
+
+// cursorRow returns the row under the cursor, or nil.
+func (v *tableView) cursorRow() *trow {
+	if len(v.shown) == 0 {
+		return nil
+	}
+	return &v.data.rows[v.shown[v.cursor]]
+}
+
+// enter goes into the cursor's row: to the rows that belong to it, to
+// the pods of a namespace, to the objects of a custom resource, or runs
+// its binding of l (a container) or d (anything else).
+func (v *tableView) enter() tea.Cmd {
+	r := v.cursorRow()
+	if r == nil || v.plain {
+		return nil
+	}
+	ref := v.ref(r)
+	res := v.q.Resource
+	isAny := func(group string, names ...string) bool {
+		return slices.ContainsFunc(names, func(n string) bool { return res.Is(group, n) })
+	}
+	switch {
+	case isAny("apps", "deployments", "replicasets", "statefulsets", "daemonsets"),
+		isAny("batch", "jobs"), isAny("", "services", "nodes"):
+		return v.openOf("pods", ref)
+	case isAny("batch", "cronjobs"):
+		return v.openOf("jobs", ref)
+	case isAny("", "pods"):
+		return pushView(newTableView(v.e, kube.Query{Resource: kube.Containers, Of: &ref}, ""))
+	case isAny("rbac.authorization.k8s.io", "roles", "clusterroles", "rolebindings", "clusterrolebindings"):
+		return pushView(newTableView(v.e, kube.Query{Resource: kube.Rules, Of: &ref}, ""))
+	case isAny("", "namespaces"):
+		return func() tea.Msg { return commandMsg{text: "pods " + r.Name} }
+	case isAny("apiextensions.k8s.io", "customresourcedefinitions"):
+		return v.openResource(r.Name, v.ns.current)
+	case isAny(kube.Containers.GVR.Group, kube.Containers.GVR.Resource):
+		return v.runBindingOn("l", ref)
+	}
+	return v.runBindingOn("d", ref)
+}
+
+// runBindingOn runs the binding of key with ref, when there is one.
+func (v *tableView) runBindingOn(key string, ref kube.ObjectRef) tea.Cmd {
+	if b, ok := v.bindingOf(key); ok {
+		return b.Run(v.e, v.q, []kube.ObjectRef{ref})
+	}
+	return nil
+}
+
+// openOf resolves name and pushes the table of its rows of ref, in a
+// command.
+func (v *tableView) openOf(name string, ref kube.ObjectRef) tea.Cmd {
+	e := v.e
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		res, err := e.sess.Resolve(ctx, name)
+		if err != nil {
+			return flashMsg{text: err.Error(), err: true}
+		}
+		return pushViewMsg{newTableView(e, kube.Query{Resource: res, Of: &ref}, "")}
+	}
+}
+
+// openResource resolves name and pushes the table of that resource in
+// the namespace ns, in a command.
+func (v *tableView) openResource(name, ns string) tea.Cmd {
+	e := v.e
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		res, err := e.sess.Resolve(ctx, name)
+		if err != nil {
+			return flashMsg{text: err.Error(), err: true}
+		}
+		q := kube.Query{Resource: res}
+		if res.Namespaced {
+			q.Namespace = ns
+		}
+		return pushViewMsg{newTableView(e, q, "")}
+	}
+}
+
+// owner pushes the table of the owner of the cursor's row, with the
+// cursor on the owner, in a command. An object without an owner is said
+// in the flash.
+func (v *tableView) owner() tea.Cmd {
+	r := v.cursorRow()
+	if r == nil || v.plain {
+		return nil
+	}
+	e, ref := v.e, v.ref(r)
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		owner, err := e.sess.Owner(ctx, ref)
+		if errors.Is(err, kube.ErrNoOwner) {
+			return flashMsg{text: ref.String() + " has no owner"}
+		}
+		if err != nil {
+			return flashMsg{text: err.Error(), err: true}
+		}
+		q := kube.Query{Resource: owner.Resource}
+		if owner.Resource.Namespaced {
+			q.Namespace = owner.Namespace
+		}
+		return pushViewMsg{newTableView(e, q, owner.Name)}
+	}
+}
+
+// useShortcut switches the table to the namespace of shortcut i, and
+// makes it the session's: it closes the watch and opens the one of the
+// new namespace.
+func (v *tableView) useShortcut(i int) tea.Cmd {
+	if !v.hasShortcuts() || i >= len(v.ns.shortcuts) {
+		return nil
+	}
+	ns := v.ns.shortcuts[i]
+	if v.stop != nil {
+		close(v.stop)
+		v.stop = nil
+	}
+	if v.box != nil {
+		v.box.close()
+	}
+	v.q.Namespace = ns
+	v.watch, v.openErr = nil, ""
+	v.data, v.read, v.hadRows = ttable{}, false, false
+	v.prev, v.fresh = nil, map[rowKey]fresh{}
+	v.marks, v.lastMark = map[rowKey]bool{}, nil
+	v.cursor, v.cursorKey, v.top = 0, nil, 0
+	v.rebuild()
+	return tea.Batch(v.openWatch(), func() tea.Msg { return useNamespaceMsg{ns} })
+}
