@@ -94,6 +94,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 		sess.end(MsgCrashed)
 	}
 	var m tea.Model
+	started := false
 	if sess.ending() == "" {
 		m = makeModel(func() tea.Model {
 			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote})
@@ -107,7 +108,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			tea.WithoutSignalHandler(),
 		)
 		p := tea.NewProgram(m, opts...)
-		if sess.start(p) {
+		if started = sess.start(p); started {
 			s.mu.Lock()
 			s.running++
 			s.mu.Unlock()
@@ -130,8 +131,12 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 		}
 	}
 
-	// The program has stopped and given the terminal back.
+	// The program has stopped and given the terminal back, or there was
+	// none.
 	defer sess.stopTimer()
+	if !started {
+		log.Info("session refused", "reason", sess.ending())
+	}
 	if reason := sess.ending(); reason != "" {
 		_, _ = io.WriteString(ss, reason+"\n")
 		_ = ss.Exit(1)

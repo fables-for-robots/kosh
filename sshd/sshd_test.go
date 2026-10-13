@@ -2,10 +2,12 @@ package sshd
 
 import (
 	"errors"
+	"log/slog"
 	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"golang.org/x/crypto/ssh"
@@ -20,8 +22,13 @@ func TestNewValidates(t *testing.T) {
 		Keys:       keys.NewList(nil),
 		Model:      func(Session) tea.Model { return testModel{} },
 	}
-	if _, err := New(good); err != nil {
+	s, err := New(good)
+	if err != nil {
 		t.Fatalf("a good config: %v", err)
+	}
+	if c := s.cfg; c.HandshakeTimeout != 30*time.Second || c.MaxHandshakes != 64 || c.KeepaliveInterval != 30*time.Second ||
+		c.KeepaliveMisses != 3 || c.IdleConnection != 5*time.Second || c.Log != slog.Default() {
+		t.Errorf("zero limits are not the defaults: %+v", c)
 	}
 	for name, change := range map[string]func(*Config){
 		"a host key that does not parse": func(c *Config) {
@@ -46,6 +53,11 @@ func TestAcceptedKeyGetsTheProgram(t *testing.T) {
 	tm.waitFor(testWord)
 	if n := h.srv.Sessions(); n != 1 {
 		t.Errorf("Sessions() = %d with one program running, want 1", n)
+	}
+	rec := h.log.waitFor(t, "of the start of the session", func(r logRecord) bool { return r.Msg == "session start" })
+	if rec.Attrs["key"] != "alice" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(key.PublicKey()) ||
+		rec.Attrs["read_only"] != "false" || rec.Attrs["transport"] != "tcp" || rec.Attrs["remote"] == "" {
+		t.Errorf("the start of the session is logged as %v", rec)
 	}
 	tm.press("q")
 	if st := tm.exit(); st != 0 {

@@ -13,7 +13,8 @@ import (
 
 func timeAfterWait() <-chan time.Time { return time.After(waitTime) }
 
-// done reports whether s's context is done, waiting for it.
+// contextEnds waits for s's context to be done, and fails the test when
+// it is not.
 func contextEnds(t *testing.T, s Session, what string) {
 	t.Helper()
 	select {
@@ -153,6 +154,10 @@ func TestKeyRemovedBetweenHandshakeAndSession(t *testing.T) {
 	if h.models.Load() != 0 {
 		t.Error("a model was made")
 	}
+	fp := ssh.FingerprintSHA256(alice.PublicKey())
+	h.log.waitFor(t, "of the refused session", func(r logRecord) bool {
+		return r.Msg == "session refused" && r.Attrs["reason"] == MsgKeyRemoved && r.Attrs["fingerprint"] == fp
+	})
 }
 
 // countingConn counts the bytes read from it.
