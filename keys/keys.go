@@ -12,11 +12,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -181,6 +185,14 @@ type List struct {
 	mu       sync.Mutex
 	set      *Set
 	onChange []func()
+
+	// What Open gives Watch: the file, the log, and the hash of the
+	// content the set was read from. They do not change after Open.
+	path string
+	log  *slog.Logger
+	sum  [sha256.Size]byte
+
+	reads atomic.Uint64 // the readings Watch has done, for the tests
 }
 
 type noCopy struct{}
@@ -195,7 +207,29 @@ func NewList(set *Set) *List {
 // be read is an error; rejected lines are logged and are none. A file
 // without a key is accepted, with a warning in the log.
 func Open(path string, log *slog.Logger) (*List, error) {
-	panic("not implemented")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// The error of os.ReadFile names the path.
+		return nil, fmt.Errorf("reading the key list: %w", err)
+	}
+	l := NewList(parseLogged(path, data, log, "key list read"))
+	l.path, l.log, l.sum = path, log, sha256.Sum256(data)
+	return l, nil
+}
+
+// parseLogged parses data, the content of the file at path, and logs
+// what Open and Watch log of it: each rejected line, a list of no key,
+// and msg with the counts.
+func parseLogged(path string, data []byte, log *slog.Logger, msg string) *Set {
+	set, rejected := Parse(bytes.NewReader(data))
+	for _, r := range rejected {
+		log.Warn("key list: a line is rejected and gives no access", "path", path, "line", r.Line, "reason", r.Reason)
+	}
+	if set.Len() == 0 {
+		log.Warn("key list holds no key: nobody is accepted", "path", path)
+	}
+	log.Info(msg, "path", path, "keys", set.Len(), "rejected", len(rejected))
+	return set
 }
 
 // Watch reads the file Open was given again every interval until ctx is
@@ -203,7 +237,33 @@ func Open(path string, log *slog.Logger) (*List, error) {
 // that cannot be read then is an empty set, until it can be read again.
 // Watch returns when ctx is done. It is for a list that Open returned.
 func (l *List) Watch(ctx context.Context, interval time.Duration) {
-	panic("not implemented")
+	if l.path == "" {
+		return
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	last, readable := l.sum, true
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		// By its name each time: a ConfigMap changes by a symbolic link
+		// that is swapped, and the file read last is then another one.
+		data, err := os.ReadFile(l.path)
+		if err != nil {
+			if readable {
+				readable = false
+				l.log.Error("key list cannot be read: nobody is accepted until it can", "path", l.path, "err", err)
+				l.Replace(&Set{})
+			}
+		} else if sum := sha256.Sum256(data); !readable || sum != last {
+			readable, last = true, sum
+			l.Replace(parseLogged(l.path, data, l.log, "key list changed"))
+		}
+		l.reads.Add(1)
+	}
 }
 
 // Lookup returns the grant of key in the current set.
