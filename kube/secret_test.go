@@ -26,13 +26,14 @@ func TestSecretData(t *testing.T) {
 	ctx := context.Background()
 
 	ro := readSessionOf(t, e, readOnlyGrant)
-	for _, ref := range []ObjectRef{
-		{Resource: secrets, Namespace: "default", Name: "full"},
-		{Resource: e.resource(t, "", "configmaps"), Namespace: "default", Name: "settings"},
-	} {
-		if _, err := ro.SecretData(ctx, ref); !errors.Is(err, ErrReadOnly) {
-			t.Errorf("read-only, %s: got %v, want ErrReadOnly", ref, err)
-		}
+	if _, err := ro.SecretData(ctx, ObjectRef{Resource: secrets, Namespace: "default", Name: "full"}); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("read-only, a Secret: got %v, want ErrReadOnly", err)
+	}
+	// A ConfigMap is no Secret, whatever the grant: an error, but not a
+	// refusal of the grant, which TestReadOnlyRefusalsAreLogged logs.
+	cm := ObjectRef{Resource: e.resource(t, "", "configmaps"), Namespace: "default", Name: "settings"}
+	if _, err := ro.SecretData(ctx, cm); err == nil || errors.Is(err, ErrReadOnly) {
+		t.Errorf("read-only, a ConfigMap: got %v, want that it is not a Secret", err)
 	}
 	if aa := append(readActionsOn(e, "secrets"), readActionsOn(e, "configmaps")...); len(aa) != 0 {
 		t.Errorf("read-only: something was read: %v", aa)

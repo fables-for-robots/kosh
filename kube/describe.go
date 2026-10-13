@@ -28,14 +28,14 @@ var errNoConfig = errors.New("describe needs a connection to the API server, and
 // Describe returns what kubectl describe prints of the object, events
 // included: kubectl's describer of its kind, or for a kind that has
 // none, the generic describer. A Secret is refused to a read-only grant
-// before anything is read. The describers take no context: each of
+// before anything is read, and the refusal is logged. The describers take no context: each of
 // their requests, not the describe as a whole, is bounded as
 // describeConfig says.
 func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
 	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}
-	if err := s.maySee(ref); err != nil {
+	if err := s.mayRead(ctx, readDescribe, ref); err != nil {
 		return "", err
 	}
 	if s.c.cfg == nil {

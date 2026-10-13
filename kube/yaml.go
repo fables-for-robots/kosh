@@ -14,12 +14,12 @@ import (
 // YAML reads the object with the dynamic client now and returns it as
 // YAML, with its resourceVersion, which Update needs, and without
 // managedFields unless they are asked for. A Secret is refused to a
-// read-only grant before anything is read.
+// read-only grant before anything is read, and the refusal is logged.
 func (s *session) YAML(ctx context.Context, ref ObjectRef, managedFields bool) (string, error) {
 	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}
-	if err := s.maySee(ref); err != nil {
+	if err := s.mayRead(ctx, readYAML, ref); err != nil {
 		return "", err
 	}
 	o, err := s.c.dyn.Resource(ref.Resource.GVR).Namespace(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})

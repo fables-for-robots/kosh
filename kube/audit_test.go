@@ -647,3 +647,82 @@ func TestAPIWarningsOfAClient(t *testing.T) {
 	}
 	auditNoMarker(t, &actionFixture{log: log})
 }
+
+func TestReadOnlyRefusalsAreLogged(t *testing.T) {
+	secret := &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "token"},
+		Data:       map[string][]byte{"token": []byte(auditMarker)},
+	}
+	ctx := context.Background()
+	reads := []struct {
+		word string
+		call func(s *session, ref ObjectRef) error
+	}{
+		{"yaml", func(s *session, ref ObjectRef) error { _, err := s.YAML(ctx, ref, true); return err }},
+		{"describe", func(s *session, ref ObjectRef) error { _, err := s.Describe(ctx, ref); return err }},
+		{"secret-data", func(s *session, ref ObjectRef) error { _, err := s.SecretData(ctx, ref); return err }},
+	}
+
+	t.Run("read-only, a Secret", func(t *testing.T) {
+		f := actionEnv(t, readOnlyGrant, nil, secret, readConfigMap())
+		ref := f.ref(t, "", "secrets", "default", "token")
+		for _, r := range reads {
+			f.log.reset()
+			if err := r.call(f.s, ref); !errors.Is(err, ErrReadOnly) {
+				t.Errorf("%s: %v, want ErrReadOnly", r.word, err)
+			}
+			recs, all := f.log.with("refused"), f.log.all()
+			if len(recs) != 1 || len(all) != 1 {
+				t.Errorf("%s: records %+v, want one refusal", r.word, all)
+				continue
+			}
+			if recs[0].Level != slog.LevelWarn {
+				t.Errorf("%s: level %v, want warn", r.word, recs[0].Level)
+			}
+			want := map[string]string{
+				"key":         readOnlyGrant.Name,
+				"fingerprint": readOnlyGrant.Fingerprint,
+				"action":      r.word,
+				"object":      "secrets/default/token",
+			}
+			for k, v := range want {
+				if got, ok := recs[0].attr(k); !ok || got != v {
+					t.Errorf("%s: %s = %q, want %q", r.word, k, got, v)
+				}
+			}
+			auditNoMarker(t, f)
+		}
+		if aa := readActionsOn(f.env, "secrets"); len(aa) != 0 {
+			t.Errorf("the Secret was read: %v", aa)
+		}
+	})
+
+	t.Run("read-only, a ConfigMap", func(t *testing.T) {
+		f := actionEnv(t, readOnlyGrant, nil, secret, readConfigMap())
+		ref := f.ref(t, "", "configmaps", "default", "settings")
+		for _, r := range reads {
+			f.log.reset()
+			if err := r.call(f.s, ref); errors.Is(err, ErrReadOnly) {
+				t.Errorf("%s: ErrReadOnly for a ConfigMap", r.word)
+			}
+			if all := f.log.all(); len(all) != 0 {
+				t.Errorf("%s: records %+v, want none", r.word, all)
+			}
+		}
+	})
+
+	t.Run("full, a Secret", func(t *testing.T) {
+		f := actionEnv(t, fullGrant, nil, secret, readConfigMap())
+		ref := f.ref(t, "", "secrets", "default", "token")
+		for _, r := range reads {
+			f.log.reset()
+			if err := r.call(f.s, ref); errors.Is(err, ErrReadOnly) {
+				t.Errorf("%s: ErrReadOnly for a full grant", r.word)
+			}
+			if all := f.log.all(); len(all) != 0 {
+				t.Errorf("%s: records %+v, want none", r.word, all)
+			}
+		}
+	})
+}

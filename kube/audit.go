@@ -30,19 +30,44 @@ const (
 	actDrain     = "drain"
 )
 
+// The words of the reads that the grant decides, as the log names them.
+const (
+	readYAML       = "yaml"
+	readDescribe   = "describe"
+	readSecretData = "secret-data"
+)
+
 // begin is how every action begins: a read-only grant gets ErrReadOnly,
 // and its refusal is logged at warn level.
 func (s *session) begin(ctx context.Context, action string, ref ObjectRef) error {
 	if err := s.mayChange(); err != nil {
-		s.c.log.LogAttrs(ctx, slog.LevelWarn, "refused",
-			slog.String("key", s.grant.Name),
-			slog.String("fingerprint", s.grant.Fingerprint),
-			slog.String("action", action),
-			slog.String("object", ref.String()),
-		)
+		s.logRefusal(ctx, action, ref)
 		return err
 	}
 	return nil
+}
+
+// mayRead is how every read that the grant decides begins: a read-only
+// grant gets ErrReadOnly for a Secret, as maySee says, and its refusal
+// is logged at warn level, as an action's is.
+func (s *session) mayRead(ctx context.Context, read string, ref ObjectRef) error {
+	if err := s.maySee(ref); err != nil {
+		s.logRefusal(ctx, read, ref)
+		return err
+	}
+	return nil
+}
+
+// logRefusal logs at warn level that the grant refused what to the
+// object: the key's name and fingerprint, the word of the action or
+// read, and the object. Nothing of the object itself.
+func (s *session) logRefusal(ctx context.Context, what string, ref ObjectRef) {
+	s.c.log.LogAttrs(ctx, slog.LevelWarn, "refused",
+		slog.String("key", s.grant.Name),
+		slog.String("fingerprint", s.grant.Fingerprint),
+		slog.String("action", what),
+		slog.String("object", ref.String()),
+	)
 }
 
 // logAction logs a call of an action that got past the grant, once the

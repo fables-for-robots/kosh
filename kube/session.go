@@ -26,7 +26,7 @@ func (s *session) mayChange() error {
 
 // maySee returns ErrReadOnly for a read-only grant and a Secret: a
 // reference that is one by its group and resource, or by its group and
-// kind.
+// kind. A read asks mayRead, which logs the refusal, not maySee.
 func (s *session) maySee(ref ObjectRef) error {
 	secret := ref.Resource.Is("", "secrets") || ref.Resource.GVR.Group == "" && ref.Resource.Kind == "Secret"
 	if s.grant.ReadOnly && secret {
