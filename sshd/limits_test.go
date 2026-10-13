@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,4 +190,159 @@ func TestAskingAboutAKeyDoesNotLeaveTheHandshake(t *testing.T) {
 	h.refusedByTheLimit(h.dialRaw())
 	h.closedByTheDeadline(c)
 	readBanner(t, h.dialRaw())
+}
+
+// closed returns a channel that is closed when cl's connection is.
+func closed(cl *ssh.Client) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		_ = cl.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// closedByTheServer waits for the server to close cl's connection, and
+// returns when it did.
+func closedByTheServer(t *testing.T, cl *ssh.Client, what string) time.Time {
+	t.Helper()
+	select {
+	case <-closed(cl):
+		return time.Now()
+	case <-timeAfterWait():
+		t.Fatalf("%s: the server has not closed the connection", what)
+		return time.Time{}
+	}
+}
+
+// stillOpen fails the test when cl's connection is closed within d.
+func stillOpen(t *testing.T, cl *ssh.Client, d time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-closed(cl):
+		t.Fatalf("%s: the connection was closed", what)
+	case <-time.After(d):
+	}
+}
+
+func TestConnectionWithoutASessionIsClosed(t *testing.T) {
+	const idle = 100 * time.Millisecond
+	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = idle }))
+	key := h.key("alice", false)
+
+	// No session at all.
+	cl := h.dial(key, "kosh")
+	connected := time.Now()
+	if d := closedByTheServer(t, cl, "a connection that opened no session").Sub(connected); d < idle/2 {
+		t.Errorf("a connection without a session was closed after %v, want about %v", d, idle)
+	}
+
+	// A session that ended.
+	cl = h.dial(key, "kosh")
+	tm := openTerm(t, cl)
+	tm.waitFor(testWord)
+	tm.press("q")
+	tm.exit()
+	ended := time.Now()
+	if d := closedByTheServer(t, cl, "a connection whose session ended").Sub(ended); d < idle/2 {
+		t.Errorf("a connection whose session ended was closed after %v, want about %v", d, idle)
+	}
+
+	// A session that is open, however long.
+	cl = h.dial(key, "kosh")
+	tm = openTerm(t, cl)
+	tm.waitFor(testWord)
+	stillOpen(t, cl, 10*idle, "a connection with an open session")
+	tm.press("q")
+	tm.exit()
+
+	// A second session, opened soon after the first ended.
+	cl = h.dial(key, "kosh")
+	tm = openTerm(t, cl)
+	tm.waitFor(testWord)
+	tm.press("q")
+	tm.exit()
+	tm = openTerm(t, cl)
+	tm.waitFor(testWord)
+	stillOpen(t, cl, 3*idle, "a connection whose second session is open")
+	tm.press("q")
+	if st := tm.exit(); st != 0 {
+		t.Errorf("the second session: exit status %d", st)
+	}
+}
+
+// deafConn swallows what the server sends once deaf is set: the client
+// sees no keepalive, and answers none.
+type deafConn struct {
+	net.Conn
+	deaf atomic.Bool
+}
+
+func (c *deafConn) Read(p []byte) (int, error) {
+	for {
+		n, err := c.Conn.Read(p)
+		if err != nil || !c.deaf.Load() {
+			return n, err
+		}
+	}
+}
+
+func keepaliveFast(c *Config) {
+	c.KeepaliveInterval = 20 * time.Millisecond
+	c.KeepaliveMisses = 3
+}
+
+func TestKeepaliveClosesADeadPeer(t *testing.T) {
+	h := newHarness(t, withConfig(keepaliveFast))
+	key := h.key("alice", false)
+	dc := &deafConn{Conn: h.dialRaw()}
+	cl, err := connect(dc, h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	tm := openTerm(t, cl)
+	tm.waitFor(testWord)
+	s := h.nextSession()
+
+	dc.deaf.Store(true)
+	closedByTheServer(t, cl, "a peer that stopped answering")
+	contextEnds(t, s, "after the keepalive closed the connection")
+	eventually(t, "Sessions() to be 0", func() bool { return h.srv.Sessions() == 0 })
+}
+
+func TestKeepaliveLeavesALivePeer(t *testing.T) {
+	h := newHarness(t, withConfig(keepaliveFast))
+	key := h.key("alice", false)
+	sc, chans, reqs, err := ssh.NewClientConn(h.dialRaw(), h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The client answers every request as x/crypto's does by itself,
+	// and counts the keepalives.
+	var keepalives atomic.Int32
+	go func() {
+		for r := range reqs {
+			if r.Type == "keepalive@openssh.com" {
+				keepalives.Add(1)
+			}
+			_ = r.Reply(false, nil)
+		}
+	}()
+	none := make(chan *ssh.Request)
+	close(none)
+	cl := ssh.NewClient(sc, chans, none)
+	t.Cleanup(func() { _ = cl.Close() })
+
+	tm := openTerm(t, cl)
+	tm.waitFor(testWord)
+	s := h.nextSession()
+	eventually(t, "20 keepalives", func() bool { return keepalives.Load() >= 20 })
+	if tm.ended() || s.Context.Err() != nil {
+		t.Fatal("the session of a peer that answers has ended")
+	}
+	tm.press("q")
+	if st := tm.exit(); st != 0 {
+		t.Errorf("exit status %d after q", st)
+	}
 }

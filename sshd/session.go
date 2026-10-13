@@ -27,6 +27,12 @@ func (s *Server) handle(ss ssh.Session) {
 		_ = ss.Exit(1)
 		return
 	}
+	c.sessionStarted()
+	defer c.sessionEnded()
+	if sc, ok := ss.Context().Value(ssh.ContextKeyConn).(gossh.Conn); ok {
+		c.startKeepalive(ss.Context(), sc)
+	}
+
 	if ss.RawCommand() != "" {
 		s.refuse(c, ss, MsgNoCommands)
 		return

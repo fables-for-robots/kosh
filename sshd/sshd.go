@@ -79,6 +79,13 @@ type Config struct {
 	// KeepaliveMisses is how many keepalives in a row may go
 	// unanswered before the connection is closed. Zero means 3.
 	KeepaliveMisses int
+
+	// IdleConnection is how long a connection may go without a session:
+	// from the moment it authenticated, and from the end of its last
+	// session. Then it is closed. A connection that has a session is not
+	// closed by this, however long the session lasts. Zero means 5
+	// seconds.
+	IdleConnection time.Duration
 }
 
 // maxAuthTries is how many times a connection may fail to authenticate.
@@ -135,6 +142,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.KeepaliveMisses <= 0 {
 		cfg.KeepaliveMisses = 3
+	}
+	if cfg.IdleConnection <= 0 {
+		cfg.IdleConnection = 5 * time.Second
 	}
 	s := &Server{
 		cfg:        cfg,
