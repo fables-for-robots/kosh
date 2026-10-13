@@ -29,7 +29,8 @@ const (
 // PodStatus follows): the phase, overridden in turn by the pod's reason,
 // by a scheduling gate, by the first init container that has not done
 // its part, by the first container that waits or ended, and last by
-// Unknown or Terminating once the pod is being deleted. It is empty for
+// Unknown or Terminating once the pod is being deleted, Terminating only
+// while its phase is not Succeeded or Failed. It is empty for
 // a pod with no phase and nothing to override it.
 func podStatus(po *corev1.Pod) string {
 	st := &po.Status
@@ -51,12 +52,13 @@ func podStatus(po *corev1.Pod) string {
 		reason = podContainersStatus(st, reason)
 	}
 
-	// As k9s's PodStatus, Terminating whatever the phase; kubectl leaves
-	// it out for a pod that has succeeded or failed.
+	// As kubectl, and unlike k9s's PodStatus: a pod that has already
+	// succeeded or failed shows what it ended as, deleted or not.
+	terminal := st.Phase == corev1.PodSucceeded || st.Phase == corev1.PodFailed
 	switch {
 	case po.DeletionTimestamp != nil && st.Reason == podNodeLost:
 		reason = podStatusUnknown
-	case po.DeletionTimestamp != nil:
+	case po.DeletionTimestamp != nil && !terminal:
 		reason = podStatusTerminating
 	}
 	return reason

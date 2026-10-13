@@ -469,8 +469,7 @@ func podTestDeleted(po *corev1.Pod) *corev1.Pod {
 
 // The STATUS of a pod is what kubectl get pods prints for it, where that
 // is not what k9s's STATUS column shows. The expectations are kubectl's
-// (printPod in kubernetes' pkg/printers/internalversion), but for a pod
-// deleted after it ended (see the row).
+// (printPod in kubernetes' pkg/printers/internalversion).
 func TestPodStatusAsKubectl(t *testing.T) {
 	notStarted := false
 	tests := []struct {
@@ -509,17 +508,22 @@ func TestPodStatusAsKubectl(t *testing.T) {
 			health: Error,
 		},
 		{
-			// kubectl prints Completed here (it leaves out Terminating
-			// for a pod whose phase is Succeeded or Failed); k9s's
-			// PodStatus prints Terminating, and kosh follows k9s, as
-			// ruled.
 			name: "deleted after it succeeded",
 			pod: podTestDeleted(podTestPod("d", corev1.PodStatus{
 				Phase:             corev1.PodSucceeded,
 				ContainerStatuses: []corev1.ContainerStatus{podTestTerminated("app", "Completed", 0, 0)},
 			}, "app")),
-			status: "Terminating",
-			health: Pending,
+			status: "Completed",
+			health: Completed,
+		},
+		{
+			name: "deleted after it failed",
+			pod: podTestDeleted(podTestPod("d2", corev1.PodStatus{
+				Phase:             corev1.PodFailed,
+				ContainerStatuses: []corev1.ContainerStatus{podTestTerminated("app", "Error", 1, 0)},
+			}, "app")),
+			status: "Error",
+			health: Error,
 		},
 		{
 			name: "a completed container beside a running one, the pod ready",
