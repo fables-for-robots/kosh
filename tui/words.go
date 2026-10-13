@@ -20,14 +20,14 @@ const (
 // commandWords cuts text into the words of a command: the command and
 // its arguments, as the container's runtime gets them.
 //
-// The text is trimmed of spaces and tabs at its ends; words are
-// separated by spaces and tabs. '…' makes one word of what it holds, in
-// which nothing is special. "…" makes one word of what it holds, in which
-// a backslash before ", \ or $ takes that character literally and any
-// other backslash is itself. Outside quotes a backslash takes the next
-// character literally, and one at the end is itself. Quoted and unquoted
-// pieces that touch are one word: a"b c"d is "ab cd". Quotes with
-// nothing between them are an empty word.
+// Words are separated by spaces and tabs, at the ends as between words:
+// an escaped space at the end is the last word's. '…' makes one word of
+// what it holds, in which nothing is special. "…" makes one word of what
+// it holds, in which a backslash before ", \ or $ takes that character
+// literally and any other backslash is itself. Outside quotes a
+// backslash takes the next character literally, and one at the end is
+// itself. Quoted and unquoted pieces that touch are one word: a"b c"d is
+// "ab cd". Quotes with nothing between them are an empty word.
 //
 // A text with a control character in it (a line feed, a carriage return,
 // an escape, DEL or a C1 control; the tab is a space) is refused, so that
@@ -38,7 +38,6 @@ func commandWords(text string) ([]string, error) {
 	if strings.ContainsFunc(text, formControl) {
 		return nil, errors.New(commandTextControl)
 	}
-	text = strings.Trim(text, " \t")
 	var (
 		out  []string
 		word strings.Builder

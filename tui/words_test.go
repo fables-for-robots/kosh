@@ -28,6 +28,9 @@ func TestCommandWords(t *testing.T) {
 		{`a\'b`, []string{"a'b"}},
 		{`a\\b`, []string{`a\b`}},
 		{`a\`, []string{`a\`}},
+		{`a\ `, []string{"a "}},
+		{`\ a`, []string{" a"}},
+		{"  a  ", []string{"a"}},
 		{`a"b c"d`, []string{"ab cd"}},
 		{`a'b c'"d e"f`, []string{"ab cd ef"}},
 		{`''`, []string{""}},
@@ -53,6 +56,7 @@ func TestCommandWords(t *testing.T) {
 	}{
 		{``, commandTextEmpty},
 		{`   `, commandTextEmpty},
+		{` `, commandTextEmpty},
 		{"\t \t", commandTextEmpty},
 		{`"abc`, commandTextUnclosed},
 		{`'abc`, commandTextUnclosed},
