@@ -85,6 +85,9 @@ type session struct {
 	// finished is set when the session has exited: end does nothing
 	// after that.
 	finished bool
+	// cancelCommand ends the context of the command that has the
+	// terminal; it is nil when none has.
+	cancelCommand context.CancelFunc
 
 	// in is what the client sends, for whoever has the terminal. It is
 	// read from the channel from the moment the program starts.
@@ -206,8 +209,11 @@ func (sess *session) start(p *tea.Program) bool {
 // end ends the session from kosh's side: it stops the program, and when
 // the program has stopped and the terminal is back to its normal screen,
 // msg and a line feed are written to the session and it exits with
-// status 1. end does not wait for any of that. A session that has not
-// ended within srv.endTimeout has its connection closed. end reports
+// status 1. A command that has the terminal has its context ended, and
+// the program stops when the command has returned. end does not wait
+// for any of that. A session that has not ended within srv.endTimeout,
+// because its client does not read or its command does not return, has
+// its connection closed. end reports
 // whether it ended the session; a session that was ended before keeps
 // its first reason.
 func (sess *session) end(msg string) bool {
@@ -219,17 +225,63 @@ func (sess *session) end(msg string) bool {
 	sess.reason = msg
 	sess.stopped.Store(true)
 	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() {
-		sess.srv.log.Warn("session did not end in time: its connection is closed",
+		what := "session did not end in time: its connection is closed"
+		if sess.commandRuns() {
+			what = "session did not end in time, the command that has its terminal did not return: its connection is closed"
+		}
+		sess.srv.log.Warn(what,
 			"transport", sess.conn.transport, "remote", sess.conn.remote,
 			"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "reason", msg)
 		_ = sess.conn.Close()
 	})
+	if sess.cancelCommand != nil {
+		// The program takes nothing, Quit neither, until the command
+		// that has the terminal has returned.
+		sess.cancelCommand()
+	}
 	if p := sess.program; p != nil {
 		// Quit waits for the program to take it, and the program may be
 		// waiting for a client that does not read.
 		go p.Quit()
 	}
 	return true
+}
+
+// over reports whether the session has ended or is being ended: by the
+// client, by kosh, or because its program has returned.
+func (sess *session) over() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.reason != "" || sess.finished || sess.ctx.Err() != nil
+}
+
+// beginCommand makes cancel what ends the context of the command that
+// has the terminal. It reports false, and keeps nothing, when the
+// session is over: end, which would call cancel, has been and gone.
+func (sess *session) beginCommand(cancel context.CancelFunc) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.reason != "" || sess.finished || sess.ctx.Err() != nil {
+		return false
+	}
+	sess.cancelCommand = cancel
+	return true
+}
+
+// endCommand is called when the command that has the terminal has
+// returned.
+func (sess *session) endCommand() {
+	sess.mu.Lock()
+	sess.cancelCommand = nil
+	sess.mu.Unlock()
+}
+
+// commandRuns reports whether a command has the terminal and has not
+// returned.
+func (sess *session) commandRuns() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.cancelCommand != nil
 }
 
 // finish marks the session as exited, and stops the timer of end. An end

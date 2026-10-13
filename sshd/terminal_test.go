@@ -36,17 +36,18 @@ type handover struct {
 	blocked chan struct{}
 	release chan struct{}
 
-	mu     sync.Mutex
-	keys   []string        // the keys the model was given
-	pastes []string        // what was pasted
-	marks  int             // mode reports the model was given
-	sizes  int             // sizes the model was given
-	w, h   int             // the last of them
-	began  int             // calls of run
-	cmd    []byte          // what echo read
-	ended  []error         // what the model's done was told
-	begins []time.Time     // when each call of run began
-	wake   chan<- struct{} // has a value put on it whenever something above changes
+	mu      sync.Mutex
+	session Session         // what the model was made from
+	keys    []string        // the keys the model was given
+	pastes  []string        // what was pasted
+	marks   int             // mode reports the model was given
+	sizes   int             // sizes the model was given
+	w, h    int             // the last of them
+	began   int             // calls of run
+	cmd     []byte          // what echo read
+	ended   []error         // what the model's done was told
+	begins  []time.Time     // when each call of run began
+	wake    chan<- struct{} // has a value put on it whenever something above changes
 }
 
 func newHandover(run func(context.Context, Terminal) error) *handover {
@@ -112,15 +113,17 @@ type handoverModel struct {
 	w, h int
 }
 
+// command is run, counted.
+func (hv *handover) command(ctx context.Context, t Terminal) error {
+	hv.note(func() {
+		hv.began++
+		hv.begins = append(hv.begins, time.Now())
+	})
+	return hv.run(ctx, t)
+}
+
 func (m handoverModel) exec() tea.Cmd {
-	hv := m.hv
-	return m.s.Exec(func(ctx context.Context, t Terminal) error {
-		hv.note(func() {
-			hv.began++
-			hv.begins = append(hv.begins, time.Now())
-		})
-		return hv.run(ctx, t)
-	}, func(err error) tea.Msg { return handoverDone{err} })
+	return m.s.Exec(m.hv.command, func(err error) tea.Msg { return handoverDone{err} })
 }
 
 type handoverAsked struct{}
@@ -194,7 +197,10 @@ func (m handoverModel) View() tea.View {
 func handoverHarness(t *testing.T, hv *handover, opts ...option) *harness {
 	t.Helper()
 	return newHarness(t, append([]option{withConfig(func(c *Config) {
-		c.Model = func(s Session) tea.Model { return handoverModel{s: s, hv: hv} }
+		c.Model = func(s Session) tea.Model {
+			hv.note(func() { hv.session = s })
+			return handoverModel{s: s, hv: hv}
+		}
 	})}, opts...)...)
 }
 
@@ -1017,4 +1023,362 @@ func TestHandoverInTheMiddleOfAPaste(t *testing.T) {
 		t.Errorf("the command read %q, the model was given %d mode reports", hv.cmd, hv.marks)
 	}
 	t.Logf("the hand-over took %v; of the paste that did not end the model was given the keys %q and the pastes %q", took.Round(time.Millisecond), hv.keys, hv.pastes)
+}
+
+// TestOneCommandAtATime asks for the terminal twice in one update: one
+// command gets it, and the other is refused without being called.
+func TestOneCommandAtATime(t *testing.T) {
+	turns := make(chan held, 2)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+
+	tm.press("@")
+	turn := next(t, turns)
+	turn.finish <- nil
+	hv.wait(t, "the model was told of both", func() bool { return len(hv.ended) == 2 })
+	hv.mu.Lock()
+	began, ended := hv.began, append([]error(nil), hv.ended...)
+	hv.mu.Unlock()
+	if began != 1 {
+		t.Errorf("%d commands were given the terminal, want 1", began)
+	}
+	if !(ended[0] == nil && ended[1] == ErrTerminalBusy) && !(ended[0] == ErrTerminalBusy && ended[1] == nil) {
+		t.Errorf("the model was told %v, want nil for the command that ran and ErrTerminalBusy for the other", ended)
+	}
+
+	// The terminal is free again.
+	tm.press("!")
+	turn = next(t, turns)
+	turn.finish <- nil
+	hv.wait(t, "the model was told of the third", func() bool { return len(hv.ended) == 3 })
+	if hv.ended[2] != nil {
+		t.Errorf("the command after the refused one: %v", hv.ended[2])
+	}
+}
+
+// TestSessionEndsDuringACommand ends the session, in each of the ways a
+// session ends, while a command has the terminal and waits in In.Read:
+// the command's context is done at once, its Read returns io.EOF, its
+// writes fail, and the session ends as it would have without a command.
+func TestSessionEndsDuringACommand(t *testing.T) {
+	type ending struct {
+		name string
+		// end ends the session.
+		end func(t *testing.T, h *harness, cl interface{ Close() error }, tm *term)
+		// reason is the reason of the session's end in the log.
+		reason string
+		// msg is what the client is told, or "" when it cannot be told.
+		msg string
+	}
+	endings := []ending{
+		{name: "the client closes its connection",
+			end: func(_ *testing.T, _ *harness, cl interface{ Close() error }, _ *term) { _ = cl.Close() }},
+		{name: "the client closes the channel", reason: reasonChannelClosed,
+			end: func(_ *testing.T, _ *harness, _ interface{ Close() error }, tm *term) { _ = tm.sess.Close() }},
+		{name: "the key is removed", reason: MsgKeyRemoved, msg: MsgKeyRemoved,
+			end: func(t *testing.T, h *harness, _ interface{ Close() error }, _ *term) { setKeys(t, h.list) }},
+		{name: "Shutdown", reason: MsgShuttingDown, msg: MsgShuttingDown,
+			end: func(t *testing.T, h *harness, _ interface{ Close() error }, _ *term) {
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), longWait)
+					defer cancel()
+					if err := h.srv.Shutdown(ctx); err != nil {
+						t.Errorf("Shutdown: %v", err)
+					}
+				}()
+			}},
+	}
+	for _, e := range endings {
+		t.Run(e.name, func(t *testing.T) {
+			// The command, as a careless one is: it waits for its
+			// context only, with a goroutine of its own in Read.
+			type running struct {
+				ctx  context.Context
+				t    Terminal
+				read <-chan readResult
+			}
+			runs := make(chan running, 1)
+			returned := make(chan struct{})
+			hv := newHandover(func(ctx context.Context, tt Terminal) error {
+				defer close(returned)
+				runs <- running{ctx, tt, readOnce(tt.In)}
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			h := handoverHarness(t, hv)
+			cl := h.dial(h.key("ann", false), "u")
+			tm := openTerm(t, cl)
+			tm.waitFor("LASTLINE")
+			tm.press("!")
+			var run running
+			select {
+			case run = <-runs:
+			case <-time.After(longWait):
+				t.Fatal("the command was not given the terminal")
+			}
+
+			ended := time.Now()
+			e.end(t, h, cl, tm)
+			select {
+			case <-run.ctx.Done():
+				if d := time.Since(ended); d > 100*time.Millisecond {
+					t.Errorf("the command's context was done %v after the session was ended, want within 100ms", d)
+				}
+			case <-time.After(longWait):
+				t.Fatal("the command's context is not done")
+			}
+			wantRead(t, "the command's Read that was waiting", run.read, "", io.EOF)
+			select {
+			case <-returned:
+			case <-time.After(longWait):
+				t.Fatal("the command has not returned")
+			}
+			if n, err := io.WriteString(run.t.Out, "LATEWRITE"); n != 0 || err != io.ErrClosedPipe {
+				t.Errorf("a write of the command after the session's end: %d, %v; want 0, io.ErrClosedPipe", n, err)
+			}
+
+			rec := h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" })
+			// A connection that is closed closes its channels: which of
+			// the two the session saw first is the scheduler's choice,
+			// with a command and without.
+			either := e.reason == "" && rec.Attrs["reason"] == reasonChannelClosed
+			if rec.Attrs["reason"] != e.reason && !either {
+				t.Errorf("the session's end is logged with the reason %q, want %q", rec.Attrs["reason"], e.reason)
+			}
+			if e.msg != "" {
+				if status := tm.exit(); status != 1 {
+					t.Errorf("exit status %d, want 1", status)
+				}
+				out := tm.stdout.String()
+				if !strings.HasSuffix(out, e.msg+"\r\n") {
+					t.Errorf("the client was not told %q at the end; the session's last bytes are %q", e.msg, out[max(0, len(out)-100):])
+				}
+				if strings.Contains(out, "LATEWRITE") {
+					t.Error("the client received what the command wrote after the session's end")
+				}
+			}
+			if _, ok := h.log.find(func(r logRecord) bool { return strings.HasPrefix(r.Msg, "session did not end in time") }); ok {
+				t.Errorf("the session had to be cut off:\n%s", h.log.dump())
+			}
+			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+		})
+	}
+}
+
+// TestCommandThatDoesNotReturn has a command that ignores its context:
+// kosh's end of the session is not held up by it for longer than the
+// end's timeout, after which the connection is closed and the log says
+// why. The session's goroutines are there until the command returns, as
+// they are for a program that does not return.
+func TestCommandThatDoesNotReturn(t *testing.T) {
+	stuck := make(chan struct{})
+	unstick := sync.OnceFunc(func() { close(stuck) })
+	defer unstick()
+	runs := make(chan context.Context, 1)
+	hv := newHandover(func(ctx context.Context, _ Terminal) error {
+		runs <- ctx
+		<-stuck
+		return nil
+	})
+	h := handoverHarness(t, hv, withServer(func(s *Server) { s.endTimeout = 200 * time.Millisecond }))
+	cl := h.dial(h.key("ann", false), "u")
+	tm := openTerm(t, cl)
+	tm.waitFor("LASTLINE")
+	tm.press("!")
+	var ctx context.Context
+	select {
+	case ctx = <-runs:
+	case <-time.After(longWait):
+		t.Fatal("the command was not given the terminal")
+	}
+
+	setKeys(t, h.list)
+	select {
+	case <-ctx.Done():
+	case <-time.After(longWait):
+		t.Fatal("the command's context is not done")
+	}
+	rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
+		return strings.HasPrefix(r.Msg, "session did not end in time")
+	})
+	if !strings.Contains(rec.Msg, "did not return") || rec.Level.String() != "WARN" || rec.Attrs["key"] != "ann" || rec.Attrs["reason"] != MsgKeyRemoved {
+		t.Errorf("the line %v does not say that the command did not return, or whose session it was and why it was ended", rec)
+	}
+	// The connection is closed: the client's session ends without an
+	// exit status, and the connection with it.
+	closed := make(chan error, 1)
+	go func() { closed <- cl.Wait() }()
+	select {
+	case <-closed:
+	case <-time.After(longWait):
+		t.Fatal("the connection of the session that did not end is open")
+	}
+	select {
+	case err := <-tm.done:
+		if err == nil {
+			t.Error("the session ended with exit status 0")
+		}
+	case <-time.After(longWait):
+		t.Fatal("the client's session has not ended")
+	}
+
+	// When the command does return, nothing of the session is left.
+	unstick()
+	h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" && r.Attrs["reason"] == MsgKeyRemoved })
+	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+}
+
+// TestExecAfterTheEnd runs the command of a hand-over when its session
+// has ended: the model's done is told so, and run is not called.
+func TestExecAfterTheEnd(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	h, tm := startHandover(t, hv)
+	hv.mu.Lock()
+	s := hv.session
+	hv.mu.Unlock()
+	called := false
+	late := s.Exec(func(context.Context, Terminal) error {
+		called = true
+		return nil
+	}, func(err error) tea.Msg { return handoverDone{err} })
+
+	tm.press("q")
+	if status := tm.exit(); status != 0 {
+		t.Fatalf("exit status %d", status)
+	}
+	contextEnds(t, s, "after the model quit")
+	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+
+	got := make(chan tea.Msg, 1)
+	go func() { got <- late() }()
+	select {
+	case msg := <-got:
+		if done, ok := msg.(handoverDone); !ok || done.err != ErrSessionEnded {
+			t.Errorf("the command of a session that has ended returned %#v, want done's message for ErrSessionEnded", msg)
+		}
+	case <-time.After(waitTime):
+		t.Fatal("the command of a session that has ended does not return")
+	}
+	if called {
+		t.Error("run was called for a session that has ended")
+	}
+}
+
+// TestExecWhenTheSessionIsBeingEnded runs the command of a hand-over
+// when kosh has ended the session and the program has not stopped yet.
+func TestExecWhenTheSessionIsBeingEnded(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	h, tm := startHandover(t, hv)
+	hv.mu.Lock()
+	s := hv.session
+	hv.mu.Unlock()
+	late := s.Exec(hv.echo, func(err error) tea.Msg { return handoverDone{err} })
+
+	// The model is in Update when the key is removed: the program
+	// cannot stop.
+	tm.press("%")
+	select {
+	case <-hv.blocked:
+	case <-time.After(waitTime):
+		t.Fatal("the model has not been given the key")
+	}
+	setKeys(t, h.list)
+	if done, ok := late().(handoverDone); !ok || done.err != ErrSessionEnded {
+		t.Errorf("the command of a session that is being ended returned %#v, want done's message for ErrSessionEnded", done)
+	}
+	close(hv.release)
+	if status := tm.exit(); status != 1 {
+		t.Errorf("exit status %d, want 1", status)
+	}
+}
+
+// TestCommandPanics has a command panic: the session is closed as it is
+// for any panic of its program's, and the server goes on.
+func TestCommandPanics(t *testing.T) {
+	hv := newHandover(func(context.Context, Terminal) error { panic("test command: panic") })
+	h, tm := startHandover(t, hv)
+	tm.press("!")
+	if status := tm.exit(); status != 1 {
+		t.Errorf("exit status %d, want 1", status)
+	}
+	if out := tm.stdout.String(); !strings.HasSuffix(out, MsgCrashed+"\r\n") {
+		t.Errorf("the client was not told %q at the end; the session's last bytes are %q", MsgCrashed, out[max(0, len(out)-100):])
+	}
+	h.log.waitFor(t, "of the panic", func(r logRecord) bool { return r.Level.String() == "ERROR" && strings.Contains(r.Msg, "panicked") })
+	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+
+	// The terminal of another session is handed over as ever.
+	hv.note(func() { hv.run = hv.echo })
+	tm = openTerm(t, h.dial(h.key("bob", false), "u"))
+	tm.waitFor("LASTLINE")
+	tm.press("!")
+	hv.wait(t, "the command has begun", func() bool { return hv.began == 2 })
+	tm.press("A" + endMark)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+}
+
+// TestHandoverWaitsForAReaderThatIsHeldUp asks for the hand-over when
+// the program's reader has keys that the program does not take: that
+// reader cannot be told its end yet, and the hand-over waits for it
+// beyond drainWait, since a reader that has not been told its end would
+// go on reading next to the one Bubble Tea starts after the command.
+func TestHandoverWaitsForAReaderThatIsHeldUp(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	h, tm := startHandover(t, hv)
+	hv.mu.Lock()
+	s := hv.session
+	hv.mu.Unlock()
+	sess := h.onlySession()
+	release := sync.OnceFunc(func() { close(hv.release) })
+	defer release()
+
+	// Three keys in one SSH write, so in one read of the program's
+	// reader: the model is in Update with the first, the read loop waits
+	// for the program with the second, and its reader waits for the read
+	// loop.
+	tm.press("%xy")
+	select {
+	case <-hv.blocked:
+	case <-time.After(waitTime):
+		t.Fatal("the model has not been given the key")
+	}
+
+	// The command of a hand-over, run as the program would run it.
+	asked := make(chan tea.Msg, 1)
+	go func() { asked <- s.Exec(hv.command, func(err error) tea.Msg { return handoverDone{err} })() }()
+	select {
+	case msg := <-asked:
+		t.Fatalf("the hand-over went on (%T) with the program's reader not told its end", msg)
+	case <-time.After(2 * drainWait):
+	}
+
+	// The program takes its keys, the reader is told, the hand-over goes
+	// on: and after it one reader reads, in order.
+	release()
+	var msg tea.Msg
+	select {
+	case msg = <-asked:
+	case <-time.After(longWait):
+		t.Fatal("the hand-over does not go on when the program's reader could be told its end")
+	}
+	sess.mu.Lock()
+	p := sess.program
+	sess.mu.Unlock()
+	p.Send(msg)
+	hv.wait(t, "the command has begun", func() bool { return hv.began == 1 })
+	tm.press("AB" + endMark)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	typed := strings.Repeat("0123456789", 20)
+	for i := range len(typed) {
+		tm.press(typed[i : i+1])
+	}
+	hv.wait(t, "the model has every key", func() bool { return len(hv.keys) >= len("%xy")+len(typed) })
+	hv.mu.Lock()
+	defer hv.mu.Unlock()
+	if got := strings.Join(hv.keys, ""); got != "%xy"+typed || string(hv.cmd) != "AB"+endMark || hv.marks != 0 {
+		t.Errorf("the model was given %q and %d mode reports, the command %q", got, hv.marks, hv.cmd)
+	}
 }

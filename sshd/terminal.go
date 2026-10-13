@@ -25,12 +25,22 @@ import (
 
 // exec is Session.Exec.
 func (sess *session) exec(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
+	// refuse tells done why the command is not run.
+	refuse := func(err error) tea.Msg {
+		if done == nil {
+			return nil
+		}
+		return done(err)
+	}
 	return func() tea.Msg {
+		if sess.over() {
+			return refuse(ErrSessionEnded)
+		}
 		// From here on what the client sends is the command's, and the
 		// program's reader is given the mark and its end.
 		in, drained, told := sess.in.give()
 		if in == nil {
-			return done(ErrTerminalBusy)
+			return refuse(ErrTerminalBusy)
 		}
 		// The mark arrives when the model has every key that was read
 		// before the hand-over. It does not arrive when the reader was
@@ -50,6 +60,11 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 		select {
 		case <-told:
 		case <-sess.ctx.Done():
+		}
+		if sess.over() {
+			// The program takes no command now.
+			sess.in.takeBack(in)
+			return refuse(ErrSessionEnded)
 		}
 		return tea.Exec(&turn{sess: sess, run: run, in: in}, done)()
 	}
@@ -79,6 +94,12 @@ func (t *turn) SetStderr(io.Writer) {}
 // returned. When Run returns the turn is over: the command's reader is
 // told io.EOF, its writer is closed, and the input is the program's, for
 // the reader Bubble Tea starts next.
+//
+// The command's context is done when the session ends, by the client or
+// by kosh, and from that moment the command reads io.EOF and its writes
+// fail, though the turn lasts until the command has returned. A session
+// that ended before Run is called gives ErrSessionEnded, and the command
+// is not called.
 func (t *turn) Run() error {
 	sess := t.sess
 	defer sess.in.takeBack(t.in)
@@ -86,6 +107,17 @@ func (t *turn) Run() error {
 	defer out.close()
 	ctx, cancel := context.WithCancel(sess.ctx)
 	defer cancel()
+	// In a goroutine of its own: closing the gate waits for a write of
+	// the command to a client that does not read.
+	stop := context.AfterFunc(ctx, func() {
+		sess.in.cut(t.in)
+		out.close()
+	})
+	defer stop()
+	if !sess.beginCommand(cancel) {
+		return ErrSessionEnded
+	}
+	defer sess.endCommand()
 	size, resized, unwatch := sess.win.watch()
 	defer unwatch()
 	return t.run(ctx, Terminal{In: t.in, Out: out, Size: size, Resized: resized})
