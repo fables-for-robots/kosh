@@ -279,6 +279,21 @@ func TestUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("a separator before and after the document", func(t *testing.T) {
+		f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
+		ref := f.ref(t, "apps", "deployments", "default", "web")
+		text := actionYAML(t, f, ref, func(m map[string]any) {
+			_ = unstructured.SetNestedField(m, int64(6), "spec", "replicas")
+		})
+		if err := f.s.Update(context.Background(), ref, "# edited\n---\n"+text+"---\n# nothing more\n"); err != nil {
+			t.Fatal(err)
+		}
+		obj, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
+		if n, _, _ := unstructured.NestedInt64(obj.(*unstructured.Unstructured).Object, "spec", "replicas"); n != 6 {
+			t.Errorf("replicas %d, want 6", n)
+		}
+	})
+
 	t.Run("a cluster-scoped object", func(t *testing.T) {
 		n := actionNode("n1")
 		n.ResourceVersion = "4"
@@ -318,6 +333,13 @@ func TestUpdate(t *testing.T) {
 		{"another apiVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { m["apiVersion"] = "apps/v1beta2" })
 		}, "the YAML names another object: "},
+		{"two documents", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
+			return actionYAML(t, f, ref, nil) + "---\napiVersion: v1\nkind: ConfigMap\nmetadata: {name: other, namespace: default}\n"
+		}, "the YAML holds more than one document"},
+		{"the same document twice", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
+			text := actionYAML(t, f, ref, nil)
+			return text + "---\n" + text
+		}, "the YAML holds more than one document"},
 		{"no resourceVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { unstructured.RemoveNestedField(m, "metadata", "resourceVersion") })
 		}, "the YAML has no resourceVersion: it must be the object as it was read"},
@@ -543,15 +565,15 @@ func TestSetImages(t *testing.T) {
 		want   map[string]any
 	}{
 		{"one of two containers", map[string]string{"side": "side:2"},
-			map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			map[string]any{"metadata": map[string]any{"resourceVersion": "7"}, "spec": map[string]any{"template": map[string]any{"spec": map[string]any{
 				"containers": []any{map[string]any{"name": "side", "image": "side:2"}},
 			}}}}},
 		{"an init container", map[string]string{"init": "init:2"},
-			map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			map[string]any{"metadata": map[string]any{"resourceVersion": "7"}, "spec": map[string]any{"template": map[string]any{"spec": map[string]any{
 				"initContainers": []any{map[string]any{"name": "init", "image": "init:2"}},
 			}}}}},
 		{"both", map[string]string{"init": "init:2", "app": "app:2", "side": "side:2"},
-			map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			map[string]any{"metadata": map[string]any{"resourceVersion": "7"}, "spec": map[string]any{"template": map[string]any{"spec": map[string]any{
 				"containers":     []any{map[string]any{"name": "app", "image": "app:2"}, map[string]any{"name": "side", "image": "side:2"}},
 				"initContainers": []any{map[string]any{"name": "init", "image": "init:2"}},
 			}}}}},
@@ -656,6 +678,48 @@ func TestRollback(t *testing.T) {
 				t.Errorf("sent %v", a)
 			}
 		}
+	})
+	// actionNoPatch fails the test when the clientset fake was sent a
+	// patch.
+	actionNoPatch := func(t *testing.T, f *actionFixture) {
+		t.Helper()
+		for _, a := range f.typed.Actions() {
+			if a.GetVerb() == "patch" {
+				t.Errorf("sent %v", a)
+			}
+		}
+	}
+	t.Run("a deployment made again under the same name", func(t *testing.T) {
+		d, rs1, rs2 := actionRollbackObjects()
+		// The new deployment web is at its own revision 2 (app:3); its
+		// revision 1 is web-2 (app:2). web-1 still names the old one.
+		d.UID = "another-uid"
+		d.Spec.Template.Spec.Containers[0].Image = "app:3"
+		rs2.OwnerReferences[0].UID = "another-uid"
+		rs2.Annotations["deployment.kubernetes.io/revision"] = "1"
+		f := actionEnv(t, fullGrant, nil, d, rs1, rs2)
+		err := f.s.Rollback(context.Background(), f.ref(t, "apps", "replicasets", "default", "web-1"))
+		if err == nil || err.Error() != "replicaset default/web-1 belongs to a deployment that no longer exists" {
+			t.Errorf("%v", err)
+		}
+		actionNoPatch(t, f)
+	})
+	t.Run("the deployment is gone", func(t *testing.T) {
+		_, rs1, _ := actionRollbackObjects()
+		f := actionEnv(t, fullGrant, nil, rs1)
+		err := f.s.Rollback(context.Background(), f.ref(t, "apps", "replicasets", "default", "web-1"))
+		if err == nil || err.Error() != "replicaset default/web-1 belongs to a deployment that no longer exists" {
+			t.Errorf("%v", err)
+		}
+	})
+	t.Run("the revision the deployment is at", func(t *testing.T) {
+		d, rs1, rs2 := actionRollbackObjects()
+		f := actionEnv(t, fullGrant, nil, d, rs1, rs2)
+		err := f.s.Rollback(context.Background(), f.ref(t, "apps", "replicasets", "default", "web-2"))
+		if err == nil || !strings.Contains(err.Error(), "skipped rollback") || !strings.Contains(err.Error(), "default/web") {
+			t.Errorf("%v, want the rollbacker's word that it skipped the rollback", err)
+		}
+		actionNoPatch(t, f)
 	})
 	t.Run("a deployment", func(t *testing.T) {
 		f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))

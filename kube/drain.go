@@ -6,8 +6,10 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	kubedrain "k8s.io/kubectl/pkg/drain"
 )
 
@@ -39,7 +41,7 @@ func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) 
 	if err := s.begin(ctx, actDrain, node); err != nil {
 		return err
 	}
-	out := &lockedBuffer{}
+	out := &drainOutput{}
 	defer func() {
 		s.logAction(ctx, actDrain, node, err,
 			slog.Int("gracePeriod", opts.GracePeriod),
@@ -54,39 +56,74 @@ func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) 
 	if err := kindIs(actDrain, node, nodeKinds...); err != nil {
 		return err
 	}
-	h := &kubedrain.Helper{
-		Ctx:                 ctx,
-		Client:              s.c.typed,
-		Force:               opts.Force,
-		GracePeriodSeconds:  opts.GracePeriod,
-		IgnoreAllDaemonSets: opts.IgnoreDaemonSets,
-		Timeout:             opts.Timeout,
-		DeleteEmptyDirData:  opts.DeleteEmptyDirData,
-		DisableEviction:     opts.DisableEviction,
-		Out:                 out,
-		ErrOut:              out,
-	}
+	h := newDrainHelper(ctx, s.c.typed, opts, out)
 	if err := s.cordon(ctx, h, node.Name, true); err != nil {
 		return err
 	}
 	return kubedrain.RunNodeDrain(h, node.Name)
 }
 
-// lockedBuffer is a buffer that the drain helper's goroutines may write
-// to at once.
-type lockedBuffer struct {
+// evictRetryDelay is how long a drain waits before it asks again to
+// evict a pod whose eviction the API refused for now, because of a
+// PodDisruptionBudget: kubectl drain's 5 seconds. Tests shorten it.
+var evictRetryDelay = 5 * time.Second
+
+// newDrainHelper returns the helper of kubectl's drain package that
+// drains with opts, ctx and client, and prints to out.
+func newDrainHelper(ctx context.Context, client kubernetes.Interface, opts DrainOptions, out io.Writer) *kubedrain.Helper {
+	return &kubedrain.Helper{
+		Ctx:                 ctx,
+		Client:              client,
+		Force:               opts.Force,
+		GracePeriodSeconds:  opts.GracePeriod,
+		IgnoreAllDaemonSets: opts.IgnoreDaemonSets,
+		Timeout:             opts.Timeout,
+		DeleteEmptyDirData:  opts.DeleteEmptyDirData,
+		DisableEviction:     opts.DisableEviction,
+		// Without it, kubectl's loop asks again at once, as often as the
+		// client's rate limiter, which every session shares, lets it.
+		EvictErrorRetryDelay: evictRetryDelay,
+		Out:                  out,
+		ErrOut:               out,
+	}
+}
+
+// drainOutputLimit is how much of what the drain helper prints is kept,
+// for the log line.
+const drainOutputLimit = 16 << 10
+
+// drainOutputCut ends what was kept of output that was longer.
+const drainOutputCut = "\n[the rest was cut]"
+
+// drainOutput keeps the first drainOutputLimit bytes the drain helper
+// prints. The helper's goroutines may write to it at once.
+type drainOutput struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
+	cut bool
 }
 
-func (b *lockedBuffer) Write(p []byte) (int, error) {
+// Write keeps what fits of p and says that it took all of it, so that
+// the helper goes on.
+func (b *drainOutput) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.Write(p)
+	if room := drainOutputLimit - b.buf.Len(); len(p) > room {
+		b.buf.Write(p[:room])
+		b.cut = true
+	} else {
+		b.buf.Write(p)
+	}
+	return len(p), nil
 }
 
-func (b *lockedBuffer) String() string {
+// String returns what was kept, and drainOutputCut after it when more
+// was printed.
+func (b *drainOutput) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.cut {
+		return b.buf.String() + drainOutputCut
+	}
 	return b.buf.String()
 }

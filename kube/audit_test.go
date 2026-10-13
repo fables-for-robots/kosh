@@ -8,10 +8,13 @@ import (
 	"sync"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -271,28 +274,30 @@ func TestFailedActionIsLoggedWithItsError(t *testing.T) {
 		name string
 		call func(t *testing.T, f *actionFixture) error
 		word string
+		// logged is the error the record holds; empty: the error's text.
+		logged string
 	}{
 		{"the API refuses", func(t *testing.T, f *actionFixture) error {
 			return f.s.Delete(ctx, f.ref(t, "apps", "deployments", "default", "web"), DeleteOptions{})
-		}, "delete"},
+		}, "delete", ""},
 		{"the object is not there", func(t *testing.T, f *actionFixture) error {
 			return f.s.Kill(ctx, f.ref(t, "", "pods", "default", "gone"))
-		}, "kill"},
+		}, "kill", ""},
 		{"the kind", func(t *testing.T, f *actionFixture) error {
 			return f.s.Scale(ctx, f.ref(t, "", "pods", "default", "web-1"), 2)
-		}, "scale"},
+		}, "scale", ""},
 		{"the arguments", func(t *testing.T, f *actionFixture) error {
 			return f.s.Scale(ctx, f.ref(t, "apps", "deployments", "default", "web"), -2)
-		}, "scale"},
+		}, "scale", ""},
 		{"the YAML", func(t *testing.T, f *actionFixture) error {
 			return f.s.Update(ctx, f.ref(t, "apps", "deployments", "default", "web"), "kind: [")
-		}, "update"},
+		}, "update", "the YAML does not parse"},
 		{"a container", func(t *testing.T, f *actionFixture) error {
 			return f.s.SetImages(ctx, f.ref(t, "apps", "deployments", "default", "web"), map[string]string{"nope": "x"})
-		}, "set-images"},
+		}, "set-images", ""},
 		{"the drain", func(t *testing.T, f *actionFixture) error {
 			return f.s.Drain(ctx, f.ref(t, "", "nodes", "", "n1"), DefaultDrainOptions())
-		}, "drain"},
+		}, "drain", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -306,36 +311,120 @@ func TestFailedActionIsLoggedWithItsError(t *testing.T) {
 			if got, _ := r.attr("action"); got != tt.word {
 				t.Errorf("action %q, want %q", got, tt.word)
 			}
-			if got, ok := r.attr("error"); !ok || got != err.Error() {
-				t.Errorf("error %q, want %q", got, err.Error())
+			want := tt.logged
+			if want == "" {
+				want = err.Error()
+			}
+			if got, ok := r.attr("error"); !ok || got != want {
+				t.Errorf("error %q, want %q", got, want)
 			}
 		})
 	}
 }
 
-func TestUpdateLogHoldsNoYAML(t *testing.T) {
-	const marker = "zebra-7d1f-marker"
-	f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
-	ref := f.ref(t, "apps", "deployments", "default", "web")
-	texts := []string{
-		actionYAML(t, f, ref, func(m map[string]any) { _ = unstructured.SetNestedField(m, marker, "metadata", "labels", "mark") }),
-		actionYAML(t, f, ref, func(m map[string]any) { _ = unstructured.SetNestedField(m, marker, "metadata", "name") }),
-		actionYAML(t, f, ref, func(m map[string]any) { _ = unstructured.SetNestedField(m, marker, "metadata", "namespace") }),
-		actionYAML(t, f, ref, func(m map[string]any) { m["kind"] = marker }),
-		actionYAML(t, f, ref, func(m map[string]any) { m["apiVersion"] = marker }),
-	}
-	for _, text := range texts {
-		_ = f.s.Update(context.Background(), ref, text)
-	}
-	recs := f.log.all()
-	if len(recs) != len(texts) {
-		t.Errorf("%d records, want %d", len(recs), len(texts))
-	}
-	for _, r := range recs {
+// auditMarker stands for a Secret's contents or text of an edit.
+const auditMarker = "zebra-7d1f-marker"
+
+// auditNoMarker fails the test when a record's message or attributes
+// hold auditMarker.
+func auditNoMarker(t *testing.T, f *actionFixture) {
+	t.Helper()
+	for _, r := range f.log.all() {
+		if strings.Contains(r.Message, auditMarker) {
+			t.Errorf("message %q holds the marker", r.Message)
+		}
 		for k, v := range r.Attrs {
-			if strings.Contains(v.String(), marker) {
-				t.Errorf("%s = %q holds the YAML", k, v.String())
+			if strings.Contains(v.String(), auditMarker) {
+				t.Errorf("%s = %q holds the marker", k, v.String())
 			}
 		}
+	}
+}
+
+func TestUpdateLogHoldsNoYAML(t *testing.T) {
+	updateFails := func(err error) func(*env) {
+		return func(e *env) {
+			e.dyn.PrependReactor("update", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, err
+			})
+		}
+	}
+	edited := func(edit func(map[string]any)) func(*testing.T, *actionFixture, ObjectRef) string {
+		return func(t *testing.T, f *actionFixture, ref ObjectRef) string { return actionYAML(t, f, ref, edit) }
+	}
+	plain := func(text string) func(*testing.T, *actionFixture, ObjectRef) string {
+		return func(*testing.T, *actionFixture, ObjectRef) string { return text }
+	}
+	invalid := apierrors.NewInvalid(schema.GroupKind{Group: "apps", Kind: "Deployment"}, "web", field.ErrorList{
+		field.Invalid(field.NewPath("spec", "replicas"), auditMarker, "must be a number"),
+		field.Invalid(field.NewPath("metadata", "labels"), auditMarker, "is not a label"),
+	})
+	tests := []struct {
+		name   string
+		before func(*env)
+		text   func(*testing.T, *actionFixture, ObjectRef) string
+		// inErr: the parser or the API put the marker into the error the
+		// caller gets.
+		inErr  bool
+		logged string // the record's error; empty: none
+	}{
+		{"a label", nil, edited(func(m map[string]any) { _ = unstructured.SetNestedField(m, auditMarker, "metadata", "labels", "mark") }), false, ""},
+		{"the name", nil, edited(func(m map[string]any) { _ = unstructured.SetNestedField(m, auditMarker, "metadata", "name") }), false, "the YAML names another object"},
+		{"the namespace", nil, edited(func(m map[string]any) { _ = unstructured.SetNestedField(m, auditMarker, "metadata", "namespace") }), false, "the YAML names another object"},
+		{"the kind", nil, edited(func(m map[string]any) { m["kind"] = auditMarker }), false, "the YAML names another object"},
+		{"the apiVersion", nil, edited(func(m map[string]any) { m["apiVersion"] = auditMarker }), false, "the YAML names another object"},
+		{"the value of a null key", nil, plain("data:\n  ~: " + auditMarker + "\n"), true, "the YAML does not parse"},
+		{"a map under a top-level null key", nil, plain("~:\n  password: " + auditMarker + "\nkind: Secret\n"), true, "the YAML does not parse"},
+		{"an !!int scalar", nil, plain("spec:\n  replicas: !!int " + auditMarker + "\n"), true, "the YAML does not parse"},
+		{"an anchor's name", nil, plain("spec: *" + auditMarker + "\n"), true, "the YAML does not parse"},
+		{"the API finds it invalid", updateFails(invalid), edited(nil), true, "the API answered Invalid (422) at spec.replicas, metadata.labels"},
+		{"a plain error", updateFails(errors.New("denied: " + auditMarker)), edited(nil), true, "update failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, tt.before, actionDeployment("default", "web", "app"))
+			ref := f.ref(t, "apps", "deployments", "default", "web")
+			err := f.s.Update(context.Background(), ref, tt.text(t, f, ref))
+			if tt.inErr && (err == nil || !strings.Contains(err.Error(), auditMarker)) {
+				t.Errorf("the caller's error %v does not hold what the parser or the API said", err)
+			}
+			r := auditOneAction(t, f)
+			if got, _ := r.attr("error"); got != tt.logged {
+				t.Errorf("logged error %q, want %q", got, tt.logged)
+			}
+			auditNoMarker(t, f)
+		})
+	}
+}
+
+func TestDeleteOfASecretLogsNoContents(t *testing.T) {
+	secret := &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "creds"},
+		Data:       map[string][]byte{"password": []byte(auditMarker)},
+	}
+	for _, tt := range []struct {
+		name   string
+		err    error
+		logged string
+	}{
+		{"a webhook's denial", errors.New("admission webhook denied: password is " + auditMarker), "delete failed"},
+		{"the API's error", apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "creds", errors.New("the password "+auditMarker+" is in use")), "the API answered Forbidden (403)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, func(e *env) {
+				e.dyn.PrependReactor("delete", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.err
+				})
+			}, secret)
+			err := f.s.Delete(context.Background(), f.ref(t, "", "secrets", "default", "creds"), DeleteOptions{})
+			if err == nil || !strings.Contains(err.Error(), auditMarker) {
+				t.Errorf("the caller's error %v is not the API's", err)
+			}
+			if got, _ := auditOneAction(t, f).attr("error"); got != tt.logged {
+				t.Errorf("logged error %q, want %q", got, tt.logged)
+			}
+			auditNoMarker(t, f)
+		})
 	}
 }

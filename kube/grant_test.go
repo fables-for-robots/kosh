@@ -37,10 +37,14 @@ func TestReadOnlyGrantIsRefusedEveryAction(t *testing.T) {
 		for j := 1; j < len(args); j++ {
 			args[j] = reflect.Zero(m.Type.In(j))
 		}
+		f.log.reset()
 		out := v.MethodByName(m.Name).Call(args)
 		err, _ := out[len(out)-1].Interface().(error)
 		if !errors.Is(err, ErrReadOnly) {
 			t.Errorf("%s: %v, want ErrReadOnly", m.Name, err)
+		}
+		if recs, all := f.log.with("refused"), f.log.all(); len(recs) != 1 || len(all) != 1 || recs[0].Level != slog.LevelWarn {
+			t.Errorf("%s: records %+v, want one refusal", m.Name, all)
 		}
 	}
 	if a := f.typed.Actions(); len(a) != 0 {

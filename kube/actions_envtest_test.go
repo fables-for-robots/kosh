@@ -97,6 +97,18 @@ func TestEnvScaleRestartSetImages(t *testing.T) {
 	if !apiequality.Semantic.DeepEqual(*want, after.Spec) {
 		t.Errorf("spec\n%+v\nwant\n%+v", after.Spec, *want)
 	}
+
+	// The images' patch with the resourceVersion of the object as it was
+	// before the changes above is a conflict, and changes nothing.
+	err = a.s.(*session).patchTemplate(ctx, ref, before.ResourceVersion, map[string]any{"spec": map[string]any{
+		"containers": []any{map[string]any{"name": "side", "image": "side:3"}},
+	}})
+	if !apierrors.IsConflict(err) {
+		t.Errorf("a patch with a stale resourceVersion: %v, want a conflict", err)
+	}
+	if got, _ := a.typed.AppsV1().Deployments("default").Get(ctx, "web", metav1.GetOptions{}); got.Spec.Template.Spec.Containers[1].Image != "side:2" {
+		t.Errorf("image %q after the conflict", got.Spec.Template.Spec.Containers[1].Image)
+	}
 }
 
 func TestEnvUpdateAndConflict(t *testing.T) {

@@ -1,25 +1,27 @@
 package kube
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
@@ -81,7 +83,12 @@ func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 		return err
 	}
 	defer func() {
-		s.logAction(ctx, actDelete, ref, err,
+		logged := err
+		if ref.Resource.Is("", "secrets") {
+			// A webhook's denial may quote the Secret it was given.
+			logged = loggableError(actDelete, err)
+		}
+		s.logAction(ctx, actDelete, ref, logged,
 			slog.String("propagation", string(opts.propagation())), slog.Bool("force", opts.Force))
 	}()
 	return s.delete(ctx, ref, opts)
@@ -113,7 +120,8 @@ func (s *session) Update(ctx context.Context, ref ObjectRef, text string) (err e
 	if err := s.begin(ctx, actUpdate, ref); err != nil {
 		return err
 	}
-	defer func() { s.logAction(ctx, actUpdate, ref, err) }()
+	// The log gets what kind of error it was: its text may quote the edit.
+	defer func() { s.logAction(ctx, actUpdate, ref, loggableError(actUpdate, err)) }()
 	obj, err := parseObject(ref, text)
 	if err != nil {
 		return err
@@ -122,33 +130,88 @@ func (s *session) Update(ctx context.Context, ref ObjectRef, text string) (err e
 	return err
 }
 
+// editRefusal is Update's refusal of a text before anything is sent.
+// reason says nothing of the text and is what the log holds; detail is
+// for the user who wrote it.
+type editRefusal struct {
+	reason, detail string
+}
+
+func (e *editRefusal) Error() string {
+	if e.detail == "" {
+		return e.reason
+	}
+	return e.reason + ": " + e.detail
+}
+
 // parseObject returns the object that text, YAML, says, when it is the
 // object ref as it was read.
 func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error) {
-	js, err := yaml.YAMLToJSON([]byte(text))
+	doc, err := oneDocument(text)
 	if err != nil {
-		return nil, fmt.Errorf("the YAML does not parse: %w", err)
+		return nil, err
+	}
+	js, err := yaml.YAMLToJSON(doc)
+	if err != nil {
+		return nil, &editRefusal{"the YAML does not parse", err.Error()}
 	}
 	var v any
 	if err := utiljson.Unmarshal(js, &v); err != nil {
-		return nil, fmt.Errorf("the YAML does not parse: %w", err)
+		return nil, &editRefusal{"the YAML does not parse", err.Error()}
 	}
 	m, ok := v.(map[string]any)
 	if !ok {
-		return nil, errors.New("the YAML is not an object")
+		return nil, &editRefusal{"the YAML is not an object", ""}
 	}
 	obj := &unstructured.Unstructured{Object: m}
 	wantVersion := ref.Resource.GVR.GroupVersion().String()
 	if obj.GetAPIVersion() != wantVersion || obj.GetKind() != ref.Resource.Kind ||
 		obj.GetName() != ref.Name || obj.GetNamespace() != ref.Namespace {
-		// Nothing of the YAML is said, since the error is logged.
-		return nil, fmt.Errorf("the YAML names another object: it must be %s",
-			describeObject(wantVersion, ref.Resource.Kind, ref.Namespace, ref.Name))
+		return nil, &editRefusal{"the YAML names another object",
+			"it must be " + describeObject(wantVersion, ref.Resource.Kind, ref.Namespace, ref.Name)}
 	}
 	if obj.GetResourceVersion() == "" {
-		return nil, errors.New("the YAML has no resourceVersion: it must be the object as it was read")
+		return nil, &editRefusal{"the YAML has no resourceVersion", "it must be the object as it was read"}
 	}
 	return obj, nil
+}
+
+// oneDocument returns the one YAML document of text. Documents that hold
+// nothing but comments do not count.
+func oneDocument(text string) ([]byte, error) {
+	r := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(text)))
+	var docs [][]byte
+	for {
+		doc, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, &editRefusal{"the YAML does not parse", err.Error()}
+		}
+		if hasContent(doc) {
+			docs = append(docs, doc)
+		}
+	}
+	switch len(docs) {
+	case 0:
+		return nil, &editRefusal{"the YAML is not an object", ""}
+	case 1:
+		return docs[0], nil
+	}
+	return nil, &editRefusal{"the YAML holds more than one document", ""}
+}
+
+// hasContent reports whether a YAML document holds more than blank lines,
+// comments and the document separator.
+func hasContent(doc []byte) bool {
+	for _, line := range strings.Split(string(doc), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && line != "---" && !strings.HasPrefix(line, "#") {
+			return true
+		}
+	}
+	return false
 }
 
 // scaleClient is the scale subresource of one kind, in one namespace.
@@ -199,7 +262,7 @@ func (s *session) Restart(ctx context.Context, ref ObjectRef) (err error) {
 	if err := kindIs("restart", ref, workloadKinds...); err != nil {
 		return err
 	}
-	return s.patchTemplate(ctx, ref, map[string]any{
+	return s.patchTemplate(ctx, ref, "", map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]any{restartedAtAnnotation: time.Now().Format(time.RFC3339)},
 		},
@@ -207,9 +270,15 @@ func (s *session) Restart(ctx context.Context, ref ObjectRef) (err error) {
 }
 
 // patchTemplate sends a strategic merge patch of the pod template of
-// ref: spec.template is template.
-func (s *session) patchTemplate(ctx context.Context, ref ObjectRef, template map[string]any) error {
-	body, err := json.Marshal(map[string]any{"spec": map[string]any{"template": template}})
+// ref: spec.template is template. A resourceVersion that is not empty
+// goes into the patch too, so that the API answers a conflict when the
+// object has changed since it was read.
+func (s *session) patchTemplate(ctx context.Context, ref ObjectRef, resourceVersion string, template map[string]any) error {
+	patch := map[string]any{"spec": map[string]any{"template": template}}
+	if resourceVersion != "" {
+		patch["metadata"] = map[string]any{"resourceVersion": resourceVersion}
+	}
+	body, err := json.Marshal(patch)
 	if err != nil {
 		return err
 	}
@@ -268,7 +337,9 @@ func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[strin
 	if inits != nil {
 		spec["initContainers"] = inits
 	}
-	return s.patchTemplate(ctx, ref, map[string]any{"spec": spec})
+	// Without the object's resourceVersion, a container removed since it
+	// was read would be added back with nothing but a name and an image.
+	return s.patchTemplate(ctx, ref, obj.GetResourceVersion(), map[string]any{"spec": spec})
 }
 
 func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error) {
@@ -296,14 +367,32 @@ func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error
 	if err != nil || revision < 1 {
 		return fmt.Errorf("replicaset %s has the revision %q, which is not one", name, text)
 	}
+	// The deployment of that name must be the one the reference is to,
+	// not another made since under the same name.
+	deployment, err := s.c.typed.AppsV1().Deployments(rs.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) || err == nil && deployment.UID != owner.UID {
+		return fmt.Errorf("replicaset %s belongs to a deployment that no longer exists", name)
+	}
+	if err != nil {
+		return err
+	}
 	rb, err := polymorphichelpers.RollbackerFor(schema.GroupKind{Group: "apps", Kind: "Deployment"}, s.c.typed)
 	if err != nil {
 		return err
 	}
-	deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: rs.Namespace, Name: owner.Name}}
-	_, err = rb.Rollback(deployment, nil, revision, cmdutil.DryRunNone)
-	return err
+	result, err := rb.Rollback(deployment, nil, revision, cmdutil.DryRunNone)
+	if err != nil {
+		return err
+	}
+	if strings.HasPrefix(result, rollbackSkipped) {
+		return fmt.Errorf("deployment %s/%s: %s", deployment.Namespace, deployment.Name, result)
+	}
+	return nil
 }
+
+// rollbackSkipped begins what kubectl's rollbacker says when the
+// deployment is at that revision already, and nothing was done.
+const rollbackSkipped = "skipped rollback"
 
 // revisionAnnotation is the revision of a deployment that a replicaset
 // is.
