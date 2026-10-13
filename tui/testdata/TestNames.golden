@@ -1,0 +1,30 @@
+Key:     alice@laptop   <shift-n> Sort Name     <space> Mark
+Cluster: v1.33.1        <shift-o> Sort Column   <?> Help
+kosh:    v0.1.0         <ctrl-w> Wide
+                        <ctrl-z> Faults
+                        </> Filter
+
+┌────────────────────────────────────────── Aliases[27] ───────────────────────────────────────────┐
+│NAME↑                      SHORTNAMES  KIND                      GROUP                      NAMES…│
+│clusterrolebindings                    ClusterRoleBinding        rbac.authorization.k8s.io  false…│
+│clusterroles                           ClusterRole               rbac.authorization.k8s.io  false…│
+│configmaps                 cm          ConfigMap                                            true …│
+│cronjobs                   cj          CronJob                   batch                      true …│
+│customresourcedefinitions  crd,crds    CustomResourceDefinition  apiextensions.k8s.io       false…│
+│daemonsets                 ds          DaemonSet                 apps                       true …│
+│deployments                deploy      Deployment                apps                       true …│
+│events                     ev          Event                                                true …│
+│horizontalpodautoscalers   hpa         HorizontalPodAutoscaler   autoscaling                true …│
+│ingresses                  ing         Ingress                   networking.k8s.io          true …│
+│jobs                                   Job                       batch                      true …│
+│namespaces                 ns          Namespace                                            false…│
+│networkpolicies            netpol      NetworkPolicy             networking.k8s.io          true …│
+│nodes                      no          Node                                                 false…│
+│persistentvolumeclaims     pvc         PersistentVolumeClaim                                true …│
+│persistentvolumes          pv          PersistentVolume                                     false…│
+│poddisruptionbudgets       pdb         PodDisruptionBudget       policy                     true …│
+│pods                       po          Pod                                                  true …│
+│replicasets                rs          ReplicaSet                apps                       true …│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <aliases>
+

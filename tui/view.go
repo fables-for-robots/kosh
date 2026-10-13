@@ -20,8 +20,10 @@ import (
 type view interface {
 	// Init returns what the view needs done when it is first shown.
 	Init() tea.Cmd
-	// Update handles a message. The root gives a view every message it
-	// does not consume itself, the top view only.
+	// Update handles a message. The root gives key presses to the top
+	// view only, and every other message to every view of the stack, top
+	// first: a view knows its own messages by an id it puts into them and
+	// ignores the rest.
 	Update(msg tea.Msg) (view, tea.Cmd)
 	// View draws the view into width by height cells: exactly height
 	// lines, none wider than width.

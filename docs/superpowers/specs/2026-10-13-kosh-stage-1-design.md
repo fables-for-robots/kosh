@@ -130,9 +130,12 @@ dependency tree kosh has no other use for.
 
 ## 5. The SSH server
 
-The server is `charm.land/wish/v2` over `charm.land/ssh`, with wish's
-Bubble Tea middleware: one Bubble Tea v2 program per session, on the
-session's terminal, in kosh's process.
+The server is `charm.land/wish/v2` over `charm.land/ssh`: one Bubble
+Tea v2 program per session, on the session's terminal, in kosh's
+process. kosh runs the program itself, with the options wish makes for a
+session, and not through wish's Bubble Tea middleware: the middleware
+drops the program's error, which is how a panic is known, and leaves the
+program listening for the process's signals.
 
 - **Authentication** is by public key and nothing else. A key is
   accepted when the key list holds it at that moment. The user name is
@@ -154,6 +157,11 @@ session's terminal, in kosh's process.
   from its authentication and from the end of its last session. A client
   of `iroh-ssh` that exits often sends no close, and the connection
   would otherwise linger until QUIC's idle timeout.
+- **A key may have 16 connections open at once, and a connection 10
+  session channels.** More are refused. The handshake's limit bounds
+  peers that have not authenticated; these two bound what one key, a
+  read-only one included, can make kosh hold: every channel lets its
+  client send two megabytes that nothing reads.
 - **Twenty tries to authenticate**, not the library's six: `iroh-ssh`
   lets `ssh` offer every key of the user's agent before the one it was
   given.
@@ -243,7 +251,9 @@ kosh reads the cluster in four ways.
 ### 8.1 Informers, for the typed kinds
 
 Each typed kind has one informer for the whole cluster and the whole
-process: client-go's typed shared informers.
+process: a shared informer over client-go's dynamic client, which turns
+each object into its typed form as it stores it. One informer per kind,
+and not a factory of typed ones, is what lets a single kind be stopped.
 
 - An informer is started the first time a session opens its kind, and
   all sessions share it. That is sound because all sessions have the

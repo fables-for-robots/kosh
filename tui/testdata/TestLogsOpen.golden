@@ -1,0 +1,30 @@
+Key:     alice@laptop   <s> Autoscroll    <1> Head   <6> 1h               <c> Copy
+Cluster: v1.33.1        <w> Wrap          <2> 1m     </> Filter
+kosh:    v0.1.0         <t> Times         <3> 5m     <m> Mark
+                        <f> Full Screen   <4> 15m    <shift-c> Clear
+                        <0> Tail          <5> 30m    <a> All Containers
+
+┌───────────────────────── Logs(pods/default/web-1) [autoscroll:on] tail ──────────────────────────┐
+│line 0001                                                                                         │
+│line 0002                                                                                         │
+│line 0003                                                                                         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <logs>
+

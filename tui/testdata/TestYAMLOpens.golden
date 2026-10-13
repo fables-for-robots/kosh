@@ -1,0 +1,30 @@
+Key:     alice@laptop   <c> Copy                <shift-n> Prev Match
+Cluster: v1.33.1        <f> Toggle FullScreen   <r> Toggle Auto-Refresh
+kosh:    v0.1.0         <w> Toggle Wrap         <m> Toggle ManagedFields
+                        </> Search
+                        <n> Next Match
+
+┌──────────────────────────────────── YAML(pods/default/web-1) ────────────────────────────────────┐
+│apiVersion: v1                                                                                    │
+│kind: Pod                                                                                         │
+│metadata:                                                                                         │
+│  name: web-1                                                                                     │
+│  namespace: default                                                                              │
+│  labels:                                                                                         │
+│    app: web # the app                                                                            │
+│spec:                                                                                             │
+│  containers:                                                                                     │
+│  - name: web                                                                                     │
+│    image: nginx:1.27                                                                             │
+│    args:                                                                                         │
+│    - --port=8080                                                                                 │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <yaml>
+
