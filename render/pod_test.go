@@ -445,3 +445,171 @@ func TestPodOrder(t *testing.T) {
 		t.Errorf("AGE: 3m sorts at %v, 3h at %v", a, b)
 	}
 }
+
+// podTestWithInit gives po init containers of the names given, a sidecar
+// (restarted always) where sidecar is true.
+func podTestWithInit(po *corev1.Pod, sidecar bool, names ...string) *corev1.Pod {
+	always := corev1.ContainerRestartPolicyAlways
+	for _, n := range names {
+		c := corev1.Container{Name: n, Image: n + ":1"}
+		if sidecar {
+			c.RestartPolicy = &always
+		}
+		po.Spec.InitContainers = append(po.Spec.InitContainers, c)
+	}
+	return po
+}
+
+// podTestDeleted marks po as being deleted.
+func podTestDeleted(po *corev1.Pod) *corev1.Pod {
+	at := ago(time.Minute)
+	po.DeletionTimestamp = &at
+	return po
+}
+
+// The STATUS of a pod is what kubectl get pods prints for it, where that
+// is not what k9s's STATUS column shows. The expectations are kubectl's
+// (printPod in kubernetes' pkg/printers/internalversion), but for a pod
+// deleted after it ended (see the row).
+func TestPodStatusAsKubectl(t *testing.T) {
+	notStarted := false
+	tests := []struct {
+		name   string
+		pod    *corev1.Pod
+		status string
+		health Health
+	}{
+		{
+			name: "deleted while initializing",
+			pod: podTestDeleted(podTestWithInit(podTestPod("a", corev1.PodStatus{
+				Phase:                 corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{podTestRunning("migrate", false)},
+				ContainerStatuses:     []corev1.ContainerStatus{podTestWaiting("app", "PodInitializing")},
+			}, "app"), false, "migrate")),
+			status: "Terminating",
+			health: Pending,
+		},
+		{
+			name: "deleted while an init container crash-loops",
+			pod: podTestDeleted(podTestWithInit(podTestPod("b", corev1.PodStatus{
+				Phase:                 corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{podTestWaiting("migrate", "CrashLoopBackOff")},
+			}, "app"), false, "migrate")),
+			status: "Terminating",
+			health: Pending,
+		},
+		{
+			name: "deleted while initializing, its node lost",
+			pod: podTestDeleted(podTestWithInit(podTestPod("c", corev1.PodStatus{
+				Phase:                 corev1.PodPending,
+				Reason:                "NodeLost",
+				InitContainerStatuses: []corev1.ContainerStatus{podTestRunning("migrate", false)},
+			}, "app"), false, "migrate")),
+			status: "Unknown",
+			health: Error,
+		},
+		{
+			// kubectl prints Completed here (it leaves out Terminating
+			// for a pod whose phase is Succeeded or Failed); k9s's
+			// PodStatus prints Terminating, and kosh follows k9s, as
+			// ruled.
+			name: "deleted after it succeeded",
+			pod: podTestDeleted(podTestPod("d", corev1.PodStatus{
+				Phase:             corev1.PodSucceeded,
+				ContainerStatuses: []corev1.ContainerStatus{podTestTerminated("app", "Completed", 0, 0)},
+			}, "app")),
+			status: "Terminating",
+			health: Pending,
+		},
+		{
+			name: "a completed container beside a running one, the pod ready",
+			pod: podTestPod("e", corev1.PodStatus{
+				Phase:             corev1.PodRunning,
+				Conditions:        []corev1.PodCondition{podTestReady},
+				ContainerStatuses: []corev1.ContainerStatus{podTestTerminated("once", "Completed", 0, 0), podTestRunning("app", true)},
+			}, "once", "app"),
+			status: "Running",
+			health: Error, // READY is 1/2
+		},
+		{
+			name: "a completed container beside a running one, the pod not ready",
+			pod: podTestPod("f", corev1.PodStatus{
+				Phase:             corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{podTestTerminated("once", "Completed", 0, 0), podTestRunning("app", true)},
+			}, "once", "app"),
+			status: "NotReady",
+			health: Error,
+		},
+		{
+			name: "a completed container beside a failed one",
+			pod: podTestPod("g", corev1.PodStatus{
+				Phase:             corev1.PodFailed,
+				ContainerStatuses: []corev1.ContainerStatus{podTestTerminated("once", "Completed", 0, 0), podTestTerminated("app", "Error", 1, 0)},
+			}, "once", "app"),
+			status: "Error",
+			health: Error,
+		},
+		{
+			name: "held by a scheduling gate",
+			pod: podTestPod("h", corev1.PodStatus{
+				Phase:      corev1.PodPending,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: "SchedulingGated"}},
+			}, "app"),
+			status: "SchedulingGated",
+			health: Pending,
+		},
+		{
+			name: "a sidecar started and not ready beside a running container",
+			pod: podTestWithInit(podTestPod("i", corev1.PodStatus{
+				Phase:                 corev1.PodRunning,
+				InitContainerStatuses: []corev1.ContainerStatus{podTestRunning("proxy", false)},
+				ContainerStatuses:     []corev1.ContainerStatus{podTestRunning("app", true)},
+			}, "app"), true, "proxy"),
+			status: "Running",
+			health: Error, // READY is 1/2
+		},
+		{
+			name: "a sidecar not started yet",
+			pod: podTestWithInit(podTestPod("j", corev1.PodStatus{
+				Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{{
+					Name: "proxy", Started: &notStarted,
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: ago(time.Minute)}},
+				}},
+				ContainerStatuses: []corev1.ContainerStatus{podTestWaiting("app", "PodInitializing")},
+			}, "app"), true, "proxy"),
+			status: "Init:0/1",
+			health: Pending,
+		},
+		{
+			name: "a sidecar that failed",
+			pod: podTestWithInit(podTestPod("k", corev1.PodStatus{
+				Phase:                 corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{podTestTerminated("proxy", "Error", 1, 0)},
+				ContainerStatuses:     []corev1.ContainerStatus{podTestWaiting("app", "PodInitializing")},
+			}, "app"), true, "proxy"),
+			status: "Init:Error",
+			health: Error,
+		},
+		{
+			name: "initialized, though an init container's status says otherwise",
+			pod: podTestWithInit(podTestPod("l", corev1.PodStatus{
+				Phase:                 corev1.PodRunning,
+				Conditions:            []corev1.PodCondition{{Type: corev1.PodInitialized, Status: corev1.ConditionTrue}},
+				InitContainerStatuses: []corev1.ContainerStatus{{Name: "migrate", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{}}}},
+				ContainerStatuses:     []corev1.ContainerStatus{podTestWaiting("app", "CrashLoopBackOff")},
+			}, "app"), false, "migrate"),
+			status: "CrashLoopBackOff",
+			health: Error,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			row, cells := rowOf(t, Pods, tt.pod)
+			wantCells(t, cells, map[string]string{"STATUS": tt.status})
+			if row.Health != tt.health {
+				t.Errorf("health = %v, want %v", row.Health, tt.health)
+			}
+		})
+	}
+}

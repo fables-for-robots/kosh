@@ -53,7 +53,7 @@ func (pod) Row(obj runtime.Object, now time.Time) (Row, error) {
 	req, lim := podResources(spec)
 
 	status := podStatus(po)
-	valid := podDiagnose(status, ready, total, podReadyCondition(st), gatesReady, gates)
+	valid := podDiagnose(status, ready, total, podCondition(st, corev1.PodReady), gatesReady, gates)
 
 	b := NewRow(po).
 		Text(po.Namespace).
@@ -139,16 +139,6 @@ func podGates(ready, total int) string {
 		return MissingValue
 	}
 	return strconv.Itoa(ready) + "/" + strconv.Itoa(total)
-}
-
-// podReadyCondition says whether the pod's Ready condition is true.
-func podReadyCondition(st *corev1.PodStatus) bool {
-	for _, c := range st.Conditions {
-		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }
 
 // podDiagnose returns what is wrong with a pod, in k9s's words, or ""

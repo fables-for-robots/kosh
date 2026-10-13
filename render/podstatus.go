@@ -1,4 +1,5 @@
-// Follows k9s's internal/render/pod.go (Apache-2.0).
+// Follows k9s's internal/render/pod.go (Apache-2.0), its PodStatus,
+// which follows kubectl's printPod.
 
 package render
 
@@ -17,44 +18,53 @@ const (
 	podStatusContainerCreating = "ContainerCreating"
 	podStatusPodInitializing   = "PodInitializing"
 	podStatusTerminating       = "Terminating"
+	podStatusNotReady          = "NotReady"
 	podStatusUnknown           = "Unknown"
 	// podNodeLost is the reason of a pod whose node no longer answers.
 	podNodeLost = "NodeLost"
 )
 
-// podStatus returns the pod's STATUS, as kubectl get pods prints it:
-// the phase, overridden by the pod's reason, by an init container that
-// has not finished, by a container that waits or ended with a reason,
-// and by Terminating once the pod is being deleted. It is empty for a
-// pod with no phase and nothing to override it.
+// podStatus returns the pod's STATUS, as kubectl get pods prints it
+// (printPod in kubernetes' pkg/printers/internalversion, which k9s's
+// PodStatus follows): the phase, overridden in turn by the pod's reason,
+// by a scheduling gate, by the first init container that has not done
+// its part, by the first container that waits or ended, and last by
+// Unknown or Terminating once the pod is being deleted. It is empty for
+// a pod with no phase and nothing to override it.
 func podStatus(po *corev1.Pod) string {
 	st := &po.Status
-	deleting := po.DeletionTimestamp != nil
-
-	status := string(st.Phase)
+	reason := string(st.Phase)
 	if st.Reason != "" {
-		if deleting && st.Reason == podNodeLost {
-			return podStatusUnknown
+		reason = st.Reason
+	}
+	for _, c := range st.Conditions {
+		if c.Type == corev1.PodScheduled && c.Reason == corev1.PodReasonSchedulingGated {
+			reason = corev1.PodReasonSchedulingGated
 		}
-		status = st.Reason
 	}
 
-	if s, ok := podInitStatus(&po.Spec, st); ok {
-		return s
+	initReason, initializing := podInitStatus(&po.Spec, st)
+	if initializing {
+		reason = initReason
+	}
+	if !initializing || podCondition(st, corev1.PodInitialized) {
+		reason = podContainersStatus(st, reason)
 	}
 
-	status, running := podContainersStatus(st, status)
-	if running && status == podStatusCompleted {
-		status = podStatusRunning
+	// As k9s's PodStatus, Terminating whatever the phase; kubectl leaves
+	// it out for a pod that has succeeded or failed.
+	switch {
+	case po.DeletionTimestamp != nil && st.Reason == podNodeLost:
+		reason = podStatusUnknown
+	case po.DeletionTimestamp != nil:
+		reason = podStatusTerminating
 	}
-	if deleting {
-		return podStatusTerminating
-	}
-	return status
+	return reason
 }
 
 // podInitStatus returns the status the first init container that has
-// not finished gives the pod, and false when every one has finished.
+// not done its part gives the pod, and false when every one has: it
+// ended well, or it is a sidecar that has started.
 func podInitStatus(spec *corev1.PodSpec, st *corev1.PodStatus) (string, bool) {
 	sidecars := make(map[string]bool, len(spec.InitContainers))
 	for i := range spec.InitContainers {
@@ -64,63 +74,76 @@ func podInitStatus(spec *corev1.PodSpec, st *corev1.PodStatus) (string, bool) {
 	}
 	for i := range st.InitContainerStatuses {
 		cs := &st.InitContainerStatuses[i]
-		if s := podInitContainerStatus(cs, i, len(spec.InitContainers), sidecars[cs.Name]); s != "" {
-			return s, true
+		switch {
+		case cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0:
+			continue
+		case sidecars[cs.Name] && cs.Started != nil && *cs.Started:
+			continue
+		case cs.State.Terminated != nil:
+			return "Init:" + podTerminatedReason(cs.State.Terminated), true
+		case cs.State.Waiting != nil && cs.State.Waiting.Reason != "" && cs.State.Waiting.Reason != podStatusPodInitializing:
+			return "Init:" + cs.State.Waiting.Reason, true
 		}
+		return "Init:" + strconv.Itoa(i) + "/" + strconv.Itoa(len(spec.InitContainers)), true
 	}
 	return "", false
 }
 
-// podInitContainerStatus returns the status the init container at idx
-// of total gives the pod, or "" when it has done its part: it ended
-// well, or it is a sidecar that ended or is started and ready.
-func podInitContainerStatus(cs *corev1.ContainerStatus, idx, total int, sidecar bool) string {
-	switch {
-	case cs.State.Terminated != nil:
-		t := cs.State.Terminated
-		if t.ExitCode == 0 || sidecar {
-			return ""
-		}
-		if t.Reason != "" {
-			return "Init:" + t.Reason
-		}
-		if t.Signal != 0 {
-			return "Init:Signal:" + strconv.Itoa(int(t.Signal))
-		}
-		return "Init:ExitCode:" + strconv.Itoa(int(t.ExitCode))
-	case sidecar && cs.Started != nil && *cs.Started:
-		if cs.Ready {
-			return ""
-		}
-	case cs.State.Waiting != nil && cs.State.Waiting.Reason != "" && cs.State.Waiting.Reason != podStatusPodInitializing:
-		return "Init:" + cs.State.Waiting.Reason
-	}
-	return "Init:" + strconv.Itoa(idx) + "/" + strconv.Itoa(total)
-}
-
-// podContainersStatus overrides status by the first container, in the
-// order of the pod, that waits or ended, and says whether a container is
-// running and ready.
-func podContainersStatus(st *corev1.PodStatus, status string) (string, bool) {
+// podContainersStatus overrides reason by the first container, in the
+// order of the pod, that waits or ended. A pod whose first container
+// completed is Running when another runs and the pod is ready, has the
+// reason of a container that failed when one did, and is NotReady when
+// another runs and the pod is not ready.
+func podContainersStatus(st *corev1.PodStatus, reason string) string {
 	var running bool
+	var failed string
 	for i := len(st.ContainerStatuses) - 1; i >= 0; i-- {
 		cs := &st.ContainerStatuses[i]
 		switch {
 		case cs.State.Waiting != nil && cs.State.Waiting.Reason != "":
-			status = cs.State.Waiting.Reason
-		case cs.State.Terminated != nil && cs.State.Terminated.Reason != "":
-			status = cs.State.Terminated.Reason
+			reason = cs.State.Waiting.Reason
 		case cs.State.Terminated != nil:
-			if cs.State.Terminated.Signal != 0 {
-				status = "Signal:" + strconv.Itoa(int(cs.State.Terminated.Signal))
-			} else {
-				status = "ExitCode:" + strconv.Itoa(int(cs.State.Terminated.ExitCode))
+			reason = podTerminatedReason(cs.State.Terminated)
+			if cs.State.Terminated.ExitCode != 0 {
+				failed = reason
 			}
 		case cs.Ready && cs.State.Running != nil:
 			running = true
 		}
 	}
-	return status, running
+	if reason == podStatusCompleted {
+		switch {
+		case running && podCondition(st, corev1.PodReady):
+			reason = podStatusRunning
+		case failed != "":
+			reason = failed
+		case running:
+			reason = podStatusNotReady
+		}
+	}
+	return reason
+}
+
+// podTerminatedReason is why a container ended: its reason, or else the
+// signal or the exit code, "Signal:9", "ExitCode:2".
+func podTerminatedReason(t *corev1.ContainerStateTerminated) string {
+	switch {
+	case t.Reason != "":
+		return t.Reason
+	case t.Signal != 0:
+		return "Signal:" + strconv.Itoa(int(t.Signal))
+	}
+	return "ExitCode:" + strconv.Itoa(int(t.ExitCode))
+}
+
+// podCondition says whether the pod's condition of type c is true.
+func podCondition(st *corev1.PodStatus, c corev1.PodConditionType) bool {
+	for _, cond := range st.Conditions {
+		if cond.Type == c && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // podIsSidecar says whether an init container is a sidecar: one that is
@@ -130,12 +153,13 @@ func podIsSidecar(c *corev1.Container) bool {
 }
 
 // podHealth returns the health of a pod from its status, as k9s colours
-// it: on its way while it is scheduled, created, initialized or deleted,
-// completed when it is done, and an error otherwise. A running pod is
-// as its VALID cell says, which valid is.
+// it: on its way while it is scheduled (or held from it), created,
+// initialized or deleted, completed when it is done, and an error
+// otherwise. A running pod is as its VALID cell says, which valid is.
 func podHealth(status string, valid string) Health {
 	switch {
-	case status == podStatusPending, status == podStatusContainerCreating,
+	case status == podStatusPending, status == corev1.PodReasonSchedulingGated,
+		status == podStatusContainerCreating,
 		status == podStatusPodInitializing, status == podStatusTerminating,
 		podInitializing(status):
 		return Pending
