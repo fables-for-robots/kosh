@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,6 +57,16 @@ var (
 	nodeKinds     = []string{"", "nodes"}
 )
 
+// imagePairs returns images as "name=image", sorted, for the log.
+func imagePairs(images map[string]string) []string {
+	out := make([]string, 0, len(images))
+	for name, image := range images {
+		out = append(out, name+"="+image)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // propagation returns the propagation of opts: background when it is
 // not set.
 func (opts DeleteOptions) propagation() Propagation {
@@ -65,10 +76,14 @@ func (opts DeleteOptions) propagation() Propagation {
 	return opts.Propagation
 }
 
-func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions) error {
+func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions) (err error) {
 	if err := s.begin(ctx, actDelete, ref); err != nil {
 		return err
 	}
+	defer func() {
+		s.logAction(ctx, actDelete, ref, err,
+			slog.String("propagation", string(opts.propagation())), slog.Bool("force", opts.Force))
+	}()
 	return s.delete(ctx, ref, opts)
 }
 
@@ -83,20 +98,22 @@ func (s *session) delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 	return s.objectClient(ref).Delete(ctx, ref.Name, del)
 }
 
-func (s *session) Kill(ctx context.Context, pod ObjectRef) error {
+func (s *session) Kill(ctx context.Context, pod ObjectRef) (err error) {
 	if err := s.begin(ctx, actKill, pod); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, actKill, pod, err) }()
 	if err := kindIs("kill", pod, podKinds...); err != nil {
 		return err
 	}
 	return s.delete(ctx, pod, DeleteOptions{Propagation: PropagationBackground, Force: true})
 }
 
-func (s *session) Update(ctx context.Context, ref ObjectRef, text string) error {
+func (s *session) Update(ctx context.Context, ref ObjectRef, text string) (err error) {
 	if err := s.begin(ctx, actUpdate, ref); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, actUpdate, ref, err) }()
 	obj, err := parseObject(ref, text)
 	if err != nil {
 		return err
@@ -124,8 +141,8 @@ func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error)
 	wantVersion := ref.Resource.GVR.GroupVersion().String()
 	if obj.GetAPIVersion() != wantVersion || obj.GetKind() != ref.Resource.Kind ||
 		obj.GetName() != ref.Name || obj.GetNamespace() != ref.Namespace {
-		return nil, fmt.Errorf("the YAML names another object: %s, not %s",
-			describeObject(obj.GetAPIVersion(), obj.GetKind(), obj.GetNamespace(), obj.GetName()),
+		// Nothing of the YAML is said, since the error is logged.
+		return nil, fmt.Errorf("the YAML names another object: it must be %s",
 			describeObject(wantVersion, ref.Resource.Kind, ref.Namespace, ref.Name))
 	}
 	if obj.GetResourceVersion() == "" {
@@ -140,10 +157,11 @@ type scaleClient interface {
 	UpdateScale(ctx context.Context, name string, scale *autoscalingv1.Scale, opts metav1.UpdateOptions) (*autoscalingv1.Scale, error)
 }
 
-func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) error {
+func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) (err error) {
 	if err := s.begin(ctx, actScale, ref); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, actScale, ref, err, slog.Int("replicas", int(replicas))) }()
 	if err := kindIs("scale", ref, scaleKinds...); err != nil {
 		return err
 	}
@@ -173,10 +191,11 @@ func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) erro
 // template.
 const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
 
-func (s *session) Restart(ctx context.Context, ref ObjectRef) error {
+func (s *session) Restart(ctx context.Context, ref ObjectRef) (err error) {
 	if err := s.begin(ctx, actRestart, ref); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, actRestart, ref, err) }()
 	if err := kindIs("restart", ref, workloadKinds...); err != nil {
 		return err
 	}
@@ -198,10 +217,11 @@ func (s *session) patchTemplate(ctx context.Context, ref ObjectRef, template map
 	return err
 }
 
-func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[string]string) error {
+func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[string]string) (err error) {
 	if err := s.begin(ctx, actSetImages, ref); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, actSetImages, ref, err, slog.Any("images", imagePairs(images))) }()
 	if err := kindIs("set the images of", ref, workloadKinds...); err != nil {
 		return err
 	}
@@ -251,10 +271,11 @@ func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[strin
 	return s.patchTemplate(ctx, ref, map[string]any{"spec": spec})
 }
 
-func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) error {
+func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error) {
 	if err := s.begin(ctx, actRollback, replicaSet); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, actRollback, replicaSet, err) }()
 	if err := kindIs("roll back to", replicaSet, rsKinds...); err != nil {
 		return err
 	}
@@ -288,10 +309,11 @@ func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) error {
 // is.
 const revisionAnnotation = "deployment.kubernetes.io/revision"
 
-func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (string, error) {
+func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (job string, err error) {
 	if err := s.begin(ctx, actTrigger, cronJob); err != nil {
 		return "", err
 	}
+	defer func() { s.logAction(ctx, actTrigger, cronJob, err, slog.String("job", job)) }()
 	if err := kindIs("trigger", cronJob, cronJobKinds...); err != nil {
 		return "", err
 	}
@@ -299,11 +321,11 @@ func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (string, error
 	if err != nil {
 		return "", err
 	}
-	job, err := s.c.typed.BatchV1().Jobs(cj.Namespace).Create(ctx, jobFromCronJob(cj, manualJobName(cj.Name)), metav1.CreateOptions{})
+	created, err := s.c.typed.BatchV1().Jobs(cj.Namespace).Create(ctx, jobFromCronJob(cj, manualJobName(cj.Name)), metav1.CreateOptions{})
 	if err != nil {
 		return "", err
 	}
-	return job.Name, nil
+	return created.Name, nil
 }
 
 // manualJobName returns the name of a job that is triggered by hand from
@@ -343,7 +365,7 @@ func jobFromCronJob(cj *batchv1.CronJob, name string) *batchv1.Job {
 	}
 }
 
-func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended bool) error {
+func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended bool) (err error) {
 	action := actResume
 	if suspended {
 		action = actSuspend
@@ -351,6 +373,7 @@ func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended
 	if err := s.begin(ctx, action, cronJob); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, action, cronJob, err) }()
 	if err := kindIs(action, cronJob, cronJobKinds...); err != nil {
 		return err
 	}

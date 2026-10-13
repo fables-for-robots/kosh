@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubedrain "k8s.io/kubectl/pkg/drain"
 )
 
-func (s *session) Cordon(ctx context.Context, node ObjectRef, on bool) error {
+func (s *session) Cordon(ctx context.Context, node ObjectRef, on bool) (err error) {
 	action := actUncordon
 	if on {
 		action = actCordon
@@ -18,6 +19,7 @@ func (s *session) Cordon(ctx context.Context, node ObjectRef, on bool) error {
 	if err := s.begin(ctx, action, node); err != nil {
 		return err
 	}
+	defer func() { s.logAction(ctx, action, node, err) }()
 	if err := kindIs(action, node, nodeKinds...); err != nil {
 		return err
 	}
@@ -33,14 +35,25 @@ func (s *session) cordon(ctx context.Context, h *kubedrain.Helper, name string, 
 	return kubedrain.RunCordonOrUncordon(h, n, on)
 }
 
-func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) error {
+func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) (err error) {
 	if err := s.begin(ctx, actDrain, node); err != nil {
 		return err
 	}
+	out := &lockedBuffer{}
+	defer func() {
+		s.logAction(ctx, actDrain, node, err,
+			slog.Int("gracePeriod", opts.GracePeriod),
+			slog.Duration("timeout", opts.Timeout),
+			slog.Bool("ignoreDaemonSets", opts.IgnoreDaemonSets),
+			slog.Bool("deleteEmptyDirData", opts.DeleteEmptyDirData),
+			slog.Bool("force", opts.Force),
+			slog.Bool("disableEviction", opts.DisableEviction),
+			slog.String("output", out.String()),
+		)
+	}()
 	if err := kindIs(actDrain, node, nodeKinds...); err != nil {
 		return err
 	}
-	out := &lockedBuffer{}
 	h := &kubedrain.Helper{
 		Ctx:                 ctx,
 		Client:              s.c.typed,
