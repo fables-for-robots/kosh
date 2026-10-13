@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,5 +159,68 @@ func TestIrohSessionEndsTheConnection(t *testing.T) {
 	ended := time.Now()
 	if d := closedByTheServer(t, cl, "an iroh connection whose session ended").Sub(ended); d < idle/2 {
 		t.Errorf("the connection was closed %v after its session ended, want about %v", d, idle)
+	}
+}
+
+// A stop tells a session over iroh why it ends before it closes what
+// carries it, as it does over TCP.
+func TestShutdownTellsSessionsOverIroh(t *testing.T) {
+	for _, transport := range []string{"iroh", "tcp"} {
+		t.Run(transport, func(t *testing.T) {
+			h := newHarness(t)
+			key := h.key("alice", false)
+			var (
+				cl    *ssh.Client
+				il    *irohListener
+				err   error
+				srvDn = h.served
+			)
+			if transport == "iroh" {
+				il = h.serveIroh()
+				if cl, err = il.connect(t, key); err != nil {
+					t.Fatalf("connecting over iroh: %v", err)
+				}
+				t.Cleanup(func() { _ = cl.Close() })
+			} else {
+				cl = h.dial(key, "kosh")
+			}
+			tm := openTerm(t, cl)
+			tm.waitFor(testWord)
+
+			ctx, cancel := context.WithTimeout(context.Background(), waitTime)
+			defer cancel()
+			if err := h.srv.Shutdown(ctx); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+			if st := tm.exit(); st != 1 {
+				t.Errorf("exit status %d, want 1", st)
+			}
+			if out := tm.stdout.String(); !strings.HasSuffix(out, MsgShuttingDown+"\r\n") {
+				t.Errorf("the session did not end with %q: %q", MsgShuttingDown, out)
+			}
+			rec := h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" })
+			if rec.Attrs["reason"] != MsgShuttingDown {
+				t.Errorf("the session's end is logged as %v", rec)
+			}
+			if il != nil {
+				select {
+				case err := <-il.served:
+					if err != nil {
+						t.Errorf("Serve of the iroh listener: %v", err)
+					}
+					il.served <- err
+				case <-timeAfterWait():
+					t.Fatal("Serve of the iroh listener has not returned")
+				}
+			}
+			select {
+			case <-srvDn:
+				if h.serveErr != nil {
+					t.Errorf("Serve of the TCP listener: %v", h.serveErr)
+				}
+			case <-timeAfterWait():
+				t.Fatal("Serve of the TCP listener has not returned")
+			}
+		})
 	}
 }

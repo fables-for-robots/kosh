@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -18,6 +19,7 @@ const (
 	reasonHandshakeDeadline = "the handshake took too long"
 	// Why a connection is closed once it has authenticated.
 	reasonTooManyConnectionsOfKey = "too many connections of this key are open"
+	reasonKeyRemoved              = "its key is no longer in the key list"
 )
 
 // maxSessionChannels is how many session channels one connection may
@@ -63,10 +65,13 @@ type conn struct {
 	// overKeyLimit is set when the connection is closed for its key's
 	// limit, which is logged then and not again as a failed connection.
 	overKeyLimit atomic.Bool
+	// read counts the bytes read from the client.
+	read atomic.Int64
 
 	mu       sync.Mutex
 	authed   bool
 	closed   bool
+	keyGone  bool        // its key left the key list: closed when it has no session
 	sessions int         // sessions whose handler runs
 	channels int         // session channels open
 	idle     *time.Timer // closes the connection when it has no session
@@ -104,15 +109,16 @@ func (c *conn) leaveHandshake() {
 }
 
 // authenticated is called when the client has proved that it holds an
-// accepted key. A connection beyond its key's limit is closed now; any
-// other is closed from now on when it has no session for IdleConnection.
+// accepted key. A connection beyond its key's limit, or whose key has left
+// the list since it was accepted, is closed now; any other is closed from
+// now on when it has no session for IdleConnection.
 func (c *conn) authenticated() {
 	c.leaveHandshake()
-	if !c.srv.countKey(c) {
+	if reason := c.srv.countKey(c); reason != "" {
 		c.overKeyLimit.Store(true)
 		g, _ := c.srv.cfg.Keys.Lookup(c.key)
 		c.srv.log.Warn("connection closed after authenticating", "transport", c.transport, "remote", c.remote,
-			"key", g.Name, "fingerprint", fingerprint(c.key), "reason", reasonTooManyConnectionsOfKey)
+			"key", g.Name, "fingerprint", fingerprint(c.key), "reason", reason)
 		_ = c.Close()
 		return
 	}
@@ -124,18 +130,23 @@ func (c *conn) authenticated() {
 	}
 }
 
-// countKey counts c among the connections of its key, and reports false
-// when the key has maxConnectionsPerKey already. A connection that is
+// countKey counts c among the connections of its key, and returns why
+// it does not: the key has maxConnectionsPerKey already, or it is no
+// longer in the key list (looked up under s.mu, as keysChanged looks: a
+// change of the list is seen either here or there). A connection that is
 // closed is not counted.
-func (s *Server) countKey(c *conn) bool {
+func (s *Server) countKey(c *conn) string {
 	if c.key == nil {
-		return true // cannot be: only keys authenticate
+		return "" // cannot be: only keys authenticate
 	}
 	fp := gossh.FingerprintSHA256(c.key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.cfg.Keys.Lookup(c.key); !ok {
+		return reasonKeyRemoved
+	}
 	if s.perKey[fp] >= maxConnectionsPerKey {
-		return false
+		return reasonTooManyConnectionsOfKey
 	}
 	c.mu.Lock()
 	closed := c.closed
@@ -144,7 +155,27 @@ func (s *Server) countKey(c *conn) bool {
 		s.perKey[fp]++
 		c.keyFingerprint = fp
 	}
-	return true
+	return ""
+}
+
+// keyRemoved is called when c's key has left the key list, after its
+// sessions were told to end: c is closed now when it has no session, or
+// else when its last session has ended.
+func (c *conn) keyRemoved() {
+	c.mu.Lock()
+	c.keyGone = true
+	now := c.sessions == 0 && !c.closed
+	c.mu.Unlock()
+	if now {
+		c.closeForKey()
+	}
+}
+
+// closeForKey closes c, whose key has left the list, and logs it.
+func (c *conn) closeForKey() {
+	c.srv.log.Info("connection closed", "transport", c.transport, "remote", c.remote,
+		"fingerprint", fingerprint(c.key), "reason", reasonKeyRemoved)
+	_ = c.Close()
 }
 
 // uncountKey takes c from the connections of its key, if it is counted.
@@ -160,11 +191,11 @@ func (s *Server) uncountKey(c *conn) {
 }
 
 // openChannel counts a new session channel, and reports false when the
-// connection has maxSessionChannels already. closeChannel takes it back.
+// connection has maxSessionChannels already, or its key left the list. closeChannel takes it back.
 func (c *conn) openChannel() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.channels >= maxSessionChannels {
+	if c.channels >= maxSessionChannels || c.keyGone {
 		return false
 	}
 	c.channels++
@@ -187,10 +218,14 @@ func (c *conn) sessionStarted() {
 
 func (c *conn) sessionEnded() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.sessions--
-	if c.sessions == 0 && c.authed && !c.closed {
+	gone := c.sessions == 0 && c.keyGone && !c.closed
+	if c.sessions == 0 && c.authed && !c.closed && !gone {
 		c.armIdleLocked()
+	}
+	c.mu.Unlock()
+	if gone {
+		c.closeForKey()
 	}
 }
 
@@ -218,6 +253,15 @@ func (c *conn) disarmIdleLocked() {
 		c.idle.Stop()
 		c.idle = nil
 	}
+}
+
+// Read reads from the client, and counts what it read.
+func (c *conn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.read.Add(int64(n))
+	}
+	return n, err
 }
 
 // Close closes the connection, and gives its place in the handshake back
@@ -304,13 +348,31 @@ func authLog(cm gossh.ConnMetadata, _ string, err error) {
 }
 
 // failureReason is why a connection that did not authenticate was
-// closed, for the log.
+// closed, for the log: the library's error, cut by cutReason, as it may
+// repeat what the peer sent.
 func failureReason(err error) string {
 	var ne net.Error
 	if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
 		return reasonHandshakeDeadline
 	}
-	return err.Error()
+	return cutReason(err.Error())
+}
+
+// maxReason is how many bytes of a reason the log holds of a connection
+// that has not authenticated.
+const maxReason = 256
+
+// cutReason returns s, or when it is longer than maxReason bytes, its
+// first maxReason bytes or fewer, cut at the start of a rune, and "…".
+func cutReason(s string) string {
+	if len(s) <= maxReason {
+		return s
+	}
+	n := maxReason
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 // RemoteAddr returns the client's address, which leads back to c.

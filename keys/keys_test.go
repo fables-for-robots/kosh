@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -375,33 +376,53 @@ func TestParseRejectsCertificates(t *testing.T) {
 }
 
 func TestParseReadOnlyAsComment(t *testing.T) {
-	const reason = "read-only is an option and goes in front of the key"
+	const reason = "read-only is an option and goes in front of the key type; a full key's name must not hold read-only, readonly, read_only or read only"
 	for _, tc := range []struct {
 		line     string // with KEY for the key
 		rejected bool
+		why      string
 	}{
-		{"KEY read-only", true},
-		{"KEY READ-ONLY guest", true},
-		{"KEY read-only\tguest", true},
-		{"KEY  Read-Only  guest", true},
-		{"read-only KEY read-only", true},
-		{"read-only KEY READ-ONLY guest", true},
-		{"read-only KEY read-only\tguest", true},
-		{"KEY bob's read-only laptop", false},
-		{"KEY read-only-bot", false},
-		{"KEY read-onlyguest", false},
-		{"read-only KEY read-only-bot", false},
+		{"KEY read-only", true, "the comment is the option"},
+		{"KEY READ-ONLY guest", true, "in any case"},
+		{"KEY read-only\tguest", true, "followed by a tab"},
+		{"KEY  Read-Only  guest", true, "in mixed case"},
+		{"KEY (read-only) guest", true, "in brackets"},
+		{"KEY guest read-only", true, "after the name"},
+		{"KEY readonly", true, "without the dash"},
+		{"KEY read_only bot", true, "with an underscore"},
+		{"KEY read only", true, "with a space"},
+		{"KEY read\u2011only", true, "with a non-breaking hyphen, a dash (Pd)"},
+		{"KEY read\u2014only", true, "with an em dash (Pd)"},
+		{"KEY re\u200bad-only", true, "with a zero-width space, a format character (Cf)"},
+		{"KEY \ufeffread-only", true, "after a byte order mark (Cf)"},
+		{"KEY bob's read-only laptop", true, "anywhere in the comment"},
+		{"KEY read-only-bot", true, "as part of a word: read-only is in it"},
+		{"KEY read-onlyguest", true, "as part of a word"},
+		{"KEY thread-only-ish", true, "th + read-only + -ish: the words are in it, and the rule does not look for word boundaries"},
+		{"KEY reader", false, "read, but not read-only"},
+		{"KEY read-write", false, "read, but not read-only"},
+		{"KEY only reads", false, "the words, but not in that order"},
+		{"read-only KEY read-only", false, "the option is there: any comment"},
+		{"read-only KEY guest read-only", false, "the option is there: any comment"},
+		{"READ-ONLY KEY (readonly) guest", false, "the option is there: any comment"},
 	} {
 		t.Run(tc.line, func(t *testing.T) {
+			line, err := strconv.Unquote(`"` + tc.line + `"`)
+			if err != nil {
+				t.Fatal(err)
+			}
 			key, keyLine := newKey(t)
-			set, rejected := parseString(strings.Replace(tc.line, "KEY", keyLine, 1) + "\n")
+			set, rejected := parseString(strings.Replace(line, "KEY", keyLine, 1) + "\n")
 			if !tc.rejected {
 				noRejected(t, rejected)
-				mustGrant(t, set, key)
+				g := mustGrant(t, set, key)
+				if strings.HasPrefix(strings.ToLower(line), "read-only ") && !g.ReadOnly {
+					t.Errorf("%s: the key is full", tc.why)
+				}
 				return
 			}
 			if len(rejected) != 1 || rejected[0].Reason != reason {
-				t.Fatalf("rejected = %+v, want: %s", rejected, reason)
+				t.Fatalf("%s: rejected = %+v, want: %s", tc.why, rejected, reason)
 			}
 			mustNotGrant(t, set, key)
 		})

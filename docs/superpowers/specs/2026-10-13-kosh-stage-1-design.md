@@ -189,7 +189,9 @@ read-only ssh-ed25519 AAAAC3Nza...  guest@laptop
   it has none.
 - **A key that is listed twice** is read-only if any of its lines says
   so, and has the name of its first line.
-- **A comment that begins with the word `read-only`** rejects the line:
+- **A comment that holds `read-only`** (or `readonly`, `read_only`,
+  `read only`, anywhere, in any case, whatever dash or invisible
+  character it is written with) rejects a line without the option:
   `ssh-ed25519 AAAA… read-only guest` is how a read-only key is written
   wrongly, and as the format stands it would be a full key.
 - Every key type `golang.org/x/crypto/ssh` reads is accepted, **except

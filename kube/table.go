@@ -46,8 +46,12 @@ func newRESTTables(cfg *rest.Config) (*restTables, error) {
 }
 
 func (t *restTables) listTable(ctx context.Context, r Resource, namespace string) (*metav1.Table, error) {
+	p, err := listPath(r, namespace)
+	if err != nil {
+		return nil, err
+	}
 	raw, err := t.client.Get().
-		AbsPath(listPath(r, namespace)).
+		AbsPath(p).
 		Param("includeObject", "Metadata").
 		SetHeader("Accept", tableAccept).
 		Do(ctx).Raw()
@@ -65,16 +69,30 @@ func (t *restTables) listTable(ctx context.Context, r Resource, namespace string
 }
 
 // listPath returns the path of the list of r, in namespace when r is
-// namespaced and namespace is not empty.
-func listPath(r Resource, namespace string) string {
+// namespaced and namespace is not empty. The client cleans the path it is
+// given of "." and "..", so every string that goes into it is checked
+// here, whatever was checked before: the GVR's strings as checkGVR says
+// (an error that wraps ErrUnknownResource), the namespace as
+// checkNamespace says (ErrInvalidNamespace). A name of these kinds is
+// one path segment that needs no escaping.
+func listPath(r Resource, namespace string) (string, error) {
+	if err := checkGVR(r.GVR); err != nil {
+		return "", err
+	}
+	if !r.Namespaced {
+		namespace = ""
+	}
+	if err := checkNamespace(r, namespace); err != nil {
+		return "", err
+	}
 	p := "/apis/" + r.GVR.Group + "/" + r.GVR.Version
 	if r.GVR.Group == "" {
 		p = "/api/" + r.GVR.Version
 	}
-	if r.Namespaced && namespace != "" {
+	if namespace != "" {
 		p += "/namespaces/" + namespace
 	}
-	return p + "/" + r.GVR.Resource
+	return p + "/" + r.GVR.Resource, nil
 }
 
 // tableWatch is the table of a resource that is not typed: the API

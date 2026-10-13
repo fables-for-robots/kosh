@@ -3,6 +3,7 @@ package kube
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -18,9 +19,11 @@ func (s *session) Cordon(ctx context.Context, node ObjectRef, on bool) (err erro
 	if on {
 		action = actCordon
 	}
-	if err := s.begin(ctx, action, node); err != nil {
+	ctx, release, err := s.begin(ctx, action, node)
+	if err != nil {
 		return err
 	}
+	defer release()
 	defer func() { s.logAction(ctx, action, node, err) }()
 	if err := s.c.checkRef(node); err != nil {
 		return err
@@ -41,9 +44,11 @@ func (s *session) cordon(ctx context.Context, h *kubedrain.Helper, name string, 
 }
 
 func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) (err error) {
-	if err := s.begin(ctx, actDrain, node); err != nil {
+	ctx, release, err := s.begin(ctx, actDrain, node)
+	if err != nil {
 		return err
 	}
+	defer release()
 	out := &drainOutput{}
 	defer func() {
 		s.logAction(ctx, actDrain, node, err,
@@ -66,7 +71,24 @@ func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) 
 	if err := s.cordon(ctx, h, node.Name, true); err != nil {
 		return err
 	}
-	return kubedrain.RunNodeDrain(h, node.Name)
+	return runUntilDone(ctx, func() error { return kubedrain.RunNodeDrain(h, node.Name) })
+}
+
+// runUntilDone runs f, and returns what it returns, or as soon as ctx
+// ends, an error that wraps ctx's cause. kubectl's drain sleeps between
+// two evictions the API refused for now, and asks discovery whether it
+// may evict, without a context: neither can be cut short, so f is left
+// to end by itself. Every request it sends after ctx ended carries ctx
+// and fails, and its goroutines return at the next look at ctx.
+func runUntilDone(ctx context.Context, f func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("stopped: %w", context.Cause(ctx))
+	}
 }
 
 // evictRetryDelay is how long a drain waits before it asks again to

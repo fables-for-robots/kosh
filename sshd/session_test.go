@@ -139,25 +139,29 @@ func TestGrantChangedEndsTheSession(t *testing.T) {
 	}
 }
 
+// A connection whose key leaves the list before it opened a session is
+// closed: it gets no session. (A session that begins while the list
+// changes is refused by register, as TestKeyRemovedEndsTheSession's.)
 func TestKeyRemovedBetweenHandshakeAndSession(t *testing.T) {
 	h := newHarness(t)
 	alice := newSigner(t)
 	setKeys(t, h.list, keyLine(alice, "alice", false))
 	cl := h.dial(alice, "kosh")
 	setKeys(t, h.list, otherKey(t))
-	tm := openTerm(t, cl)
-	if st := tm.exit(); st != 1 {
-		t.Errorf("exit status %d, want 1", st)
+	select {
+	case <-closed(cl):
+	case <-timeAfterWait():
+		t.Fatal("the connection is still open")
 	}
-	if got := tm.stdout.String(); got != MsgKeyRemoved+"\r\n" {
-		t.Errorf("the session was told %q, want %q", got, MsgKeyRemoved)
+	if _, err := cl.NewSession(); err == nil {
+		t.Error("a session was opened")
 	}
 	if h.models.Load() != 0 {
 		t.Error("a model was made")
 	}
 	fp := ssh.FingerprintSHA256(alice.PublicKey())
-	h.log.waitFor(t, "of the refused session", func(r logRecord) bool {
-		return r.Msg == "session refused" && r.Attrs["reason"] == MsgKeyRemoved && r.Attrs["fingerprint"] == fp
+	h.log.waitFor(t, "of the closed connection", func(r logRecord) bool {
+		return r.Msg == "connection closed" && r.Attrs["reason"] == reasonKeyRemoved && r.Attrs["fingerprint"] == fp
 	})
 }
 
@@ -226,6 +230,12 @@ func TestReplaceDoesNotBlockOnSessions(t *testing.T) {
 	}
 	// The session cannot be told; its connection is closed instead.
 	contextEnds(t, s, "after its key was removed and it could not end")
+	rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
+		return strings.HasPrefix(r.Msg, "session did not end in time")
+	})
+	if rec.Attrs["key"] != "alice" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) {
+		t.Errorf("the line %v does not name the key by its name and fingerprint", rec)
+	}
 }
 
 func TestShutdown(t *testing.T) {

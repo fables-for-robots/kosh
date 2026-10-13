@@ -43,6 +43,8 @@ type logSource struct {
 // and init containers; the stream ends with Close, with the session's context
 // and with the Cluster.
 func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (LogStream, error) {
+	ctx, release := s.bound(ctx)
+	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return nil, err
 	}

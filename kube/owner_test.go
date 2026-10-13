@@ -70,3 +70,28 @@ func TestOwner(t *testing.T) {
 		t.Errorf("an object that is not there: got %v, want the API's error", err)
 	}
 }
+
+// Owner reads only an object's metadata: of a Secret, a read-only key's
+// question fetches nothing of its data into kosh.
+func TestOwnerReadsOnlyMetadata(t *testing.T) {
+	secret := &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "token",
+			OwnerReferences: []metav1.OwnerReference{readOwnerRef("v1", "ConfigMap", "settings", true)}},
+		Data: map[string][]byte{"token": []byte("s3cr3t")},
+	}
+	e := newEnv(t, envConfig{}, secret)
+	e.typed.ClearActions()
+	e.dyn.ClearActions()
+	ro := readSessionOf(t, e, readOnlyGrant)
+	got, err := ro.Owner(context.Background(), ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "settings" || !got.Resource.Is("", "configmaps") || got.Namespace != "default" {
+		t.Errorf("owner %s", got)
+	}
+	if aa := readActionsOn(e, "secrets"); len(aa) != 0 {
+		t.Errorf("the Secret was read whole: %v", aa)
+	}
+}

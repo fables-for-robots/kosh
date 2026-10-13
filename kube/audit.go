@@ -30,19 +30,57 @@ const (
 	actDrain     = "drain"
 )
 
-// begin is how every action begins: a read-only grant gets ErrReadOnly,
-// and its refusal is logged at warn level.
-func (s *session) begin(ctx context.Context, action string, ref ObjectRef) error {
+// The words of the reads that the grant decides, as the log names them.
+const (
+	readYAML       = "yaml"
+	readDescribe   = "describe"
+	readSecretData = "secret-data"
+)
+
+// errSessionEnded is what an action of a session that has ended gets,
+// and why one that runs when its session ends is stopped.
+var errSessionEnded = errors.New("the session has ended")
+
+// begin is how every action begins. A session that has ended is refused
+// with errSessionEnded, and a read-only grant with ErrReadOnly; either
+// refusal is logged at warn level. Otherwise begin returns the context
+// the action runs with: ctx, ended also when the session ends, with
+// errSessionEnded as its cause; and the function that releases it, which
+// the action defers.
+func (s *session) begin(ctx context.Context, action string, ref ObjectRef) (context.Context, context.CancelFunc, error) {
+	if s.ctx.Err() != nil {
+		s.logRefusal(ctx, action, ref, slog.String("reason", errSessionEnded.Error()))
+		return nil, nil, errSessionEnded
+	}
 	if err := s.mayChange(); err != nil {
-		s.c.log.LogAttrs(ctx, slog.LevelWarn, "refused",
-			slog.String("key", s.grant.Name),
-			slog.String("fingerprint", s.grant.Fingerprint),
-			slog.String("action", action),
-			slog.String("object", ref.String()),
-		)
+		s.logRefusal(ctx, action, ref)
+		return nil, nil, err
+	}
+	actx, release := s.bound(ctx)
+	return actx, release, nil
+}
+
+// mayRead is how every read that the grant decides begins: a read-only
+// grant gets ErrReadOnly for a Secret, as maySee says, and its refusal
+// is logged at warn level, as an action's is.
+func (s *session) mayRead(ctx context.Context, read string, ref ObjectRef) error {
+	if err := s.maySee(ref); err != nil {
+		s.logRefusal(ctx, read, ref)
 		return err
 	}
 	return nil
+}
+
+// logRefusal logs at warn level that the grant refused what to the
+// object: the key's name and fingerprint, the word of the action or
+// read, the object, and attrs. Nothing of the object itself.
+func (s *session) logRefusal(ctx context.Context, what string, ref ObjectRef, attrs ...slog.Attr) {
+	s.c.log.LogAttrs(ctx, slog.LevelWarn, "refused", append([]slog.Attr{
+		slog.String("key", s.grant.Name),
+		slog.String("fingerprint", s.grant.Fingerprint),
+		slog.String("action", what),
+		slog.String("object", ref.String()),
+	}, attrs...)...)
 }
 
 // logAction logs a call of an action that got past the grant, once the

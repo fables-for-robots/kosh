@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -62,6 +63,9 @@ type Cluster struct {
 	// informers convert what the API sends into: render.Zero.
 	zeroOf func(schema.GroupVersionResource) (runtime.Object, bool)
 	tables tableLister // nil without cfg, until a test sets its fake
+	// meta reads objects' metadata alone; nil without cfg, until a test
+	// sets its fake.
+	meta metadata.Interface
 	// openLog opens the log of one container of a pod: the typed
 	// client's GetLogs(…).Stream. Tests give streams of their own.
 	openLog func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
@@ -143,6 +147,9 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 			c.log.Error("the API server's tables cannot be read", "err", err)
 		} else {
 			c.tables = tables
+		}
+		if c.meta, err = metadata.NewForConfig(cfg); err != nil {
+			c.log.Error("the API server's metadata cannot be read", "err", err)
 		}
 	}
 	if resources == nil {

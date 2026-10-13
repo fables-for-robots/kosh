@@ -4,18 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	ucli "github.com/urfave/cli/v2"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 
 	"github.com/fables-for-robots/kosh/irohnet"
@@ -152,6 +156,8 @@ func serve(ctx context.Context, o serveOptions) error {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 	routeKlog(log)
+	routeStdlog(log)
+	defer unrouteStdlog(log)
 
 	timeout := o.stopTimeout
 	if timeout <= 0 {
@@ -161,7 +167,7 @@ func serve(ctx context.Context, o serveOptions) error {
 	if err := r.start(ctx, o, bind); err != nil {
 		r.stop(timeout)
 		if ctx.Err() != nil {
-			log.Info("kosh has stopped before it served")
+			log.Info("kosh has stopped before it served", "err", loggableStartError(err))
 			return nil
 		}
 		return err
@@ -175,6 +181,18 @@ func serve(ctx context.Context, o serveOptions) error {
 	r.stop(timeout)
 	log.Info("kosh has stopped")
 	return fail
+}
+
+// loggableStartError returns the error of a start as the log holds it:
+// of an error of the API, only its code, after the step that failed, as
+// nothing of an API error's text is logged; any other error as it is.
+func loggableStartError(err error) string {
+	var api apierrors.APIStatus
+	if !errors.As(err, &api) {
+		return err.Error()
+	}
+	step, _, _ := strings.Cut(err.Error(), ": ")
+	return fmt.Sprintf("%s: the API answered (%d)", step, api.Status().Code)
 }
 
 // running is what serve has started, for stop to stop.
@@ -456,4 +474,77 @@ func (h klogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h klogHandler) WithGroup(name string) slog.Handler {
 	return klogHandler{with: append(slices.Clip(h.with), func(t slog.Handler) slog.Handler { return t.WithGroup(name) })}
+}
+
+// stdlogTo is the log that the lines of Go's standard log package go to:
+// that of the serve that started last, while it runs. Nil when none runs.
+var (
+	stdlogTo   atomic.Pointer[slog.Logger]
+	stdlogOnce sync.Once
+)
+
+// routeStdlog sends what Go's standard log package prints, as quic-go
+// prints a warning about the UDP receive buffer, to log: each line one
+// record at warn level, with source=log. The standard logger is set once
+// for the process, without its own date; after that only the log it goes
+// to changes.
+//
+// A log whose handler is Go's default slog handler, which writes through
+// the standard logger, is never where the standard logger's lines go: a
+// line would wait for the standard logger's lock, which its Print holds,
+// for ever. The routing is then left as it is, and a debug line says so.
+func routeStdlog(log *slog.Logger) {
+	if reflect.TypeOf(log.Handler()) == defaultSlogHandler {
+		log.Debug("the standard log is not routed: kosh's log is Go's default slog, which writes through it")
+		return
+	}
+	stdlogTo.Store(log)
+	stdlogOnce.Do(func() {
+		stdlog.SetFlags(0)
+		stdlog.SetOutput(stdlogWriter{})
+	})
+}
+
+// defaultSlogHandler is the type of Go's default slog handler, taken
+// before anything could call slog.SetDefault.
+var defaultSlogHandler = reflect.TypeOf(slog.Default().Handler())
+
+// unrouteStdlog is called when the serve of log returns: unless another
+// serve has started since, the standard log's lines go to standard error
+// again, not to the log of a serve that has ended.
+func unrouteStdlog(log *slog.Logger) {
+	stdlogTo.CompareAndSwap(log, nil)
+}
+
+// stdlogWriter is the output of the standard logger, which writes each
+// line with one Write. A line is cut by cutLine.
+type stdlogWriter struct{}
+
+func (stdlogWriter) Write(p []byte) (int, error) {
+	log := stdlogTo.Load()
+	if log == nil {
+		return os.Stderr.Write(p)
+	}
+	msg := cutLine(strings.TrimSuffix(string(p), "\n"))
+	log.LogAttrs(context.Background(), slog.LevelWarn, msg, slog.String("source", "log"))
+	return len(p), nil
+}
+
+// maxStdlogLine is how many bytes of a line of the standard logger the
+// log holds: what libraries log through Go's default slog comes this way,
+// and the SSH library's errors may repeat what a peer sent.
+const maxStdlogLine = 1 << 10
+
+// cutLine returns s, or when it is longer than maxStdlogLine bytes, its
+// first maxStdlogLine bytes or fewer, cut at the start of a rune, and
+// "…".
+func cutLine(s string) string {
+	if len(s) <= maxStdlogLine {
+		return s
+	}
+	n := maxStdlogLine
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }

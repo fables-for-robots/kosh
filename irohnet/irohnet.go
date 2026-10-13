@@ -350,11 +350,15 @@ func (l *Listener) errClosed() error {
 	return &net.OpError{Op: "accept", Net: "iroh", Addr: l.Addr(), Err: net.ErrClosed}
 }
 
-// Close closes the endpoint and every connection of it.
+// Close closes the endpoint and every connection of it: those their
+// owners have not closed at once, while a connection its owner closed
+// is given the rest of its linger, for the peer to read the last bytes
+// and close it first. Close waits for those, the linger at most, before
+// it shuts the endpoint down.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		// The context first: spawn relies on it being done once closed
-		// is set.
+		// is set, and a conn closed from now on closes at once.
 		l.cancel()
 		l.mu.Lock()
 		l.closed = true
@@ -365,10 +369,12 @@ func (l *Listener) Close() error {
 		l.mu.Unlock()
 
 		for _, c := range conns {
-			c.Close()
+			c.closeNow()
 		}
-		l.closeErr = l.ep.Shutdown(context.Background())
+		// The waits for a peer run in goroutines of l.wg, as the accept
+		// loop and the waits for streams do, which end with l.ctx.
 		l.wg.Wait()
+		l.closeErr = l.ep.Shutdown(context.Background())
 	})
 	return l.closeErr
 }
