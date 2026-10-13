@@ -130,9 +130,12 @@ dependency tree kosh has no other use for.
 
 ## 5. The SSH server
 
-The server is `charm.land/wish/v2` over `charm.land/ssh`, with wish's
-Bubble Tea middleware: one Bubble Tea v2 program per session, on the
-session's terminal, in kosh's process.
+The server is `charm.land/wish/v2` over `charm.land/ssh`: one Bubble
+Tea v2 program per session, on the session's terminal, in kosh's
+process. kosh runs the program itself, with the options wish makes for a
+session, and not through wish's Bubble Tea middleware: the middleware
+drops the program's error, which is how a panic is known, and leaves the
+program listening for the process's signals.
 
 - **Authentication** is by public key and nothing else. A key is
   accepted when the key list holds it at that moment. The user name is
