@@ -90,8 +90,10 @@ stream and SSH runs in it.
   most, and gives it to the SSH server as a connection
   (`Conn.AcceptStreamConn`, then `Server.HandleConn`). The SSH client
   speaks first, which is what makes the stream visible to kosh.
-- When the SSH connection ends kosh closes the iroh connection. Further
-  streams of the same connection are not accepted.
+- When the SSH connection ends kosh closes the iroh connection, after
+  giving the client up to 2 seconds to close it first, so that the last
+  bytes are not cut off. Further streams of the same connection are not
+  accepted.
 - `--iroh=false` switches this transport off. With both transports off
   kosh refuses to start.
 
@@ -104,7 +106,14 @@ two ways, each with a flag that is on by default:
   reachable from anywhere, through a relay or directly when a path can
   be made.
 - `--iroh-mdns`: mDNS on the local network, under `_irohv1._udp.local.`,
-  the service name `iroh-ssh` asks for.
+  the service name `iroh-ssh` asks for, by an announcer of kosh's own:
+  the one go-iroh has is not found by `iroh-ssh` (§20). Of `iroh-ssh`,
+  only a build from its repository looks anything up by mDNS at the
+  time of writing; the released 0.2.12 does not.
+
+Neither announces the address of a tunnel: only addresses of interfaces
+that are up, broadcast, multicast and not point-to-point. A tunnel's
+address in an announcement was seen to make connections time out.
 
 With `--iroh` on, at least one of the two has to be on. kosh does not
 publish to the mainline DHT.
@@ -141,7 +150,15 @@ session's terminal, in kosh's process.
 - **Keepalive.** kosh sends an SSH keepalive request on every connection
   every 30 seconds. After three in a row without an answer it closes the
   connection, and with it the sessions and what they had open.
-- **No idle limit.** A session that only shows a log may stay.
+- **A connection without a session is closed** after 5 seconds, counted
+  from its authentication and from the end of its last session. A client
+  of `iroh-ssh` that exits often sends no close, and the connection
+  would otherwise linger until QUIC's idle timeout.
+- **Twenty tries to authenticate**, not the library's six: `iroh-ssh`
+  lets `ssh` offer every key of the user's agent before the one it was
+  given.
+- **No idle limit for a session.** A session that only shows a log may
+  stay.
 
 ## 6. The key list
 
@@ -670,6 +687,13 @@ The end-to-end tests run in the workflow on Linux and can be run on a
 Linux machine by hand. Those over the relays need the internet.
 
 ## 20. Settled first
+
+*What the probe found is in the plan's
+[`task-00-probe.md`](../plans/2026-10-13-kosh-stage-1/task-00-probe.md):
+the relay path holds, a Bubble Tea program runs over the stream as over
+TCP, and go-iroh's mDNS is not found by `iroh-ssh`, so `irohnet`
+announces by itself. §4.2 and §5 above say what followed from it. The
+section below is as it was written before the probe.*
 
 Two things this design rests on have not been tried. The plan's first
 task tries them with a throwaway program, before anything of kosh is

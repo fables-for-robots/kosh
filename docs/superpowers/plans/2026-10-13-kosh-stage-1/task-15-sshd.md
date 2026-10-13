@@ -22,6 +22,7 @@ kosh's SSH server: who gets in, and the life of a session. It serves connections
 1. `New` fails when `HostKeyPEM` does not parse, and when `Keys` or `Model` is nil. Zero limits get their defaults (30 s, 64, 30 s, 3).
 2. Authentication is by public key and nothing else: the public key handler accepts a key when `cfg.Keys.Lookup` finds it at that moment. No password handler, no keyboard-interactive handler. The user name is not looked at.
 3. The server's version string is `SSH-2.0-kosh_<Version>`.
+3a. A connection may try 20 times to authenticate (`MaxAuthTries` of the `gossh.ServerConfig`), not the library's 6: `iroh-ssh` lets `ssh` offer every key of the user's agent before the one named with `-i`, and each key offered is a try.
 4. **The handshake has a deadline** of `HandshakeTimeout` (`Server.HandshakeTimeout` of the library). A connection that has not authenticated by then is closed: one that sends nothing, one that sends bytes that are not SSH, one that asks whether a key would do and then stalls (Review Focus 3).
 5. **At most `MaxHandshakes` connections are in the handshake at once**, over every listener together. A connection that arrives when they are all taken is closed at once, and logged. A connection leaves the handshake when it has authenticated, or when it is closed, whichever is first, and never twice.
 
@@ -42,6 +43,10 @@ kosh's SSH server: who gets in, and the life of a session. It serves connections
 13. **The key list changed** (`cfg.Keys.OnChange`): every open session's key is looked up. One that is no longer found is ended with `MsgKeyRemoved`; one whose `ReadOnly` differs from the grant the session began with is ended with `MsgGrantChanged`. A change of the name alone ends nothing. The function you register must not block the caller of `Replace` on sessions: collect what to end under your lock, end them outside it.
 14. **`Shutdown`** closes every listener `Serve` was given, ends every session with `MsgShuttingDown`, then shuts the library's server down, and returns when every connection is closed or its context is done. `Serve` returns nil then, and also when its listener is closed.
 15. **A panic** in the model's `Init`, `Update` or `View` is recovered: it is logged at error level with the key's name and the stack, the session is ended with `MsgCrashed`, and every other session goes on. Wrap the model for this (`sshd/guard.go`); let Bubble Tea keep catching what it catches itself, so that a panic in a command's goroutine cannot take the process down, and log that case too when the program returns `tea.ErrProgramPanic`.
+
+**A connection without a session**
+
+15a. A connection that has no session is closed after `Config.IdleConnection` (default 5 seconds; add the field to `Config` in `sshd/sshd.go` with its documentation, the one change to the contract this task makes), counted from the moment it authenticated and again from the end of its last session. A client of `iroh-ssh` that exits often sends no close at all, and the connection would otherwise linger for half a minute, until QUIC's idle timeout; and a client that authenticates and opens nothing would hold a connection for ever. A connection that has a session is never closed by this rule, however long the session lasts. It needs to know when a connection has authenticated, which is the same moment as in 5, and how many sessions it has.
 
 **Keepalive**
 
@@ -81,6 +86,8 @@ kosh's SSH server: who gets in, and the life of a session. It serves connections
 | `TestGarbagePeerIsClosed` | a connection that sends `GET / HTTP/1.1\r\n\r\n`, and one that sends 1 MB of zeros: closed, and the server goes on serving |
 | `TestHandshakeLimit` | `MaxHandshakes` 3: three idle connections are held; a fourth is closed at once; after one of the three authenticates, another idle one is held again; after the deadline has closed the idle ones, three more are held |
 | `TestAskingAboutAKeyDoesNotLeaveTheHandshake` | a client that sends the public key query for an accepted key and then stalls still counts against the limit, and is closed by the deadline. (Drive the query with `x/crypto/ssh`'s client using a signer whose `Sign` blocks: the client library asks first and signs after.) |
+| `TestConnectionWithoutASessionIsClosed` | `IdleConnection` 100 ms: a client that authenticates and opens no session is closed by the server soon after; a client whose session ended and that stays connected is closed 100 ms later; a client with an open session is still connected after ten times that; a second session opened within the 100 ms after the first ended keeps the connection |
+| `TestTwentyAuthenticationTries` | a client that offers 15 keys that are not accepted and then the accepted one gets in |
 | `TestKeepaliveClosesADeadPeer` | interval 20 ms, misses 3: a client whose connection stops answering requests (a `net.Conn` wrapper in the test that swallows what the server sends from a moment on) is closed by the server; `Session.Context` is done |
 | `TestKeepaliveLeavesALivePeer` | the `x/crypto/ssh` client answers by itself: the session is still open after 20 intervals |
 | `TestServeTwoListeners` | two TCP listeners with transports `a` and `b`: sessions from each see their own `Transport`; closing one listener leaves the other serving |
@@ -99,7 +106,7 @@ kosh's SSH server: who gets in, and the life of a session. It serves connections
 - [ ] Ending a session; the key list; `Shutdown`. Commit: `SSHD: a session ends when its key goes, when its grant changes, and when kosh stops`.
 - [ ] The guard. Commit: `SSHD: a panic ends its own session and no other`.
 - [ ] The handshake deadline and limit. Commit: `SSHD: a peer that does not authenticate is closed by a deadline, and only so many may try at once`.
-- [ ] The keepalive. Commit: `SSHD: a peer that stopped answering is closed`.
+- [ ] The keepalive, and the connection without a session. Commit: `SSHD: a peer that stopped answering is closed, and so is a connection that has no session`.
 - [ ] Over iroh. Commit: `SSHD: the same server over an iroh endpoint`.
 - [ ] `go test -race ./sshd/...`; `gofmt -l . && go vet ./... && go build ./...` clean.
 
