@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,21 @@ func logPrepare(batch []kube.LogLine) []logLine {
 	return out
 }
 
+// logKeepLast keeps the last n of s at the start of its array, and
+// clears the rest of it, so that what was dropped is let go.
+func logKeepLast[T any](s []T, n int) []T {
+	if len(s) <= n {
+		return s
+	}
+	k := copy(s, s[len(s)-n:])
+	clear(s[k:])
+	return s[:k]
+}
+
+// logCopyMax is the most c copies: the lines from the end that fit in
+// it.
+const logCopyMax = 1 << 20
+
 // logBox holds a log view's stream and the context it reads with, so
 // that a stream opened after the view went on is closed too.
 type logBox struct {
@@ -202,12 +218,21 @@ type logView struct {
 	filter string
 	re     *regexp.Regexp
 
-	top  int // the first line shown, as an index of shown, while auto is off
-	w, h int // of the last drawing
+	pos  logPos // the first row shown while auto is off
+	w, h int    // of the last drawing
 }
 
-// newLogView returns the view of the log of ref, without a stream.
-func newLogView(e env, ref kube.ObjectRef, opts kube.LogOptions) *logView {
+// logPos is a row of the lines shown: the line, as an index of shown,
+// and the row in it when it is wrapped.
+type logPos struct{ line, row int }
+
+// before reports whether p comes before q.
+func (p logPos) before(q logPos) bool {
+	return p.line < q.line || p.line == q.line && p.row < q.row
+}
+
+// logNewView returns the view of the log of ref, without a stream.
+func logNewView(e env, ref kube.ObjectRef, opts kube.LogOptions) *logView {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &logView{
 		id:     newID(),
@@ -230,13 +255,28 @@ func (v *logView) newBox() *logBox {
 }
 
 // logOpen returns a command that opens the log of ref and pushes its
-// view. When the log cannot be opened no view is pushed, and the flash
-// says why.
+// view. When the log cannot be opened within apiTimeout no view is
+// pushed, and the flash says why.
 func logOpen(e env, ref kube.ObjectRef, opts kube.LogOptions) tea.Cmd {
+	return logOpenWithin(e, ref, opts, apiTimeout)
+}
+
+// logOpenWithin is logOpen with the time Logs has to return a stream.
+// When it has not returned by then, its context is cancelled. The
+// context of a stream that was opened lives as long as the view.
+func logOpenWithin(e env, ref kube.ObjectRef, opts kube.LogOptions, within time.Duration) tea.Cmd {
 	return func() tea.Msg {
-		v := newLogView(e, ref, opts)
+		v := logNewView(e, ref, opts)
 		box := v.newBox()
+		timer := time.AfterFunc(within, box.cancel)
 		s, err := e.sess.Logs(box.ctx, ref, opts)
+		if !timer.Stop() {
+			if err == nil {
+				s.Close()
+			}
+			v.Close()
+			return flashMsg{text: fmt.Sprintf("the log of %s did not open in %v", ref, within), err: true}
+		}
 		if err != nil {
 			v.Close()
 			return flashMsg{text: err.Error(), err: true}
@@ -265,11 +305,12 @@ func (v *logView) read() tea.Cmd {
 		var got []logLine
 		take := func(b []kube.LogLine) {
 			got = append(got, logPrepare(b)...)
-			if n := len(got) - kube.LogBufferLines; n > 0 {
-				got = got[n:]
+			if len(got) > 2*kube.LogBufferLines {
+				got = logKeepLast(got, kube.LogBufferLines)
 			}
 		}
 		msg := func(ended bool) tea.Msg {
+			got = logKeepLast(got, kube.LogBufferLines)
 			m := logReadMsg{id: id, gen: gen, lines: got, ended: ended, skipped: s.Skipped(), at: time.Now()}
 			if ended && s.Err() != nil {
 				m.err = cleanLine(s.Err().Error())
@@ -352,8 +393,12 @@ func (v *logView) Update(msg tea.Msg) (view, tea.Cmd) {
 }
 
 // add puts lines at the end of the buffer, and drops the oldest beyond
-// kube.LogBufferLines.
+// kube.LogBufferLines first, so that the buffer never holds more.
 func (v *logView) add(lines []logLine) {
+	if n := len(lines) - kube.LogBufferLines; n > 0 {
+		lines = lines[n:]
+	}
+	v.drop(len(v.lines) + len(lines) - kube.LogBufferLines)
 	for _, l := range lines {
 		v.lines = append(v.lines, l)
 		if v.passes(&l) {
@@ -367,20 +412,26 @@ func (v *logView) add(lines []logLine) {
 			}
 		}
 	}
-	n := len(v.lines) - kube.LogBufferLines
+}
+
+// drop lets go of the n oldest lines of the buffer.
+func (v *logView) drop(n int) {
 	if n <= 0 {
 		return
 	}
-	v.lines = v.lines[n:]
+	n = min(n, len(v.lines))
+	v.lines = logKeepLast(v.lines, len(v.lines)-n)
 	d := 0
 	for d < len(v.shown) && v.shown[d] < n {
 		d++
 	}
-	v.shown = v.shown[d:]
+	v.shown = logKeepLast(v.shown, len(v.shown)-d)
 	for i := range v.shown {
 		v.shown[i] -= n
 	}
-	v.top = max(v.top-d, 0)
+	if v.pos.line -= d; v.pos.line < 0 {
+		v.pos = logPos{}
+	}
 }
 
 // passes reports whether l is shown under the filter. The lines the
@@ -407,7 +458,7 @@ func (v *logView) SetFilter(text string) tea.Cmd {
 			v.shown = append(v.shown, i)
 		}
 	}
-	v.top = max(min(v.top, v.endTop()), 0)
+	v.pos = v.clampPos(v.pos)
 	return nil
 }
 
@@ -472,7 +523,7 @@ func (v *logView) key(k tea.KeyPressMsg) tea.Cmd {
 	case "s":
 		v.auto = !v.auto
 		if !v.auto {
-			v.top = v.endTop()
+			v.pos = v.endPos()
 		}
 	case "up", "k":
 		v.scroll(-1)
@@ -483,9 +534,9 @@ func (v *logView) key(k tea.KeyPressMsg) tea.Cmd {
 	case "pgdown", "ctrl+f":
 		v.scroll(page)
 	case "g", "home":
-		v.auto, v.top = false, 0
+		v.auto, v.pos = false, logPos{}
 	case "G", "end":
-		v.top = v.endTop()
+		v.pos = v.endPos()
 	case "w":
 		v.wrap = !v.wrap
 	case "t":
@@ -518,47 +569,100 @@ func (v *logView) key(k tea.KeyPressMsg) tea.Cmd {
 
 // clear empties the buffer.
 func (v *logView) clear() {
-	v.lines, v.shown, v.top = nil, nil, 0
+	v.lines, v.shown, v.pos = nil, nil, logPos{}
 }
 
 // copy gives the clipboard the lines shown, as they are drawn but
-// whole and without styles, and says how many.
+// whole and without styles, and says how many: the last of them that
+// fit in logCopyMax.
 func (v *logView) copy() tea.Cmd {
-	out := make([]string, len(v.shown))
-	for i, j := range v.shown {
-		out[i], _ = v.text(&v.lines[j], v.w)
+	var out []string
+	size := 0
+	for i := len(v.shown) - 1; i >= 0; i-- {
+		s, _ := v.text(&v.lines[v.shown[i]], v.w)
+		n := len(s)
+		if len(out) > 0 {
+			n++
+		}
+		if size+n > logCopyMax {
+			break
+		}
+		size += n
+		out = append(out, s)
 	}
-	return tea.Batch(tea.SetClipboard(strings.Join(out, "\n")), flash(fmt.Sprintf("copied %d lines", len(out))))
+	slices.Reverse(out)
+	text := fmt.Sprintf("copied %d lines", len(out))
+	if len(out) < len(v.shown) {
+		text = fmt.Sprintf("copied the last %d of %d lines", len(out), len(v.shown))
+	}
+	return tea.Batch(tea.SetClipboard(strings.Join(out, "\n")), flash(text))
 }
 
-// scroll moves the view by d lines. Up turns autoscroll off.
+// scroll moves the view by d rows. Up turns autoscroll off.
 func (v *logView) scroll(d int) {
 	if v.auto {
 		if d >= 0 {
 			return
 		}
 		v.auto = false
-		v.top = v.endTop()
+		v.pos = v.endPos()
 	}
-	v.top = max(min(v.top+d, v.endTop()), 0)
+	end := v.endPos()
+	p := v.clampPos(v.pos)
+	for ; d < 0; d++ {
+		if p.row > 0 {
+			p.row--
+		} else if p.line > 0 {
+			p.line--
+			p.row = v.rowCount(p.line) - 1
+		} else {
+			break
+		}
+	}
+	for ; d > 0 && p.before(end); d-- {
+		if p.row+1 < v.rowCount(p.line) {
+			p.row++
+		} else {
+			p.line, p.row = p.line+1, 0
+		}
+	}
+	v.pos = p
 }
 
-// endTop is the first line shown when the end of the log is.
-func (v *logView) endTop() int {
+// endPos is the first row shown at the end of the log: the last rows
+// fill the view, the first of them perhaps in the middle of a line.
+// Autoscroll shows it, and the view can go no further down.
+func (v *logView) endPos() logPos {
 	if len(v.shown) == 0 {
-		return 0
+		return logPos{}
 	}
 	if v.h <= 0 {
-		return len(v.shown) - 1
+		return logPos{line: len(v.shown) - 1}
 	}
 	rows := 0
 	for i := len(v.shown) - 1; i >= 0; i-- {
-		rows += v.rowCount(i)
-		if rows > v.h {
-			return min(i+1, len(v.shown)-1)
+		c := v.rowCount(i)
+		if rows+c >= v.h {
+			return logPos{i, rows + c - v.h}
 		}
+		rows += c
 	}
-	return 0
+	return logPos{}
+}
+
+// clampPos returns p within the lines shown and not beyond the end.
+func (v *logView) clampPos(p logPos) logPos {
+	if len(v.shown) == 0 || p.line < 0 {
+		return logPos{}
+	}
+	if p.line >= len(v.shown) {
+		return v.endPos()
+	}
+	p.row = max(min(p.row, v.rowCount(p.line)-1), 0)
+	if end := v.endPos(); end.before(p) {
+		return end
+	}
+	return p
 }
 
 // logSpan is a part of a line that is drawn in a style: the bytes
@@ -676,32 +780,33 @@ func (v *logView) rows(i, w int) []string {
 	return out
 }
 
-// View draws the end of the log while autoscroll is on, and the lines
-// from the top otherwise.
+// View draws the end of the log while autoscroll is on, and the rows
+// from where the view stands otherwise: exactly h rows of w cells.
 func (v *logView) View(w, h int) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
 	v.w, v.h = w, h
-	var rows []string
+	var pos logPos
 	if v.auto {
-		for i := len(v.shown) - 1; i >= 0 && len(rows) < h; i-- {
-			r := v.rows(i, w)
-			for j := len(r) - 1; j >= 0 && len(rows) < h; j-- {
-				rows = append(rows, r[j])
-			}
-		}
-		for a, b := 0, len(rows)-1; a < b; a, b = a+1, b-1 {
-			rows[a], rows[b] = rows[b], rows[a]
-		}
+		pos = v.endPos()
 	} else {
-		v.top = max(min(v.top, v.endTop()), 0)
-		for i := v.top; i < len(v.shown) && len(rows) < h; i++ {
-			rows = append(rows, v.rows(i, w)...)
+		v.pos = v.clampPos(v.pos)
+		pos = v.pos
+	}
+	rows := make([]string, 0, h)
+	for i := pos.line; i < len(v.shown) && len(rows) < h; i++ {
+		r := v.rows(i, w)
+		if i == pos.line {
+			r = r[min(pos.row, len(r)-1):]
 		}
-		if len(rows) > h {
-			rows = rows[:h]
-		}
+		rows = append(rows, r...)
+	}
+	if len(rows) > h {
+		rows = rows[:h]
+	}
+	for len(rows) < h {
+		rows = append(rows, fit("", w))
 	}
 	return strings.Join(rows, "\n")
 }
