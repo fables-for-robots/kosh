@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/go-logr/logr"
@@ -842,6 +843,34 @@ func TestStandardLogGoesToTheLog(t *testing.T) {
 	}
 	if r := got[0]; r.Level != slog.LevelWarn || r.Msg != "marker line" || r.Attrs["source"] != "log" {
 		t.Errorf("%v, want the line at warn level with source=log", r)
+	}
+}
+
+// A line the standard logger carries, which may repeat what a peer sent
+// (the SSH library's errors come through Go's default slog), is cut to
+// 1 KiB at a rune boundary.
+func TestStandardLogLineIsCut(t *testing.T) {
+	var rec recorder
+	was := stdlogTo.Swap(rec.logger())
+	t.Cleanup(func() { stdlogTo.Store(was) })
+	line := strings.Repeat("é", 1000) + "\n" // 2000 bytes
+	if n, err := (stdlogWriter{}).Write([]byte(line)); n != len(line) || err != nil {
+		t.Fatalf("Write: %d, %v", n, err)
+	}
+	if _, err := (stdlogWriter{}).Write([]byte("short\n")); err != nil {
+		t.Fatal(err)
+	}
+	recs := rec.records()
+	if len(recs) != 2 {
+		t.Fatalf("records %v", recs)
+	}
+	msg := recs[0].Msg
+	if len(msg) > 1024+len("…") || !strings.HasSuffix(msg, "…") || !utf8.ValidString(msg) ||
+		!strings.HasPrefix(line, strings.TrimSuffix(msg, "…")) {
+		t.Errorf("a line of 2000 bytes became %d bytes: %.80q…", len(msg), msg)
+	}
+	if recs[1].Msg != "short" {
+		t.Errorf("a short line became %q", recs[1].Msg)
 	}
 }
 

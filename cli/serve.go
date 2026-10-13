@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	ucli "github.com/urfave/cli/v2"
@@ -503,7 +504,7 @@ func unrouteStdlog(log *slog.Logger) {
 }
 
 // stdlogWriter is the output of the standard logger, which writes each
-// line with one Write.
+// line with one Write. A line is cut by cutLine.
 type stdlogWriter struct{}
 
 func (stdlogWriter) Write(p []byte) (int, error) {
@@ -511,7 +512,26 @@ func (stdlogWriter) Write(p []byte) (int, error) {
 	if log == nil {
 		return os.Stderr.Write(p)
 	}
-	msg := strings.TrimSuffix(string(p), "\n")
+	msg := cutLine(strings.TrimSuffix(string(p), "\n"))
 	log.LogAttrs(context.Background(), slog.LevelWarn, msg, slog.String("source", "log"))
 	return len(p), nil
+}
+
+// maxStdlogLine is how many bytes of a line of the standard logger the
+// log holds: what libraries log through Go's default slog comes this way,
+// and the SSH library's errors may repeat what a peer sent.
+const maxStdlogLine = 1 << 10
+
+// cutLine returns s, or when it is longer than maxStdlogLine bytes, its
+// first maxStdlogLine bytes or fewer, cut at the start of a rune, and
+// "…".
+func cutLine(s string) string {
+	if len(s) <= maxStdlogLine {
+		return s
+	}
+	n := maxStdlogLine
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
