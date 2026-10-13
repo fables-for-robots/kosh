@@ -38,20 +38,57 @@ func (r *root) broadcast(msg tea.Msg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// push puts v on the stack, tells it the namespaces and runs its Init.
+// maxStack is how many views the stack holds at most: a view is not
+// given up when another is pushed over it, and a session must not hold
+// views without end.
+const maxStack = 32
+
+// textTooManyViews is the flash of a push the stack has no room for.
+const textTooManyViews = "too many views open: go back with esc"
+
+// buriedMsg tells the top view that another view is pushed over it. It
+// is buried until it is the top again, which it learns from the
+// refreshMsg that pop gives the new top. A view that does nothing
+// while it is not seen rests in between; the others ignore it.
+type buriedMsg struct{}
+
+// push puts v on the stack, tells the view below that it is buried,
+// tells v the namespaces and runs its Init. When the stack is full, v
+// is closed instead, and the flash says so.
 func (r *root) push(v view) tea.Cmd {
 	if v == nil {
 		return nil
 	}
+	if len(r.stack) >= maxStack {
+		v.Close()
+		return func() tea.Msg { return flashMsg{text: textTooManyViews, err: true} }
+	}
+	buried := r.updateTop(buriedMsg{})
 	r.stack = append(r.stack, v)
 	var cmd tea.Cmd
 	r.stack[len(r.stack)-1], cmd = v.Update(r.ns.msg())
-	return tea.Batch(cmd, r.stack[len(r.stack)-1].Init())
+	return tea.Batch(buried, cmd, r.stack[len(r.stack)-1].Init())
+}
+
+// bury makes a table rest while it is buried: the wait for its next
+// reading ends, and it waits for no other until it is the top again. A
+// reading under way is taken when it comes. Its watch stays open.
+func (v *tableView) bury() tea.Cmd {
+	if v.closed {
+		return nil
+	}
+	v.buried = true
+	if v.stop != nil {
+		close(v.stop)
+		v.stop = make(chan struct{})
+	}
+	return nil
 }
 
 // pop takes the top view off the stack and closes it, and asks the view
-// below to read again. The last view stays, unless it is the help or the
-// names, which leave the body empty, as it was when the start failed.
+// below to read again, which also tells it that it is the top again. The
+// last view stays, unless it is the help or the names, which leave the
+// body empty, as it was when the start failed.
 func (r *root) pop() tea.Cmd {
 	if len(r.stack) == 1 {
 		switch r.stack[0].(type) {
