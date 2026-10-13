@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -160,12 +161,31 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 
 // RESTConfig returns how to reach the API: from the kubeconfig at path,
 // or, when path is empty, from the ServiceAccount of the pod kosh runs
-// in.
+// in. A path that is a list, as KUBECONFIG may be, is read as kubectl
+// reads KUBECONFIG: the files that are there are merged, and the current
+// context is taken from them; a list from which no configuration comes
+// is an error that names it. A single path that is not there is an
+// error.
 func RESTConfig(kubeconfig string) (*rest.Config, error) {
 	if kubeconfig == "" {
 		return rest.InClusterConfig()
 	}
-	return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	paths := filepath.SplitList(kubeconfig)
+	if len(paths) <= 1 {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+	// Loaded and then made a client config directly: the deferred one
+	// would fall back on the ServiceAccount when the files give nothing.
+	rules := &clientcmd.ClientConfigLoadingRules{Precedence: paths}
+	merged, err := rules.Load()
+	if err != nil {
+		return nil, fmt.Errorf("the kubeconfig files %q could not be read: %w", kubeconfig, err)
+	}
+	cfg, err := clientcmd.NewNonInteractiveClientConfig(*merged, merged.CurrentContext, &clientcmd.ConfigOverrides{}, rules).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("the kubeconfig files %q give no configuration: %w", kubeconfig, err)
+	}
+	return cfg, nil
 }
 
 // New connects to the cluster cfg names, reads the API server's version
@@ -211,6 +231,9 @@ func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) 
 func (c *Cluster) Session(ctx context.Context, grant keys.Grant) Session {
 	return &session{c: c, ctx: ctx, grant: grant}
 }
+
+// Version returns the version of the API server, as New read it: "v1.33.1".
+func (c *Cluster) Version() string { return c.version }
 
 // Close stops every informer and everything else the Cluster runs.
 func (c *Cluster) Close() {
