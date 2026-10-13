@@ -1,7 +1,6 @@
 package kube
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	yaml2 "go.yaml.in/yaml/v2"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
-	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
@@ -85,12 +84,19 @@ func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 	defer func() {
 		logged := err
 		if ref.Resource.Is("", "secrets") {
-			// A webhook's denial may quote the Secret it was given.
+			// logAction already logs an error of the API as its reason
+			// and code. What this adds is the rest: an error that is no
+			// API status, which may still quote the Secret (a webhook's
+			// text passed on in some other form), is logged as "delete
+			// failed".
 			logged = loggableError(actDelete, err)
 		}
 		s.logAction(ctx, actDelete, ref, logged,
 			slog.String("propagation", string(opts.propagation())), slog.Bool("force", opts.Force))
 	}()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	return s.delete(ctx, ref, opts)
 }
 
@@ -110,6 +116,9 @@ func (s *session) Kill(ctx context.Context, pod ObjectRef) (err error) {
 		return err
 	}
 	defer func() { s.logAction(ctx, actKill, pod, err) }()
+	if err := s.c.checkRef(pod); err != nil {
+		return err
+	}
 	if err := kindIs("kill", pod, podKinds...); err != nil {
 		return err
 	}
@@ -122,6 +131,9 @@ func (s *session) Update(ctx context.Context, ref ObjectRef, text string) (err e
 	}
 	// The log gets what kind of error it was: its text may quote the edit.
 	defer func() { s.logAction(ctx, actUpdate, ref, loggableError(actUpdate, err)) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	obj, err := parseObject(ref, text)
 	if err != nil {
 		return err
@@ -147,11 +159,10 @@ func (e *editRefusal) Error() string {
 // parseObject returns the object that text, YAML, says, when it is the
 // object ref as it was read.
 func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error) {
-	doc, err := oneDocument(text)
-	if err != nil {
+	if err := oneDocument(text); err != nil {
 		return nil, err
 	}
-	js, err := yaml.YAMLToJSON(doc)
+	js, err := yaml.YAMLToJSON([]byte(text))
 	if err != nil {
 		return nil, &editRefusal{"the YAML does not parse", err.Error()}
 	}
@@ -176,70 +187,36 @@ func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error)
 	return obj, nil
 }
 
-// oneDocument returns the one YAML document of text. Documents that hold
-// nothing but comments and directives do not count; anything but those
-// after a document's end marker "..." is another document.
-func oneDocument(text string) ([]byte, error) {
-	more := &editRefusal{"the YAML holds more than one document", ""}
-	r := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(text)))
-	var docs [][]byte
+// oneDocument refuses text unless it is one YAML document that is a
+// mapping, followed by nothing but documents that carry nothing (a "---"
+// with nothing or only comments after it, or a null).
+//
+// The documents are counted with the decoder of go.yaml.in/yaml/v2, the
+// library and version sigs.k8s.io/yaml's YAMLToJSON parses with: the two
+// cannot disagree about where the first document ends, so YAMLToJSON of
+// the whole text, which is what is sent, is that document and nothing of
+// what follows it is dropped unseen.
+func oneDocument(text string) error {
+	dec := yaml2.NewDecoder(strings.NewReader(text))
+	var first any
+	if err := dec.Decode(&first); err == io.EOF {
+		return &editRefusal{"the YAML is not an object", ""}
+	} else if err != nil {
+		return &editRefusal{"the YAML does not parse", err.Error()}
+	}
+	if _, ok := first.(map[any]any); !ok {
+		return &editRefusal{"the YAML is not an object", ""}
+	}
 	for {
-		doc, err := r.Read()
+		var next any
+		err := dec.Decode(&next)
 		if err == io.EOF {
-			break
+			return nil
 		}
-		if err != nil {
-			return nil, &editRefusal{"the YAML does not parse", err.Error()}
-		}
-		content, after := documentContent(doc)
-		if after {
-			return nil, more
-		}
-		if content {
-			docs = append(docs, doc)
+		if err != nil || next != nil {
+			return &editRefusal{"the YAML holds more than one document", ""}
 		}
 	}
-	switch len(docs) {
-	case 0:
-		return nil, &editRefusal{"the YAML is not an object", ""}
-	case 1:
-		return docs[0], nil
-	}
-	return nil, more
-}
-
-// documentContent reports whether a part of a YAML stream between two
-// "---" holds more than blank lines, comments, directives and markers,
-// and whether anything of that kind follows a document end marker "...".
-// Both markers and directives are only those at the start of a line,
-// where nothing else can be.
-func documentContent(doc []byte) (content, afterEnd bool) {
-	ended := false
-	for _, line := range strings.Split(string(doc), "\n") {
-		line = strings.TrimRight(line, "\r")
-		switch {
-		case isMarker(line, "..."):
-			ended = true
-			continue
-		case isMarker(line, "---"), strings.HasPrefix(line, "%"):
-			continue
-		}
-		if t := strings.TrimSpace(line); t == "" || strings.HasPrefix(t, "#") {
-			continue
-		}
-		if ended {
-			return content, true
-		}
-		content = true
-	}
-	return content, false
-}
-
-// isMarker reports whether line is the marker, alone or before white
-// space.
-func isMarker(line, marker string) bool {
-	rest, ok := strings.CutPrefix(line, marker)
-	return ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t')
 }
 
 // scaleClient is the scale subresource of one kind, in one namespace.
@@ -253,6 +230,9 @@ func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) (err
 		return err
 	}
 	defer func() { s.logAction(ctx, actScale, ref, err, slog.Int("replicas", int(replicas))) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	if err := kindIs("scale", ref, scaleKinds...); err != nil {
 		return err
 	}
@@ -287,6 +267,9 @@ func (s *session) Restart(ctx context.Context, ref ObjectRef) (err error) {
 		return err
 	}
 	defer func() { s.logAction(ctx, actRestart, ref, err) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	if err := kindIs("restart", ref, workloadKinds...); err != nil {
 		return err
 	}
@@ -319,6 +302,9 @@ func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[strin
 		return err
 	}
 	defer func() { s.logAction(ctx, actSetImages, ref, err, slog.Any("images", imagePairs(images))) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	if err := kindIs("set the images of", ref, workloadKinds...); err != nil {
 		return err
 	}
@@ -375,6 +361,9 @@ func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error
 		return err
 	}
 	defer func() { s.logAction(ctx, actRollback, replicaSet, err) }()
+	if err := s.c.checkRef(replicaSet); err != nil {
+		return err
+	}
 	if err := kindIs("roll back to", replicaSet, rsKinds...); err != nil {
 		return err
 	}
@@ -431,6 +420,9 @@ func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (job string, e
 		return "", err
 	}
 	defer func() { s.logAction(ctx, actTrigger, cronJob, err, slog.String("job", job)) }()
+	if err := s.c.checkRef(cronJob); err != nil {
+		return "", err
+	}
 	if err := kindIs("trigger", cronJob, cronJobKinds...); err != nil {
 		return "", err
 	}
@@ -491,6 +483,9 @@ func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended
 		return err
 	}
 	defer func() { s.logAction(ctx, action, cronJob, err) }()
+	if err := s.c.checkRef(cronJob); err != nil {
+		return err
+	}
 	if err := kindIs(action, cronJob, cronJobKinds...); err != nil {
 		return err
 	}

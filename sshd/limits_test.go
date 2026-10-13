@@ -346,3 +346,153 @@ func TestKeepaliveLeavesALivePeer(t *testing.T) {
 		t.Errorf("exit status %d after q", st)
 	}
 }
+
+// serverConn returns the server's conn of the client at remote.
+func (h *harness) serverConn(remote string) *conn {
+	h.t.Helper()
+	var found *conn
+	eventually(h.t, "the server's side of the connection", func() bool {
+		h.srv.mu.Lock()
+		defer h.srv.mu.Unlock()
+		for c := range h.srv.conns {
+			if c.remote == remote {
+				found = c
+				return true
+			}
+		}
+		return false
+	})
+	return found
+}
+
+func (c *conn) channelCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.channels
+}
+
+// rejectedAsTooMany checks that a new session channel of cl is rejected
+// for a shortage of resources.
+func rejectedAsTooMany(t *testing.T, cl *ssh.Client) {
+	t.Helper()
+	sess, err := cl.NewSession()
+	if err == nil {
+		_ = sess.Close()
+		t.Fatalf("session channel %d of a connection was accepted", maxSessionChannels+1)
+	}
+	var oce *ssh.OpenChannelError
+	if !errors.As(err, &oce) || oce.Reason != ssh.ResourceShortage {
+		t.Fatalf("session channel %d: %v, want rejected for a shortage of resources", maxSessionChannels+1, err)
+	}
+}
+
+func TestSessionChannelLimit(t *testing.T) {
+	h := newHarness(t)
+	raw := h.dialRaw()
+	cl, err := connect(raw, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key("alice", false))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	sc := h.serverConn(raw.LocalAddr().String())
+
+	// Channels that never ask for a shell, some with a terminal.
+	open := make([]*ssh.Session, maxSessionChannels)
+	for i := range open {
+		if open[i], err = cl.NewSession(); err != nil {
+			t.Fatalf("session channel %d: %v", i+1, err)
+		}
+		if i%2 == 0 {
+			if err := open[i].RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rejectedAsTooMany(t, cl)
+	if n := sc.channelCount(); n != maxSessionChannels {
+		t.Errorf("the server counts %d session channels, want %d", n, maxSessionChannels)
+	}
+
+	// One closes: another is accepted.
+	_ = open[0].Close()
+	eventually(t, "a session channel to be accepted after one closed", func() bool {
+		open[0], err = cl.NewSession()
+		return err == nil
+	})
+	rejectedAsTooMany(t, cl)
+
+	// Three are refused sessions: their places come back.
+	for _, sess := range open[:3] {
+		if err := sess.Run("ls"); err == nil {
+			t.Fatal("a command was run")
+		}
+	}
+	eventually(t, "the refused sessions to be counted out", func() bool { return sc.channelCount() == maxSessionChannels-3 })
+	for i := range 3 {
+		if open[i], err = cl.NewSession(); err != nil {
+			t.Fatalf("a session channel after three were refused: %v", err)
+		}
+	}
+	rejectedAsTooMany(t, cl)
+
+	// The connection drops: every place comes back.
+	_ = cl.Close()
+	eventually(t, "the channels of a closed connection to be counted out", func() bool { return sc.channelCount() == 0 })
+}
+
+func TestConnectionsPerKeyLimit(t *testing.T) {
+	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = time.Minute }))
+	alice, bob := h.key("alice", false), h.key("bob", false)
+	clients := make([]*ssh.Client, maxConnectionsPerKey)
+	for i := range clients {
+		clients[i] = h.dial(alice, "kosh")
+	}
+
+	raw := h.dialRaw()
+	if cl, err := connect(raw, h.addr, clientConfig("kosh", ssh.PublicKeys(alice))); err == nil {
+		_ = cl.Close()
+		t.Fatalf("connection %d of a key got in", maxConnectionsPerKey+1)
+	}
+	remote := raw.LocalAddr().String()
+	rec := h.log.waitFor(t, "of the connection over the key's limit", func(r logRecord) bool { return r.Attrs["remote"] == remote })
+	if rec.Attrs["reason"] != reasonTooManyConnectionsOfKey || rec.Attrs["key"] != "alice" ||
+		rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) || rec.Attrs["transport"] != "tcp" {
+		t.Errorf("the connection over the key's limit is logged as %v", rec)
+	}
+	n := 0
+	for _, r := range h.log.records() {
+		if r.Attrs["remote"] == remote {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("the connection over the key's limit is logged in %d records, want 1", n)
+	}
+
+	// The others are up.
+	for i, cl := range clients {
+		select {
+		case <-closed(cl):
+			t.Fatalf("connection %d of the key was closed", i+1)
+		default:
+		}
+	}
+	tm := openTerm(t, clients[0])
+	tm.waitFor(testWord)
+	tm.press("q")
+	tm.exit()
+
+	// Another key is not counted with it.
+	_ = h.dial(bob, "kosh")
+
+	// One closes: another gets in.
+	_ = clients[1].Close()
+	eventually(t, "a connection of the key to get in after one closed", func() bool {
+		cl, err := connect(h.dialRaw(), h.addr, clientConfig("kosh", ssh.PublicKeys(alice)))
+		if err != nil {
+			return false
+		}
+		t.Cleanup(func() { _ = cl.Close() })
+		return true
+	})
+}

@@ -114,6 +114,7 @@ type Server struct {
 	conns     map[*conn]struct{}
 	sessions  map[*session]struct{}
 	windows   map[ssh.Session]*window // of session channels that asked for a terminal
+	perKey    map[string]int          // authenticated connections by key fingerprint
 	running   int                     // sessions whose program runs
 	changed   chan struct{}           // closed, and replaced, when conns or sessions change
 }
@@ -155,6 +156,7 @@ func New(cfg Config) (*Server, error) {
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},
 		windows:    map[ssh.Session]*window{},
+		perKey:     map[string]int{},
 		changed:    make(chan struct{}),
 	}
 	// The host key goes first: without it wish would make one and write
@@ -171,7 +173,7 @@ func New(cfg Config) (*Server, error) {
 	// request or subsystem handler but the library's session: what is
 	// not handled is refused. The library fills these maps in only in
 	// its own Serve, which kosh does not use.
-	srv.ChannelHandlers = map[string]ssh.ChannelHandler{"session": ssh.DefaultSessionHandler}
+	srv.ChannelHandlers = map[string]ssh.ChannelHandler{"session": s.sessionChannel}
 	srv.RequestHandlers = map[string]ssh.RequestHandler{}
 	srv.SubsystemHandlers = map[string]ssh.SubsystemHandler{}
 	srv.Handler = s.handle
@@ -189,6 +191,21 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// sessionChannel is the handler of session channels: the library's,
+// for at most maxSessionChannels of a connection at once. A channel
+// beyond them is rejected before it is accepted. The library's handler
+// returns when the channel's request loop ends, which is the life of
+// what the channel holds.
+func (s *Server) sessionChannel(srv *ssh.Server, sc *gossh.ServerConn, nc gossh.NewChannel, ctx ssh.Context) {
+	c := connOf(sc.RemoteAddr())
+	if c == nil || !c.openChannel() {
+		_ = nc.Reject(gossh.ResourceShortage, "too many sessions on this connection")
+		return
+	}
+	defer c.closeChannel()
+	ssh.DefaultSessionHandler(srv, sc, nc, ctx)
+}
+
 // keyAccepted is the public key handler: a key is accepted when the key
 // list holds it now. The user name is not looked at.
 func (s *Server) keyAccepted(_ ssh.Context, key ssh.PublicKey) bool {
@@ -200,15 +217,16 @@ func (s *Server) keyAccepted(_ ssh.Context, key ssh.PublicKey) bool {
 // one connection.
 func (s *Server) serverConfig(ssh.Context) *gossh.ServerConfig {
 	return &gossh.ServerConfig{
-		MaxAuthTries:    maxAuthTries,
-		AuthLogCallback: authLog,
+		MaxAuthTries:              maxAuthTries,
+		VerifiedPublicKeyCallback: verifiedKey,
+		AuthLogCallback:           authLog,
 	}
 }
 
 // connectionFailed logs a connection that ended before it authenticated.
 func (s *Server) connectionFailed(nc net.Conn, err error) {
 	c := connOf(nc.RemoteAddr())
-	if c == nil {
+	if c == nil || c.overKeyLimit.Load() {
 		return
 	}
 	s.logRefused(slog.LevelInfo, c.transport, c.remote, failureReason(err))
