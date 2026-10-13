@@ -909,6 +909,7 @@ func TestVanishedClientEndsItsSession(t *testing.T) {
 	p.waitFor("kosh-e2e-marker")
 	eventually(t, wait, "the API server serves the marker's log", func() bool { return logStreams(t) > 0 },
 		func() string { return "the screen:\n" + p.scr.String() })
+	t.Logf("with the log open, the API server serves %d log", logStreams(t))
 
 	var start string
 	eventually(t, wait, "kosh's log has the session's start", func() bool {
@@ -927,11 +928,16 @@ func TestVanishedClientEndsItsSession(t *testing.T) {
 	if err := p.cmd.Process.Signal(syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
+	killed := time.Now()
+	var end []string
 	eventually(t, wait, "kosh's log has the end of the session of "+remote[1], func() bool {
-		return len(logLines(t, "session end", "remote", remote[1])) > 0
+		end = logLines(t, "session end", "remote", remote[1])
+		return len(end) > 0
 	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	t.Logf("%v after the kill: %s", time.Since(killed).Round(100*time.Millisecond), end[0])
 	eventually(t, wait, "the marker's log is no longer read", func() bool { return logStreams(t) == 0 },
 		func() string { return fmt.Sprintf("%d logs are read", logStreams(t)) })
+	t.Logf("%v after the kill, the API server serves no pod's log", time.Since(killed).Round(100*time.Millisecond))
 }
 
 // irohSSH runs the real iroh-ssh to kosh's endpoint ID as k, on a
@@ -1006,9 +1012,11 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 
 	setKeys(t, full.line)
 	t.Cleanup(func() { setKeys(t, full.line, "read-only "+ro.line) })
+	changed := time.Now()
 
 	// The kubelet updates a mounted ConfigMap in its own time.
 	err := r.ended(120 * time.Second)
+	t.Logf("the read-only key's session ended %v after the list changed", time.Since(changed).Round(100*time.Millisecond))
 	var exit *ssh.ExitError
 	if !errors.As(err, &exit) || exit.ExitStatus() != 1 {
 		t.Errorf("the read-only key's session ended with %v, want status 1", err)
