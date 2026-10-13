@@ -59,6 +59,11 @@ type session struct {
 	mu sync.Mutex
 	// reason is why kosh ends the session; "" while it does not.
 	reason string
+	// program is the session's program, once it is made.
+	program *tea.Program
+	// timer closes the connection when the session takes longer than
+	// srv.endTimeout to end after kosh ended it.
+	timer *time.Timer
 }
 
 // run gives the session its program, and ends it when the program ends.
@@ -80,28 +85,79 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			tea.WithoutSignalHandler(),
 		)
 		p := tea.NewProgram(m, opts...)
+		if sess.start(p) {
+			s.mu.Lock()
+			s.running++
+			s.mu.Unlock()
+			log.Info("session start")
+			began := time.Now()
 
-		s.mu.Lock()
-		s.running++
-		s.mu.Unlock()
-		log.Info("session start")
-		began := time.Now()
+			go forwardWindow(ctx, ss, p)
+			_, _ = p.Run()
 
-		go forwardWindow(ctx, ss, p)
-		_, _ = p.Run()
-
-		s.mu.Lock()
-		s.running--
-		s.mu.Unlock()
-		defer func() { logEnd(log, began, sess.ending()) }()
+			s.mu.Lock()
+			s.running--
+			s.mu.Unlock()
+			defer func() { logEnd(log, began, sess.ending()) }()
+		}
 	}
 
+	// The program has stopped and given the terminal back.
+	defer sess.stopTimer()
 	if reason := sess.ending(); reason != "" {
 		_, _ = io.WriteString(ss, reason+"\n")
 		_ = ss.Exit(1)
 		return
 	}
 	_ = ss.Exit(0)
+}
+
+// start makes p the session's program, unless kosh has ended the session
+// already.
+func (sess *session) start(p *tea.Program) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.reason != "" {
+		return false
+	}
+	sess.program = p
+	return true
+}
+
+// end ends the session from kosh's side: it stops the program, and when
+// the program has stopped and the terminal is back to its normal screen,
+// msg and a line feed are written to the session and it exits with
+// status 1. end does not wait for any of that. A session that has not
+// ended within srv.endTimeout has its connection closed. end reports
+// whether it ended the session; a session that was ended before keeps
+// its first reason.
+func (sess *session) end(msg string) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.reason != "" {
+		return false
+	}
+	sess.reason = msg
+	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() {
+		sess.srv.log.Warn("session did not end in time: its connection is closed",
+			"transport", sess.conn.transport, "remote", sess.conn.remote, "key", sess.grant.Name, "reason", msg)
+		_ = sess.conn.Close()
+	})
+	if p := sess.program; p != nil {
+		// Quit waits for the program to take it, and the program may be
+		// waiting for a client that does not read.
+		go p.Quit()
+	}
+	return true
+}
+
+// stopTimer stops the timer of end, once the session has ended.
+func (sess *session) stopTimer() {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.timer != nil {
+		sess.timer.Stop()
+	}
 }
 
 // fingerprint is key's SHA256 fingerprint, or "" for no key.
@@ -138,6 +194,43 @@ func (s *Server) register(sess *session) {
 	}
 	s.sessions[sess] = struct{}{}
 	s.notifyLocked()
+}
+
+// keysChanged is called when the key list has changed. A session whose
+// key is gone is ended with MsgKeyRemoved, and one whose key went from
+// full to read-only or back with MsgGrantChanged. It does not wait for
+// any session: it is called in the goroutine of the list's Replace.
+func (s *Server) keysChanged() {
+	type ending struct {
+		sess *session
+		msg  string
+	}
+	var ends []ending
+	s.mu.Lock()
+	for sess := range s.sessions {
+		g, ok := s.cfg.Keys.Lookup(sess.key)
+		switch {
+		case !ok:
+			ends = append(ends, ending{sess, MsgKeyRemoved})
+		case g.ReadOnly != sess.grant.ReadOnly:
+			ends = append(ends, ending{sess, MsgGrantChanged})
+		}
+	}
+	s.mu.Unlock()
+	removed, changed := 0, 0
+	for _, e := range ends {
+		if !e.sess.end(e.msg) {
+			continue
+		}
+		if e.msg == MsgKeyRemoved {
+			removed++
+		} else {
+			changed++
+		}
+	}
+	if removed+changed > 0 {
+		s.log.Info("key list changed: sessions are closed", "key_removed", removed, "grant_changed", changed)
+	}
 }
 
 func (s *Server) unregister(sess *session) {

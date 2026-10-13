@@ -270,13 +270,36 @@ type harness struct {
 	// models counts the models made.
 	models atomic.Int32
 
-	serveErr chan error
+	served   chan struct{} // closed when Serve has returned
+	serveErr error         // what it returned
 }
 
-// newHarness starts a server with short limits; opts change its Config
-// before New. After the test the server is shut down and the goroutines
-// it started are checked to be gone.
-func newHarness(t *testing.T, opts ...func(*Config)) *harness {
+// serveResult waits for Serve to return, and returns what it returned.
+func (h *harness) serveResult() error {
+	h.t.Helper()
+	select {
+	case <-h.served:
+		return h.serveErr
+	case <-time.After(waitTime):
+		h.t.Fatal("Serve has not returned")
+		return nil
+	}
+}
+
+// option changes the Config of a harness's server before New, or the
+// server after New and before Serve.
+type option struct {
+	cfg func(*Config)
+	srv func(*Server)
+}
+
+func withConfig(f func(*Config)) option { return option{cfg: f} }
+func withServer(f func(*Server)) option { return option{srv: f} }
+
+// newHarness starts a server with short limits, changed by opts. After
+// the test the server is shut down and the goroutines it started are
+// checked to be gone.
+func newHarness(t *testing.T, opts ...option) *harness {
 	t.Helper()
 	t.Cleanup(func() { checkNoServerGoroutines(t) })
 
@@ -299,11 +322,18 @@ func newHarness(t *testing.T, opts ...func(*Config)) *harness {
 		HandshakeTimeout: 2 * time.Second,
 	}
 	for _, o := range opts {
-		o(&cfg)
+		if o.cfg != nil {
+			o.cfg(&cfg)
+		}
 	}
 	srv, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, o := range opts {
+		if o.srv != nil {
+			o.srv(srv)
+		}
 	}
 	h.srv = srv
 
@@ -312,8 +342,11 @@ func newHarness(t *testing.T, opts ...func(*Config)) *harness {
 		t.Fatal(err)
 	}
 	h.addr = l.Addr().String()
-	h.serveErr = make(chan error, 1)
-	go func() { h.serveErr <- srv.Serve(l, "tcp") }()
+	h.served = make(chan struct{})
+	go func() {
+		h.serveErr = srv.Serve(l, "tcp")
+		close(h.served)
+	}()
 
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), waitTime)
@@ -321,13 +354,8 @@ func newHarness(t *testing.T, opts ...func(*Config)) *harness {
 		if err := srv.Shutdown(ctx); err != nil {
 			t.Errorf("Shutdown: %v", err)
 		}
-		select {
-		case err := <-h.serveErr:
-			if err != nil {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(waitTime):
-			t.Errorf("Serve has not returned after Shutdown")
+		if err := h.serveResult(); err != nil {
+			t.Errorf("Serve: %v", err)
 		}
 	})
 	return h

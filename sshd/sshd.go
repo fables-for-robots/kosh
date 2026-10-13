@@ -93,6 +93,11 @@ type Server struct {
 	log *slog.Logger
 	ssh *ssh.Server
 
+	// endTimeout is how long a session that kosh ends may take to stop
+	// its program and say why. Then its connection is closed: a client
+	// that does not read cannot keep a session kosh has ended.
+	endTimeout time.Duration
+
 	mu        sync.Mutex
 	closing   bool // Shutdown has been called
 	listeners map[net.Listener]struct{}
@@ -129,12 +134,13 @@ func New(cfg Config) (*Server, error) {
 		cfg.KeepaliveMisses = 3
 	}
 	s := &Server{
-		cfg:       cfg,
-		log:       cfg.Log,
-		listeners: map[net.Listener]struct{}{},
-		conns:     map[*conn]struct{}{},
-		sessions:  map[*session]struct{}{},
-		changed:   make(chan struct{}),
+		cfg:        cfg,
+		log:        cfg.Log,
+		endTimeout: 2 * time.Second,
+		listeners:  map[net.Listener]struct{}{},
+		conns:      map[*conn]struct{}{},
+		sessions:   map[*session]struct{}{},
+		changed:    make(chan struct{}),
 	}
 	// The host key goes first: without it wish would make one and write
 	// it to a file.
@@ -158,6 +164,7 @@ func New(cfg Config) (*Server, error) {
 	srv.ServerConfigCallback = s.serverConfig
 	srv.ConnectionFailedCallback = s.connectionFailed
 	s.ssh = srv
+	cfg.Keys.OnChange(s.keysChanged)
 	return s, nil
 }
 
@@ -292,15 +299,29 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for l := range s.listeners {
 		listeners = append(listeners, l)
 	}
+	var sessions []*session
+	for sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
 	s.mu.Unlock()
 	for _, l := range listeners {
 		_ = l.Close()
 	}
 
-	// The library's server closes the connections it has, which are
-	// those that have authenticated; the others are closed here.
+	// A session that begins from now on is ended as it begins.
+	for _, sess := range sessions {
+		sess.end(MsgShuttingDown)
+	}
+	err := s.waitFor(ctx, func() bool { return len(s.sessions) == 0 })
+
+	// The sessions have said why they end. The library's server closes
+	// the connections it has, which are those that have authenticated;
+	// the others are closed here.
 	_ = s.ssh.Close()
 	s.closeConns()
+	if err != nil {
+		return err
+	}
 	return s.waitFor(ctx, func() bool { return len(s.conns) == 0 && len(s.sessions) == 0 })
 }
 
