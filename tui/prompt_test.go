@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/fables-for-robots/kosh/kube/kubetest"
 )
 
 func TestCommandGoesToAResource(t *testing.T) {
@@ -23,6 +25,9 @@ func TestCommandGoesToAResource(t *testing.T) {
 		t.Errorf("the stack is not the deployments' table alone: %d views", len(hs.root().stack))
 	}
 	hs.notFrame(":deploy")
+	if got := sess.OpenWatches(); len(got) != 1 || got[0] != kubetest.Key(query("deployments", "default")) {
+		t.Errorf("the open watches are %q", got)
+	}
 }
 
 func TestCommandClosesTheOldStack(t *testing.T) {
