@@ -120,11 +120,19 @@ endpoint ID; `iroh-ssh` finds it there and connects, directly when it
 can and through a relay when it cannot. There is no address to expose
 and nothing to open in a firewall: kosh needs outgoing traffic only. The
 SSH host key is checked by `ssh` as always, inside the iroh connection.
+The record that lets `iroh-ssh` find kosh by its endpoint ID lists kosh's
+direct addresses, private ones included, in public DNS; the endpoint ID is
+what authenticates kosh, and an address is of use only to whoever can
+reach it.
 
 The released `iroh-ssh` (0.2.12) finds kosh through the relays. A build
 of `iroh-ssh` from its repository also finds it by mDNS on the same
 network, without the relays, when kosh runs on the host's network
-(`--set iroh.hostNetwork=true`).
+(`--set iroh.hostNetwork=true`). That puts the pod on the node's network:
+the SSH port then listens on every address of the node, whatever
+`service.type` is, and the pod is outside every NetworkPolicy. kosh was
+seen on the host network of a kind node, found by mDNS from the same
+network and reached through the relays.
 
 ## Keys
 
@@ -166,6 +174,9 @@ helm upgrade kosh ./charts/kosh --namespace kosh --reuse-values --set rbac.clust
 ```
 
 Where the ServiceAccount lacks a right, kosh shows the API's refusal.
+With a Role bound in one namespace instead of a ClusterRole, the tables of
+the kinds kosh knows show `forbidden`, since kosh lists them across the
+cluster. An action under way ends when its session does.
 Kubernetes' audit log names kosh's ServiceAccount for everything kosh
 does; kosh's own log names the key, with a line for every action:
 
@@ -191,6 +202,12 @@ level=INFO msg=action key=alice@kosh-e2e fingerprint=SHA256:... action=scale obj
 goes to the clipboard of your own machine through the terminal, and kill
 asks first.
 
+The editor opens objects of up to 1,000 lines and 48 KiB; for a larger
+one use `kubectl edit`. When the API refuses an edit as a conflict (the
+object changed meanwhile), close the editor and open the object again.
+Marks and actions go by namespace and name. The PODS column of the nodes'
+table is a node's capacity.
+
 ## Values
 
 | Value | Default | |
@@ -208,7 +225,7 @@ asks first.
 | `iroh.enabled` | `true` | SSH over iroh |
 | `iroh.relay` | `true` | the relays, and the record that makes kosh reachable by its endpoint ID |
 | `iroh.mdns` | `true` | announce on the local network by mDNS |
-| `iroh.hostNetwork` | `false` | the pod on the host's network, for mDNS and direct connections |
+| `iroh.hostNetwork` | `false` | the pod on the node's network, for mDNS and direct connections: the SSH port listens on every address of the node, and no NetworkPolicy applies; only with `iroh.enabled` |
 | `iroh.port` | unset | a fixed UDP port for the endpoint |
 | `state.existingSecret` | unset | a Secret with `iroh.key` and `ssh_host_ed25519_key`, made by `kosh id` |
 | `state.persistence.enabled`, `.size`, `.storageClass` | `false`, `16Mi`, the default class | a PersistentVolumeClaim instead, on which kosh makes its keys at first start |
@@ -235,7 +252,7 @@ The chart refuses to install without state (`state.existingSecret` or
   record it did not find, up to several minutes. Wait until the cache
   forgets, or point your machine at another DNS resolver, one that has not
   asked for the record yet.
-- **A direct connection from an `iroh-ssh` built on iroh 1.x is cut.**
+- **A direct connection from an `iroh-ssh` built on iroh 1.x can be cut.**
   The iroh library kosh uses can misread a QUIC key update on a connection
   that uses several network paths, as a client on iroh 1.x does, and close
   the connection: `ssh` then says `Connection closed by UNKNOWN port 65535`.
@@ -243,6 +260,11 @@ The chart refuses to install without state (`state.existingSecret` or
   frequent case; one that the client starts, or a later regular one in a
   very long session, can in principle still cut a direct connection.
   Connect again.
+- **A key's 17th connection is closed without a word.** A key has at most
+  16 open connections; the next is closed without a message to the client
+  (kosh's log says why). Many connections opened within a few seconds can
+  meet it, since a connection whose client went away without closing it
+  takes some seconds to be given up.
 
 ## Development
 
