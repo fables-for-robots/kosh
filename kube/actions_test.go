@@ -2,12 +2,15 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -350,3 +353,316 @@ func TestUpdateConflict(t *testing.T) {
 }
 
 func actionPtr[T any](v T) *T { return &v }
+
+// actionWorkload is a deployment, statefulset, daemonset or replicaset
+// whose pod template has containers of the given names, each with the
+// image "<name>:1".
+func actionWorkload(kind, namespace, name string, containers ...string) runtime.Object {
+	d := actionDeployment(namespace, name, containers...)
+	meta := d.ObjectMeta
+	meta.Labels = nil
+	tm := metav1.TypeMeta{APIVersion: "apps/v1", Kind: kind}
+	switch kind {
+	case "Deployment":
+		return d
+	case "StatefulSet":
+		return &appsv1.StatefulSet{TypeMeta: tm, ObjectMeta: meta, Spec: appsv1.StatefulSetSpec{Replicas: d.Spec.Replicas, Selector: d.Spec.Selector, Template: d.Spec.Template}}
+	case "DaemonSet":
+		return &appsv1.DaemonSet{TypeMeta: tm, ObjectMeta: meta, Spec: appsv1.DaemonSetSpec{Selector: d.Spec.Selector, Template: d.Spec.Template}}
+	case "ReplicaSet":
+		return &appsv1.ReplicaSet{TypeMeta: tm, ObjectMeta: meta, Spec: appsv1.ReplicaSetSpec{Replicas: d.Spec.Replicas, Selector: d.Spec.Selector, Template: d.Spec.Template}}
+	}
+	panic("no workload of kind " + kind)
+}
+
+// actionScaleSubresource makes the clientset fake serve the scale
+// subresource of deployments, statefulsets and replicasets from their
+// spec.replicas, which it does not by itself.
+func actionScaleSubresource(e *env) {
+	for _, res := range []string{"deployments", "statefulsets", "replicasets"} {
+		e.typed.PrependReactor("get", res, func(a k8stesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() != "scale" {
+				return false, nil, nil
+			}
+			name := a.(k8stesting.GetAction).GetName()
+			obj, err := e.typed.Tracker().Get(a.GetResource(), a.GetNamespace(), name)
+			if err != nil {
+				return true, nil, err
+			}
+			replicas := reflect.ValueOf(obj).Elem().FieldByName("Spec").FieldByName("Replicas").Interface().(*int32)
+			return true, &autoscalingv1.Scale{
+				ObjectMeta: metav1.ObjectMeta{Namespace: a.GetNamespace(), Name: name},
+				Spec:       autoscalingv1.ScaleSpec{Replicas: *replicas},
+			}, nil
+		})
+		e.typed.PrependReactor("update", res, func(a k8stesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() != "scale" {
+				return false, nil, nil
+			}
+			sc := a.(k8stesting.UpdateAction).GetObject().(*autoscalingv1.Scale)
+			obj, err := e.typed.Tracker().Get(a.GetResource(), a.GetNamespace(), sc.Name)
+			if err != nil {
+				return true, nil, err
+			}
+			n := sc.Spec.Replicas
+			reflect.ValueOf(obj).Elem().FieldByName("Spec").FieldByName("Replicas").Set(reflect.ValueOf(&n))
+			if err := e.typed.Tracker().Update(a.GetResource(), obj, a.GetNamespace()); err != nil {
+				return true, nil, err
+			}
+			return true, sc, nil
+		})
+	}
+}
+
+// actionAcceptPatches makes the dynamic fake answer every patch with the
+// object as it is: it cannot apply a strategic merge patch as the API
+// does, so the tests look at the patch it was sent.
+func actionAcceptPatches(e *env) {
+	e.dyn.PrependReactor("patch", "*", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		obj, err := e.dyn.Tracker().Get(a.GetResource(), a.GetNamespace(), a.(k8stesting.PatchAction).GetName())
+		return true, obj, err
+	})
+}
+
+// actionPatches returns the patches the dynamic fake was sent.
+func actionPatches(f *actionFixture) []k8stesting.PatchAction {
+	var out []k8stesting.PatchAction
+	for _, a := range f.dyn.Actions() {
+		if p, ok := a.(k8stesting.PatchAction); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// actionOnePatch returns the one patch the dynamic fake was sent, which
+// must be a strategic merge patch, decoded.
+func actionOnePatch(t *testing.T, f *actionFixture) map[string]any {
+	t.Helper()
+	pp := actionPatches(f)
+	if len(pp) != 1 {
+		t.Fatalf("patches %v, want one", pp)
+	}
+	if pp[0].GetPatchType() != types.StrategicMergePatchType {
+		t.Errorf("patch type %s, want a strategic merge patch", pp[0].GetPatchType())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(pp[0].GetPatch(), &body); err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestScale(t *testing.T) {
+	for _, kind := range []struct{ kind, res string }{{"Deployment", "deployments"}, {"StatefulSet", "statefulsets"}, {"ReplicaSet", "replicasets"}} {
+		t.Run(kind.res, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, actionScaleSubresource, actionWorkload(kind.kind, "default", "web", "app"))
+			ref := f.ref(t, "apps", kind.res, "default", "web")
+			if err := f.s.Scale(context.Background(), ref, 4); err != nil {
+				t.Fatal(err)
+			}
+			var verbs []string
+			for _, a := range f.typed.Actions() {
+				verbs = append(verbs, a.GetVerb()+" "+a.GetResource().Resource+"/"+a.GetSubresource())
+			}
+			if want := []string{"get " + kind.res + "/scale", "update " + kind.res + "/scale"}; !reflect.DeepEqual(verbs, want) {
+				t.Errorf("sent %v, want %v", verbs, want)
+			}
+			obj, err := f.typed.Tracker().Get(ref.Resource.GVR, "default", "web")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := *reflect.ValueOf(obj).Elem().FieldByName("Spec").FieldByName("Replicas").Interface().(*int32); n != 4 {
+				t.Errorf("replicas %d, want 4", n)
+			}
+		})
+	}
+
+	f := actionEnv(t, fullGrant, actionScaleSubresource, actionDeployment("default", "web", "app"), pod("default", "web-1", nil))
+	if err := f.s.Scale(context.Background(), f.ref(t, "apps", "deployments", "default", "web"), -1); err == nil || !strings.Contains(err.Error(), "-1") {
+		t.Errorf("-1: %v", err)
+	}
+	if err := f.s.Scale(context.Background(), f.ref(t, "", "pods", "default", "web-1"), 2); err == nil || err.Error() != "cannot scale pods/default/web-1" {
+		t.Errorf("a pod: %v", err)
+	}
+	if a := f.sent(); len(a) != 0 {
+		t.Errorf("sent %v", a)
+	}
+}
+
+func TestRestart(t *testing.T) {
+	for _, kind := range []struct{ kind, res string }{{"Deployment", "deployments"}, {"StatefulSet", "statefulsets"}, {"DaemonSet", "daemonsets"}} {
+		t.Run(kind.res, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, actionAcceptPatches, actionWorkload(kind.kind, "default", "web", "app"))
+			ref := f.ref(t, "apps", kind.res, "default", "web")
+			if err := f.s.Restart(context.Background(), ref); err != nil {
+				t.Fatal(err)
+			}
+			if p := actionPatches(f); len(p) == 1 && (p[0].GetResource() != ref.Resource.GVR || p[0].GetNamespace() != "default" || p[0].GetName() != "web") {
+				t.Errorf("patched %v %s/%s", p[0].GetResource(), p[0].GetNamespace(), p[0].GetName())
+			}
+			body := actionOnePatch(t, f)
+			stamp, ok := body["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)["annotations"].(map[string]any)["kubectl.kubernetes.io/restartedAt"].(string)
+			if !ok {
+				t.Fatalf("patch %v", body)
+			}
+			want := map[string]any{"spec": map[string]any{"template": map[string]any{"metadata": map[string]any{"annotations": map[string]any{"kubectl.kubernetes.io/restartedAt": stamp}}}}}
+			if !reflect.DeepEqual(body, want) {
+				t.Errorf("patch %v holds more than the annotation", body)
+			}
+			at, err := time.Parse(time.RFC3339, stamp)
+			if err != nil {
+				t.Fatalf("%q is not RFC 3339: %v", stamp, err)
+			}
+			if d := time.Since(at); d < -time.Minute || d > time.Minute {
+				t.Errorf("restartedAt %v is not now", at)
+			}
+		})
+	}
+
+	f := actionEnv(t, fullGrant, actionAcceptPatches)
+	if err := f.s.Restart(context.Background(), f.ref(t, "batch", "jobs", "default", "once")); err == nil || err.Error() != "cannot restart jobs/default/once" {
+		t.Errorf("a job: %v", err)
+	}
+	if a := f.sent(); len(a) != 0 {
+		t.Errorf("sent %v", a)
+	}
+}
+
+func TestSetImages(t *testing.T) {
+	withInit := func() runtime.Object {
+		d := actionDeployment("default", "web", "app", "side")
+		d.Spec.Template.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "init:1"}}
+		return d
+	}
+	tests := []struct {
+		name   string
+		images map[string]string
+		want   map[string]any
+	}{
+		{"one of two containers", map[string]string{"side": "side:2"},
+			map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+				"containers": []any{map[string]any{"name": "side", "image": "side:2"}},
+			}}}}},
+		{"an init container", map[string]string{"init": "init:2"},
+			map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+				"initContainers": []any{map[string]any{"name": "init", "image": "init:2"}},
+			}}}}},
+		{"both", map[string]string{"init": "init:2", "app": "app:2", "side": "side:2"},
+			map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+				"containers":     []any{map[string]any{"name": "app", "image": "app:2"}, map[string]any{"name": "side", "image": "side:2"}},
+				"initContainers": []any{map[string]any{"name": "init", "image": "init:2"}},
+			}}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, actionAcceptPatches, withInit())
+			ref := f.ref(t, "apps", "deployments", "default", "web")
+			if err := f.s.SetImages(context.Background(), ref, tt.images); err != nil {
+				t.Fatal(err)
+			}
+			if body := actionOnePatch(t, f); !reflect.DeepEqual(body, tt.want) {
+				t.Errorf("patch %v, want %v", body, tt.want)
+			}
+		})
+	}
+
+	t.Run("a container that is not there", func(t *testing.T) {
+		f := actionEnv(t, fullGrant, actionAcceptPatches, withInit())
+		ref := f.ref(t, "apps", "deployments", "default", "web")
+		err := f.s.SetImages(context.Background(), ref, map[string]string{"app": "app:2", "nope": "nope:2"})
+		if err == nil || !strings.Contains(err.Error(), `"nope"`) {
+			t.Errorf("%v, want an error that names the container", err)
+		}
+		if p := actionPatches(f); len(p) != 0 {
+			t.Errorf("patched %v", p)
+		}
+	})
+
+	t.Run("no images", func(t *testing.T) {
+		f := actionEnv(t, fullGrant, actionAcceptPatches, withInit())
+		if err := f.s.SetImages(context.Background(), f.ref(t, "apps", "deployments", "default", "web"), map[string]string{}); err != nil {
+			t.Fatal(err)
+		}
+		if a := f.sent(); len(a) != 0 {
+			t.Errorf("sent %v", a)
+		}
+	})
+}
+
+// actionRollbackObjects are a deployment web at revision 2 and the
+// replicasets of its revisions 1 and 2, whose images are app:1 and app:2.
+func actionRollbackObjects() (*appsv1.Deployment, *appsv1.ReplicaSet, *appsv1.ReplicaSet) {
+	d := actionDeployment("default", "web", "app")
+	d.Spec.Template.Spec.Containers[0].Image = "app:2"
+	d.Annotations = map[string]string{"deployment.kubernetes.io/revision": "2"}
+	rs := func(rev string) *appsv1.ReplicaSet {
+		r := actionWorkload("ReplicaSet", "default", "web-"+rev, "app").(*appsv1.ReplicaSet)
+		r.Labels = map[string]string{"app": "web", "pod-template-hash": rev}
+		r.Annotations = map[string]string{"deployment.kubernetes.io/revision": rev}
+		r.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", UID: d.UID, Controller: actionPtr(true)}}
+		r.Spec.Selector = &metav1.LabelSelector{MatchLabels: r.Labels}
+		r.Spec.Template = actionTemplate(map[string]string{"app": "web", "pod-template-hash": rev}, "app")
+		r.Spec.Template.Spec.Containers[0].Image = "app:" + rev
+		return r
+	}
+	return d, rs("1"), rs("2")
+}
+
+func TestRollback(t *testing.T) {
+	d, rs1, rs2 := actionRollbackObjects()
+	f := actionEnv(t, fullGrant, nil, d, rs1, rs2)
+	if err := f.s.Rollback(context.Background(), f.ref(t, "apps", "replicasets", "default", "web-1")); err != nil {
+		t.Fatal(err)
+	}
+	obj, err := f.typed.Tracker().Get(f.resource(t, "apps", "deployments").GVR, "default", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := obj.(*appsv1.Deployment)
+	if img := got.Spec.Template.Spec.Containers[0].Image; img != "app:1" {
+		t.Errorf("image %q, want app:1, the first revision's", img)
+	}
+	if _, ok := got.Spec.Template.Labels["pod-template-hash"]; ok {
+		t.Errorf("template labels %v", got.Spec.Template.Labels)
+	}
+
+	t.Run("no owner", func(t *testing.T) {
+		d, rs1, _ := actionRollbackObjects()
+		rs1.OwnerReferences = nil
+		f := actionEnv(t, fullGrant, nil, d, rs1)
+		err := f.s.Rollback(context.Background(), f.ref(t, "apps", "replicasets", "default", "web-1"))
+		if err == nil || !strings.Contains(err.Error(), "belongs to no deployment") {
+			t.Errorf("%v", err)
+		}
+		for _, a := range f.typed.Actions() {
+			if a.GetVerb() != "get" {
+				t.Errorf("sent %v", a)
+			}
+		}
+	})
+	t.Run("no revision", func(t *testing.T) {
+		d, rs1, _ := actionRollbackObjects()
+		rs1.Annotations = nil
+		f := actionEnv(t, fullGrant, nil, d, rs1)
+		err := f.s.Rollback(context.Background(), f.ref(t, "apps", "replicasets", "default", "web-1"))
+		if err == nil || !strings.Contains(err.Error(), "revision") {
+			t.Errorf("%v", err)
+		}
+		for _, a := range f.typed.Actions() {
+			if a.GetVerb() != "get" {
+				t.Errorf("sent %v", a)
+			}
+		}
+	})
+	t.Run("a deployment", func(t *testing.T) {
+		f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
+		err := f.s.Rollback(context.Background(), f.ref(t, "apps", "deployments", "default", "web"))
+		if err == nil || err.Error() != "cannot roll back to deployments/default/web" {
+			t.Errorf("%v", err)
+		}
+		if a := f.sent(); len(a) != 0 {
+			t.Errorf("sent %v", a)
+		}
+	})
+}
