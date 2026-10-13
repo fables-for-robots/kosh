@@ -38,6 +38,8 @@ func TestPersistentVolumeClaimRows(t *testing.T) {
 	terminating := pvcOf(corev1.ClaimBound)
 	now := ago(time.Minute)
 	terminating.DeletionTimestamp = &now
+	boundNoCap := pvcOf(corev1.ClaimBound)
+	boundNoCap.Status.Capacity = nil
 	beta := pvcOf(corev1.ClaimBound)
 	beta.Annotations = map[string]string{corev1.BetaStorageClassAnnotation: "slow"}
 
@@ -55,12 +57,13 @@ func TestPersistentVolumeClaimRows(t *testing.T) {
 			"STATUS": "Pending", "VOLUME": "", "CAPACITY": "", "ACCESS MODES": "", "VALID": "",
 		}, Pending},
 		{"lost", pvcOf(corev1.ClaimLost), map[string]string{"STATUS": "Lost", "VALID": "unexpected status Lost"}, Error},
-		{"terminating", terminating, map[string]string{"STATUS": "Terminating", "VALID": ""}, Pending},
+		{"terminating", terminating, map[string]string{"STATUS": "Terminating", "VALID": "unexpected status Terminating"}, Error},
+		{"bound without status capacity", boundNoCap, map[string]string{"CAPACITY": "0"}, OK},
 		{"beta class annotation wins", beta, map[string]string{"STORAGECLASS": "slow"}, OK},
 		{"metadata only", &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "bare"}}, map[string]string{
 			"NAME": "bare", "STATUS": "", "VOLUME": "", "CAPACITY": "", "ACCESS MODES": "", "STORAGECLASS": "",
-			"LABELS": MissingValue, "VALID": "", "AGE": UnknownValue,
-		}, OK},
+			"LABELS": MissingValue, "VALID": "unexpected status ", "AGE": UnknownValue,
+		}, Error},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

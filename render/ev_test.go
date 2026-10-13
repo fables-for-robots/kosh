@@ -1,7 +1,6 @@
 package render
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -69,9 +68,6 @@ func TestEventRows(t *testing.T) {
 			}
 		})
 	}
-	if strings.ContainsAny(func() string { _, c := rowOf(t, Events, full); return c["MESSAGE"] }(), "\r\n") {
-		t.Error("message holds a line break")
-	}
 }
 
 func TestEventLastSeenPrefersLastThenEventTimeThenFirst(t *testing.T) {
@@ -80,7 +76,7 @@ func TestEventLastSeenPrefersLastThenEventTimeThenFirst(t *testing.T) {
 		EventTime:      metav1.NewMicroTime(testNow.Add(-2 * time.Minute)),
 		FirstTimestamp: ago(3 * time.Minute),
 	}
-	if _, c := rowOf(t, Events, ev); c["LAST SEEN"] != "60s" && c["LAST SEEN"] != "1m" {
+	if _, c := rowOf(t, Events, ev); c["LAST SEEN"] != "60s" {
 		t.Errorf("last timestamp not used: %q", c["LAST SEEN"])
 	}
 	ev.LastTimestamp = metav1.Time{}

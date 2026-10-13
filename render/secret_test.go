@@ -1,6 +1,9 @@
 package render
 
 import (
+	"encoding/base64"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -49,15 +52,20 @@ func TestSecretRowHoldsNoValue(t *testing.T) {
 		StringData: map[string]string{"j": marker},
 	}
 	row, _ := rowOf(t, Secrets, sec)
+	forms := map[string]string{
+		"raw":    marker,
+		"base64": base64.StdEncoding.EncodeToString([]byte(marker)),
+		"bytes":  fmt.Sprint([]byte(marker)),
+	}
 	for i, c := range row.Cells {
-		if strings.Contains(c, marker) {
-			t.Errorf("cell %d holds the value: %q", i, c)
+		for form, needle := range forms {
+			if strings.Contains(c, needle) {
+				t.Errorf("cell %d holds the value (%s): %q", i, form, c)
+			}
 		}
 	}
-	for k, v := range row.Labels {
-		if strings.Contains(k+v, marker) {
-			t.Errorf("label %s holds the value", k)
-		}
+	if !reflect.DeepEqual(row.Labels, sec.Labels) {
+		t.Errorf("Labels = %v, want exactly the object's %v", row.Labels, sec.Labels)
 	}
 }
 

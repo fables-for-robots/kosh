@@ -83,6 +83,10 @@ func svcExternalIPs(svc *corev1.Service) string {
 	case corev1.ServiceTypeExternalName:
 		ips = append(ips, svc.Spec.ExternalName)
 	}
+	// Deliberately every address on its own, sorted: the cell then does
+	// not change when the API returns the ingress addresses in another
+	// order. k9s sorts the ingress addresses, joined as one text in the
+	// order of the API, together with the external IPs.
 	sort.Strings(ips)
 	return strings.Join(ips, ",")
 }

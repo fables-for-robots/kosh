@@ -54,7 +54,7 @@ func TestPersistentVolumeRows(t *testing.T) {
 		{"failed", pvOf(corev1.VolumeFailed), map[string]string{"STATUS": "Failed", "VALID": "failed to delete or recycle"}, Error},
 		{"terminating", terminating, map[string]string{"STATUS": "Terminating"}, OK},
 		{"metadata only", &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "bare"}}, map[string]string{
-			"NAME": "bare", "CAPACITY": "", "ACCESS MODES": "", "RECLAIM POLICY": "", "STATUS": "", "CLAIM": "",
+			"NAME": "bare", "CAPACITY": "0", "ACCESS MODES": "", "RECLAIM POLICY": "", "STATUS": "", "CLAIM": "",
 			"STORAGECLASS": "", "REASON": "", "VOLUMEMODE": MissingValue, "LABELS": MissingValue, "VALID": "", "AGE": UnknownValue,
 		}, OK},
 	}

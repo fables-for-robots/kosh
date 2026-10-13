@@ -71,17 +71,22 @@ func (node) Row(obj runtime.Object, now time.Time) (Row, error) {
 		b.Num(NAValue, 0)
 	}
 
-	// Health is set before Valid: a reason makes the row an Error.
-	if ready && n.Spec.Unschedulable {
-		b.Health(Pending)
-	}
+	// As k9s: VALID says why the node is not as it should be. A node
+	// that is ready and cordoned is only on its way (Pending), so
+	// Health is set after Valid, which would make the row an Error.
 	reason := ""
-	if !ready {
+	switch {
+	case !ready:
 		reason = "node is not ready"
+	case n.Spec.Unschedulable:
+		reason = "node is cordoned"
 	}
 	b.Map(n.Labels).
 		Valid(reason).
 		Age(n.CreationTimestamp.Time, now)
+	if ready && n.Spec.Unschedulable {
+		b.Health(Pending)
+	}
 	return b.Row(), nil
 }
 

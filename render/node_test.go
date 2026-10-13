@@ -84,7 +84,7 @@ func TestNodeRows(t *testing.T) {
 		{
 			name:   "ready and cordoned",
 			node:   cordoned,
-			want:   map[string]string{"STATUS": "Ready,SchedulingDisabled", "VALID": ""},
+			want:   map[string]string{"STATUS": "Ready,SchedulingDisabled", "VALID": "node is cordoned"},
 			health: Pending,
 		},
 		{

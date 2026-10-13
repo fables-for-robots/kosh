@@ -58,10 +58,15 @@ func (persistentVolumeClaim) Row(obj runtime.Object, now time.Time) (Row, error)
 	b := NewRow(pvc)
 	reason := ""
 	switch phase {
-	case "", "Bound", "Available":
-	case "Pending", "Terminating":
+	case "Bound", "Available":
+	case "Pending":
+		// The brief's one departure from k9s besides Lost: a claim
+		// that waits for its volume is on its way, not invalid.
 		b.Health(Pending)
 	default:
+		// As k9s: any other phase, an empty one and Terminating
+		// included, is invalid. A claim held by the
+		// pvc-protection finalizer is shown red on purpose.
 		reason = "unexpected status " + phase
 	}
 	b.Text(pvc.Namespace).
@@ -102,11 +107,9 @@ func coreAccessModes(modes []corev1.PersistentVolumeAccessMode) string {
 }
 
 // coreStorage is the storage quantity of the list as it is written
-// ("10Gi") and its value in bytes; empty and 0 when the list has none.
+// ("10Gi") and its value in bytes. As k9s does, a list without one shows
+// the zero quantity, "0".
 func coreStorage(rl corev1.ResourceList) (string, float64) {
-	q, ok := rl[corev1.ResourceStorage]
-	if !ok {
-		return "", 0
-	}
+	q := rl[corev1.ResourceStorage]
 	return q.String(), q.AsApproximateFloat64()
 }

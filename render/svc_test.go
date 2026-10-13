@@ -55,10 +55,21 @@ func TestServiceRows(t *testing.T) {
 					Ports: []corev1.ServicePort{{Port: 443, NodePort: 30443, Protocol: corev1.ProtocolTCP}},
 				},
 				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{
-					{IP: "1.2.3.4"}, {Hostname: "lb.example.com"},
+					{Hostname: "lb.example.com"}, {IP: "9.9.9.9"}, {IP: "1.2.3.4"},
 				}}},
 			},
-			want: map[string]string{"EXTERNAL-IP": "1.2.3.4,lb.example.com", "PORTS": "443►30443"},
+			want: map[string]string{"EXTERNAL-IP": "1.2.3.4,9.9.9.9,lb.example.com", "PORTS": "443►30443"},
+		},
+		{
+			name: "load balancer with ingress and external ips, all sorted",
+			svc: &corev1.Service{
+				ObjectMeta: meta("lb3"),
+				Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer, ExternalIPs: []string{"5.5.5.5", "0.0.0.1"}},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{
+					{IP: "7.7.7.7"}, {IP: "3.3.3.3"},
+				}}},
+			},
+			want: map[string]string{"EXTERNAL-IP": "0.0.0.1,3.3.3.3,5.5.5.5,7.7.7.7"},
 		},
 		{
 			name: "load balancer without an address yet",
