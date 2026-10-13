@@ -171,10 +171,17 @@ func listen(ctx context.Context, cfg Config, tm timeouts) (*Listener, error) {
 		slots:  make(chan struct{}, maxWaiting),
 		conns:  make(map[*conn]struct{}),
 	}
-	log.Info("iroh endpoint bound", "id", l.id, "addr", ep.LocalAddr())
+	log.Info("iroh endpoint bound", "id", l.id, "addr", ep.LocalAddr(),
+		"local", cfg.Local, "relay", cfg.Relay && !cfg.Local, "mdns", cfg.MDNS && !cfg.Local)
 
 	l.wg.Add(1)
 	go l.acceptLoop()
+	if !cfg.Local {
+		if err := l.announce(ctx, cfg); err != nil {
+			l.Close()
+			return nil, fmt.Errorf("irohnet: %w", err)
+		}
+	}
 	return l, nil
 }
 
