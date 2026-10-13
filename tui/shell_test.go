@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -182,6 +183,23 @@ func shellHints(hs *harness) bool {
 	return slices.Contains(hs.root().top().Hints(), hint{"s", "Shell"})
 }
 
+// shellHelpHasIt reports whether a line of the body of the help that is
+// shown has the key s with the text Shell.
+func shellHelpHasIt(hs *harness) bool {
+	hs.t.Helper()
+	if hs.title() != "Help" {
+		hs.t.Fatalf("the help is not shown: %q", hs.title())
+	}
+	for _, l := range hs.lines() {
+		if strings.HasPrefix(l, "│") && shellHelpLine.MatchString(l) {
+			return true
+		}
+	}
+	return false
+}
+
+var shellHelpLine = regexp.MustCompile(`<s>\s+Shell\b`)
+
 var shellDefaultWords = []string{"sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"}
 
 func TestShellBinding(t *testing.T) {
@@ -217,7 +235,9 @@ func TestShellBinding(t *testing.T) {
 			t.Errorf("Shell is not beside the logs: %q", order)
 		}
 		hs.press("?")
-		hs.wantFrame("<s>", "Shell")
+		if !shellHelpHasIt(hs) {
+			t.Errorf("the help's body has no line with <s> Shell:\n%s", hs.frame())
+		}
 		hs.press("esc", "s")
 		shellDialog(hs)
 		hs.press("esc", "enter")
@@ -263,6 +283,9 @@ func TestShellBinding(t *testing.T) {
 				t.Error("s opened a dialog")
 			}
 			hs.press("?")
+			if shellHelpHasIt(hs) {
+				t.Error("the help lists <s> Shell")
+			}
 			hs.notFrame("Shell")
 			hs.press("esc", "enter")
 			if shellHints(hs) {
@@ -969,32 +992,51 @@ func TestShellReadOnlyGrant(t *testing.T) {
 	}
 }
 
-// A paste into Command, of a megabyte with line feeds and escape
-// sequences, is cleaned onto one line and cut to what a field takes; what
-// is run is cut into words by the rule and nothing else.
+// A paste into Command that holds a line break or another control
+// character is refused, and the field keeps its text: a paste does not
+// smuggle a second line in. A paste of one line is taken, cut to what a
+// field takes.
 func TestShellPaste(t *testing.T) {
 	sess, _, hs := shellSetup(t, shellPodYAML("", running("app"), nil, nil))
 	hs.press("s")
+	for _, paste := range []string{
+		"ls\nrm -rf /",
+		"ls\r",
+		"ls\x1b[2J",
+		"ls\x00",
+		"ls\u009b",
+		"ls\x7f",
+		"ls\n\x1b[2J" + strings.Repeat("rm -rf / ;\r\n", 100000),
+	} {
+		hs.send(tea.PasteMsg{Content: paste})
+		d := shellDialog(hs)
+		if v := d.field("Command").value(); v != shellDefaultCommand {
+			t.Errorf("a paste of %q changed the field to %q", paste[:min(len(paste), 20)], v[:min(len(v), 80)])
+		}
+		hs.wantFrame(shellTextPasteRefused)
+		hs.press("end")
+		hs.notFrame(shellTextPasteRefused)
+	}
+	// One line, of a megabyte, with tabs: taken, and cut.
 	for range len(shellDefaultCommand) {
 		hs.press("backspace")
 	}
-	hs.send(tea.PasteMsg{Content: "ls\n\x1b[2J" + strings.Repeat("rm -rf / ;\r\n", 100000)})
+	hs.send(tea.PasteMsg{Content: "ls\t-l " + strings.Repeat("x", 1<<20)})
 	v := shellDialog(hs).field("Command").value()
-	if n := len([]rune(v)); n == 0 || n > inputMaxChars {
-		t.Errorf("the field holds %d characters", n)
+	if n := len([]rune(v)); n != inputMaxChars || !strings.HasPrefix(v, "ls") {
+		t.Errorf("the field holds %d characters: %q", n, v[:min(len(v), 20)])
 	}
-	if strings.ContainsAny(v, "\n\r\x1b") {
-		t.Errorf("the field holds a control character: %q", v[:40])
-	}
+	hs.notFrame(shellTextPasteRefused)
 	hs.press("enter")
 	ex := shellExecs(sess)
-	if len(ex) != 1 || ex[0].opts.Command[0] != "ls" {
+	if len(ex) != 1 || len(ex[0].opts.Command) != 3 || ex[0].opts.Command[0] != "ls" || ex[0].opts.Command[1] != "-l" {
 		t.Fatalf("Exec was called so: %d calls", len(ex))
 	}
-	for _, w := range ex[0].opts.Command {
-		if strings.ContainsAny(w, "\n\r\x1b") {
-			t.Errorf("a word holds a control character: %q", w)
-		}
+	// The other dialogs take a paste as they did: on one line.
+	other := dialogForm("q", nil, []*formField{formTextField("Name", "")})
+	other.Update(tea.PasteMsg{Content: "a\nb"})
+	if v := other.fields[0].value(); v != "a b" {
+		t.Errorf("another dialog's field took a paste as %q", v)
 	}
 }
 
@@ -1012,5 +1054,116 @@ func TestShellLongReason(t *testing.T) {
 	}
 	if !dialogFocusDrawn(hs) || dialogFocused(hs) != "Command" || d.field("Command").value() != shellDefaultCommand {
 		t.Errorf("the dialog is not as it was:\n%s", hs.frame())
+	}
+}
+
+// The session ends while a shell has the terminal: the hand-over's
+// context is done, Exec returns its error, and done's message never
+// comes to a program that is ending. run gives the keys back itself.
+func TestShellEndsWithItsSession(t *testing.T) {
+	sess, term, hs := shellSetup(t, shellPodYAML("", running("app"), nil, nil))
+	ended := false
+	handover := func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
+		return func() tea.Msg {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			run(ctx, Terminal{In: term.in, Out: &term.out, Size: term.size, Resized: term.resized})
+			ended = true
+			return nil
+		}
+	}
+	sess.ExecDo = func(ctx context.Context, _ kube.ObjectRef, _ kube.ExecOptions) (kube.ExecResult, error) {
+		return kube.ExecResult{}, ctx.Err()
+	}
+	e := env{sess: sess, now: hs.clock.now, handover: handover}
+	q := query("pods", "default")
+	var shell binding
+	for _, b := range bindingsFor(q.Resource, sess.Grant()) {
+		if b.Key == "s" {
+			shell = b
+		}
+	}
+	hs.send(shell.Run(e, q, []kube.ObjectRef{shellWeb})())
+	shellDialog(hs)
+	hs.press("enter")
+	if !ended || len(sess.Called("Exec")) != 1 {
+		t.Fatal("the shell did not run")
+	}
+	if actionBusy(sess) {
+		t.Error("the session's entry is still in actionsRunning")
+	}
+	actionsRunning.Lock()
+	_, held := actionsRunning.m[sess]
+	actionsRunning.Unlock()
+	if held {
+		t.Error("the session is still a key of actionsRunning")
+	}
+}
+
+// A panic under Exec does not end the program: the shell's error in
+// the flash, the table back, the keys free.
+func TestShellPanicIsAnError(t *testing.T) {
+	sess, _, hs := shellSetup(t, shellPodYAML("", running("app"), nil, nil))
+	sess.ExecDo = func(context.Context, kube.ObjectRef, kube.ExecOptions) (kube.ExecResult, error) {
+		panic("stream \x1b[2Jbroke" + strings.Repeat(" and broke", 100000))
+	}
+	hs.press("s", "enter")
+	hs.wantFrame("the shell failed: stream broke and broke")
+	if !strings.Contains(hs.drawnLine("the shell failed"), sgr(styleError)) {
+		t.Error("the panic is not an error flash")
+	}
+	if strings.Contains(hs.drawn(), "\x1b[2J") {
+		t.Error("the panic's text is not cleaned")
+	}
+	if hs.root().dlg != nil || actionBusy(sess) {
+		t.Error("a dialog is open or the keys are held")
+	}
+	if hs.title() != "Pods(default)[2]" {
+		t.Errorf("the table is not back: %q", hs.title())
+	}
+	hs.press("ctrl+k")
+	if d := dialogOpen(hs); d == nil || !strings.Contains(d.question, "Kill") {
+		t.Error("another action key does not work")
+	}
+}
+
+// From a pod's containers, s on a container that does not run says so,
+// and opens nothing, while another container of the pod runs.
+func TestShellContainerNotRunning(t *testing.T) {
+	yaml := shellPodYAML("", []shellCtr{{"app", "running"}, {"late", "waiting"}}, []shellCtr{{"setup", "completed"}}, nil)
+	sess, term, hs := shellSetup(t, yaml)
+	sess.SetTable(queryOf(kube.Containers, shellWeb), kube.Table{
+		Columns: []render.Column{{Name: "NAME"}},
+		Rows: []render.Row{
+			{Namespace: "default", Name: "app", Cells: []string{"app"}},
+			{Namespace: "default", Name: "late", Cells: []string{"late"}},
+			{Namespace: "default", Name: "setup", Cells: []string{"setup"}},
+		},
+	})
+	hs.press("enter")
+	tv := hs.table2(1)
+	for range 3 {
+		name := tv.ref(tv.cursorRow()).Name
+		hs.press("s")
+		if name == "app" {
+			shellDialog(hs)
+			hs.press("esc")
+		} else {
+			if hs.root().dlg != nil {
+				t.Errorf("s on %s opened a dialog", name)
+			}
+			text := "container " + name + " of pod default/web is not running"
+			hs.wantFrame(text)
+			if strings.Contains(hs.drawnLine(text), sgr(styleError)) {
+				t.Error("the flash is an error")
+			}
+		}
+		if actionBusy(sess) {
+			t.Errorf("the keys are held after s on %s", name)
+		}
+		hs.press("down")
+	}
+	if len(sess.Called("Exec")) != 0 || term.runs != 0 {
+		t.Error("something was run")
 	}
 }

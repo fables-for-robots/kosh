@@ -35,10 +35,8 @@ const (
 // one with a quote that is not closed. It runs in time linear in the
 // text.
 func commandWords(text string) ([]string, error) {
-	for _, r := range text {
-		if (r < 0x20 && r != '\t') || (r >= 0x7f && r <= 0x9f) {
-			return nil, errors.New(commandTextControl)
-		}
+	if strings.ContainsFunc(text, formControl) {
+		return nil, errors.New(commandTextControl)
 	}
 	text = strings.Trim(text, " \t")
 	var (

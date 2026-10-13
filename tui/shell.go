@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"sigs.k8s.io/yaml"
@@ -37,6 +39,13 @@ const shellDefaultCommand = `sh -c "command -v bash >/dev/null && exec bash || e
 
 // shellAnnotation names the container chosen first.
 const shellAnnotation = "kubectl.kubernetes.io/default-container"
+
+// shellTextPasteRefused is the reason of a paste into Command that is
+// not taken: a paste must not bring a second line.
+const shellTextPasteRefused = "the pasted text holds a line break or a control character"
+
+// shellPanicMax is how much of a panic's value the shell's error keeps.
+const shellPanicMax = 1024
 
 // shellButton is the label of the button that starts the shell.
 const shellButton = "Shell"
@@ -82,9 +91,13 @@ func shellOpen(e env, q kube.Query, refs []kube.ObjectRef) tea.Cmd {
 		if err != nil {
 			return nil, fmt.Errorf("the pod %s/%s could not be read: %w", pod.Namespace, pod.Name, err)
 		}
-		if len(names) == 0 {
+		if len(names) == 0 && container == "" {
 			release()
 			return flashMsg{text: fmt.Sprintf("pod %s/%s has no running container", pod.Namespace, pod.Name)}, nil
+		}
+		if container != "" && !slices.Contains(names, container) {
+			release()
+			return flashMsg{text: fmt.Sprintf("container %s of pod %s/%s is not running", container, pod.Namespace, pod.Name)}, nil
 		}
 		s := &shell{e: e, pod: pod, names: names, at: at, release: release}
 		if container != "" {
@@ -189,7 +202,7 @@ func (s *shell) dialog(command, why string) *formDialog {
 		container = formPickField("Container", s.at, shown...)
 	}
 	cmd := formTextField("Command", command)
-	cmd.presses, cmd.scrolls = shellButton, true
+	cmd.presses, cmd.scrolls, cmd.pasteRefused = shellButton, true, shellTextPasteRefused
 	d := dialogForm("A shell in pod "+s.pod.Namespace+"/"+s.pod.Name, nil, []*formField{container, cmd}, formButton{
 		label: shellButton,
 		after: true,
@@ -222,6 +235,7 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 	var (
 		mu     sync.Mutex
 		ran    bool
+		ended  bool
 		result kube.ExecResult
 	)
 	run := func(ctx context.Context, t Terminal) error {
@@ -233,7 +247,7 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 			cleanLine(pod.Namespace), cleanLine(pod.Name), cleanLine(container))
 		// No timeout: a shell lasts as long as the user wants, and the
 		// context ends with the session.
-		r, err := sess.Exec(ctx, pod, kube.ExecOptions{
+		r, err := shellCallExec(ctx, sess, pod, kube.ExecOptions{
 			Container: container,
 			Command:   words,
 			Stdin:     t.In,
@@ -243,7 +257,14 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 		})
 		mu.Lock()
 		result = r
+		ended = ctx.Err() != nil
 		mu.Unlock()
+		if ended {
+			// The session is ending: done's message may never be taken
+			// by a program that ends with it, so the keys are given back
+			// here. done gives them back too, which then does nothing.
+			s.release()
+		}
 		return err
 	}
 	// done is called when the terminal is the UI's again, before any
@@ -251,9 +272,9 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 	// here, and no key can reach a table before they are.
 	done := func(err error) tea.Msg {
 		mu.Lock()
-		r, started := result, ran
+		r, started, over := result, ran, ended
 		mu.Unlock()
-		if started && errors.Is(err, kube.ErrExecNotStarted) {
+		if started && !over && errors.Is(err, kube.ErrExecNotStarted) {
 			// The dialog again, which holds the keys from here on.
 			s.at = at
 			return tea.BatchMsg{openDialog(s.dialog(text, errorText(err.Error()))), refresh()}
@@ -268,4 +289,34 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 		return refreshMsg{}
 	}
 	return s.e.handover(run, done)
+}
+
+// shellCallExec calls Exec, and returns a panic under it as an error: run is
+// called in the program's loop, and a panic there would end the session
+// and leave the keys of actions held. It is the one call of the UI that
+// is so guarded.
+func shellCallExec(ctx context.Context, sess kube.Session, pod kube.ObjectRef, opts kube.ExecOptions) (r kube.ExecResult, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			r, err = kube.ExecResult{}, errors.New("the shell failed: "+shellPanicText(p))
+		}
+	}()
+	return sess.Exec(ctx, pod, opts)
+}
+
+// shellPanicText is a panic's value as the shell's error says it: its
+// first shellPanicMax bytes, with "…" when there were more, cleaned onto
+// one line.
+func shellPanicText(p any) string {
+	s := fmt.Sprint(p)
+	if len(s) <= shellPanicMax {
+		return cleanLine(s)
+	}
+	i := shellPanicMax
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	// The mark after the cleaning, which would take it into an escape
+	// sequence the cut fell in.
+	return cleanLine(s[:i]) + "…"
 }

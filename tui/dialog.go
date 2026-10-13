@@ -71,6 +71,11 @@ type formField struct {
 	// scrolls: a text field longer than its width shows the part about
 	// its cursor from the first frame on, and not only after a key.
 	scrolls bool
+	// pasteRefused, when set, is the reason the dialog gives for a paste
+	// into the field that holds a line break or another control
+	// character but the tab: such a paste is not taken, rather than put
+	// on one line, and the field keeps its text.
+	pasteRefused string
 }
 
 // formTextField returns a field of a line of text, filled with value.
@@ -166,6 +171,12 @@ func (f *formField) input(msg tea.Msg) tea.Cmd {
 		f.in.SetCursor(pos)
 	}
 	return cmd
+}
+
+// formControl reports whether r is a control character other than the
+// tab: C0, DEL or C1.
+func formControl(r rune) bool {
+	return (r < 0x20 && r != '\t') || (r >= 0x7f && r <= 0x9f)
 }
 
 // formButton is a button of a dialog.
@@ -326,6 +337,10 @@ func (d *formDialog) Update(msg tea.Msg) (dialog, tea.Cmd) {
 		return d, d.key(msg)
 	case tea.PasteMsg:
 		if f := d.focused(); f != nil {
+			if f.pasteRefused != "" && strings.ContainsFunc(msg.Content, formControl) {
+				d.why = f.pasteRefused
+				return d, nil
+			}
 			// Cleaned, on one line, and cut to what a field takes.
 			return d, f.input(tea.PasteMsg{Content: inputCut(cleanLine(msg.Content))})
 		}
