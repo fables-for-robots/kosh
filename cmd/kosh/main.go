@@ -15,6 +15,9 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// After the first signal kosh stops; a second one ends the process
+	// at once, as the signals' default does.
+	context.AfterFunc(ctx, stop)
 	if err := cli.App().RunContext(ctx, os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, "kosh:", err)
 		os.Exit(1)
