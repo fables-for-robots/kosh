@@ -23,17 +23,17 @@ const dialogWidth = 64
 // dialogNames is how many names a dialog lists; the others are counted.
 const dialogNames = 10
 
-// textCancel is the label of the button that changes nothing.
-const textCancel = "Cancel"
+// dialogCancel is the label of the button that changes nothing.
+const dialogCancel = "Cancel"
 
 // formKind is the kind of a field of a form.
 type formKind int
 
 const (
-	formText   formKind = iota // a line of text
-	formNumber                 // a whole number
-	formChoice                 // one of several options
-	formCheck                  // a checkbox
+	formIsText   formKind = iota // a line of text
+	formIsNumber                 // a whole number
+	formIsChoice                 // one of several options
+	formIsCheck                  // a checkbox
 )
 
 // formField is one field of a form dialog.
@@ -51,25 +51,25 @@ type formField struct {
 	on bool
 }
 
-// newTextField returns a field of a line of text, filled with value.
-func newTextField(label, value string) *formField {
-	return &formField{kind: formText, label: label, in: formInput(value)}
+// formTextField returns a field of a line of text, filled with value.
+func formTextField(label, value string) *formField {
+	return &formField{kind: formIsText, label: label, in: formInput(value)}
 }
 
-// newNumberField returns a field that takes only digits, and a minus at
+// formNumberField returns a field that takes only digits, and a minus at
 // its start when signed.
-func newNumberField(label, value string, signed bool) *formField {
-	return &formField{kind: formNumber, label: label, in: formInput(value), signed: signed}
+func formNumberField(label, value string, signed bool) *formField {
+	return &formField{kind: formIsNumber, label: label, in: formInput(value), signed: signed}
 }
 
-// newChoiceField returns a choice of options, the first one chosen.
-func newChoiceField(label string, options ...string) *formField {
-	return &formField{kind: formChoice, label: label, options: options}
+// formChoiceField returns a choice of options, the first one chosen.
+func formChoiceField(label string, options ...string) *formField {
+	return &formField{kind: formIsChoice, label: label, options: options}
 }
 
-// newCheckField returns a checkbox.
-func newCheckField(label string, on bool) *formField {
-	return &formField{kind: formCheck, label: label, on: on}
+// formCheckField returns a checkbox.
+func formCheckField(label string, on bool) *formField {
+	return &formField{kind: formIsCheck, label: label, on: on}
 }
 
 // formInput returns the text input of a field: no blinking cursor, and
@@ -92,12 +92,12 @@ func formInput(value string) textinput.Model {
 // "true" or "false".
 func (f *formField) value() string {
 	switch f.kind {
-	case formChoice:
+	case formIsChoice:
 		if f.at < len(f.options) {
 			return f.options[f.at]
 		}
 		return ""
-	case formCheck:
+	case formIsCheck:
 		return strconv.FormatBool(f.on)
 	}
 	return f.in.Value()
@@ -105,7 +105,7 @@ func (f *formField) value() string {
 
 // takes reports whether a number field takes s.
 func (f *formField) takes(s string) bool {
-	if f.kind != formNumber {
+	if f.kind != formIsNumber {
 		return true
 	}
 	if f.signed {
@@ -117,7 +117,7 @@ func (f *formField) takes(s string) bool {
 // input gives msg to a text or number field. A number field keeps its
 // text when msg would put into it what it does not take.
 func (f *formField) input(msg tea.Msg) tea.Cmd {
-	if f.kind != formText && f.kind != formNumber {
+	if f.kind != formIsText && f.kind != formIsNumber {
 		return nil
 	}
 	before, pos := f.in.Value(), f.in.Position()
@@ -153,21 +153,21 @@ type formDialog struct {
 	why string
 }
 
-// newConfirmDialog returns a dialog that asks question about names,
+// dialogConfirm returns a dialog that asks question about names,
 // with the buttons Cancel and then buttons. Cancel has the focus.
-func newConfirmDialog(question string, names []string, buttons ...formButton) *formDialog {
-	return newFormDialog(question, names, nil, buttons...)
+func dialogConfirm(question string, names []string, buttons ...formButton) *formDialog {
+	return dialogForm(question, names, nil, buttons...)
 }
 
-// newFormDialog returns a dialog with fields, and the buttons Cancel and
+// dialogForm returns a dialog with fields, and the buttons Cancel and
 // then buttons. The first field has the focus, or Cancel when there is
 // none. The question and the names are cleaned; ten names are listed
 // and the others counted.
-func newFormDialog(question string, names []string, fields []*formField, buttons ...formButton) *formDialog {
+func dialogForm(question string, names []string, fields []*formField, buttons ...formButton) *formDialog {
 	d := &formDialog{
 		question: cleanLine(question),
 		fields:   fields,
-		buttons:  append([]formButton{{label: textCancel}}, buttons...),
+		buttons:  append([]formButton{{label: dialogCancel}}, buttons...),
 	}
 	for i, n := range names {
 		if i == dialogNames {
@@ -204,7 +204,7 @@ func (d *formDialog) setFocus(i int) {
 	n := len(d.fields) + len(d.buttons)
 	d.focus = ((i % n) + n) % n
 	for j, f := range d.fields {
-		if f.kind != formText && f.kind != formNumber {
+		if f.kind != formIsText && f.kind != formIsNumber {
 			continue
 		}
 		// The cursor does not blink (formInput), so Focus returns no
@@ -267,10 +267,10 @@ func (d *formDialog) key(k tea.KeyPressMsg) tea.Cmd {
 			return nil
 		}
 		switch f.kind {
-		case formChoice:
+		case formIsChoice:
 			f.at = (f.at + 1) % max(len(f.options), 1)
 			return nil
-		case formCheck:
+		case formIsCheck:
 			f.on = !f.on
 			return nil
 		}
@@ -343,7 +343,7 @@ func (d *formDialog) fieldLine(f *formField, focused bool, lw, iw int) string {
 	vw := max(iw-2-lw-2, 1)
 	var value string
 	switch f.kind {
-	case formChoice:
+	case formIsChoice:
 		var opts []string
 		for i, o := range f.options {
 			box := "( ) "
@@ -353,7 +353,7 @@ func (d *formDialog) fieldLine(f *formField, focused bool, lw, iw int) string {
 			opts = append(opts, box+o)
 		}
 		value = stylePromptText.Render(strings.Join(opts, "  "))
-	case formCheck:
+	case formIsCheck:
 		value = stylePromptText.Render("[ ]")
 		if f.on {
 			value = stylePromptText.Render("[x]")

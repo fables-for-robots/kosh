@@ -33,10 +33,10 @@ type actionSpySession struct {
 	fail map[string]error
 }
 
-func newActionSpySession() *actionSpySession { return newActionSpyOf(newSession()) }
+func actionSpy() *actionSpySession { return actionSpyOf(newSession()) }
 
-// newActionSpyOf returns a spy over sess.
-func newActionSpyOf(sess *kubetest.Session) *actionSpySession {
+// actionSpyOf returns a spy over sess.
+func actionSpyOf(sess *kubetest.Session) *actionSpySession {
 	return &actionSpySession{Session: sess, hold: map[string]chan struct{}{}, left: map[string][]time.Duration{}}
 }
 
@@ -243,7 +243,7 @@ func TestActionGoesOnAfterAnError(t *testing.T) {
 
 // Some rows fail: the flash counts those done and gives the first error.
 func TestActionFailsForSomeRows(t *testing.T) {
-	sess := newActionSpySession()
+	sess := actionSpy()
 	sess.fail = map[string]error{
 		"pods/default/web-02": errors.New("first"),
 		"pods/default/web-03": errors.New("second"),
@@ -282,7 +282,7 @@ func TestFlashAfterAnAction(t *testing.T) {
 }
 
 func TestNoSecondActionWhileOneRuns(t *testing.T) {
-	sess := newActionSpySession()
+	sess := actionSpy()
 	release := sess.holdCalls("Kill")
 	t.Cleanup(release)
 	sess.SetTable(query("pods", "default"), podsNamed("web-1", "web-2"))
@@ -297,7 +297,7 @@ func TestNoSecondActionWhileOneRuns(t *testing.T) {
 	release()
 	hs.awaitFrame("Killed pods/default/web-1")
 	// Another session is not held up by this one's action.
-	other := newActionSpySession()
+	other := actionSpy()
 	releaseOther := other.holdCalls("Kill")
 	t.Cleanup(releaseOther)
 	other.SetTable(query("pods", "default"), podsNamed("web-1"))
@@ -312,7 +312,7 @@ func TestNoSecondActionWhileOneRuns(t *testing.T) {
 }
 
 func TestNothingIsCalledInUpdate(t *testing.T) {
-	sess := newActionSpySession()
+	sess := actionSpy()
 	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
 	hs := newHarness(t, sess, 100, 30)
 	hs.press(actionKillKey, "right", "enter")

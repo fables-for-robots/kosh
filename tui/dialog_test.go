@@ -71,7 +71,7 @@ func TestConfirmDialogKeys(t *testing.T) {
 	hs := newHarness(t, newSession(), 100, 30)
 	var p dialogPressed
 	open := func() {
-		hs.send(openDialogMsg{newConfirmDialog("Kill pods/default/web-1?", nil, p.button("Kill"))})
+		hs.send(openDialogMsg{dialogConfirm("Kill pods/default/web-1?", nil, p.button("Kill"))})
 	}
 	open()
 	hs.wantFrame("Kill pods/default/web-1?", "[ Cancel ]", "Kill")
@@ -126,7 +126,7 @@ func TestConfirmDialogListsNames(t *testing.T) {
 	for _, n := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"} {
 		names = append(names, "web-"+n)
 	}
-	hs.send(openDialogMsg{newConfirmDialog("Kill 12 pods?", names, formButton{label: "Kill"})})
+	hs.send(openDialogMsg{dialogConfirm("Kill 12 pods?", names, formButton{label: "Kill"})})
 	hs.wantFrame("Kill 12 pods?", "web-a", "web-j", "… and 2 more")
 	hs.notFrame("web-k", "web-l")
 }
@@ -146,12 +146,12 @@ func TestFormDialog(t *testing.T) {
 		return nil, ""
 	}}
 	open := func() {
-		hs.send(openDialogMsg{newFormDialog("Do it?", nil, []*formField{
-			newTextField("Name", "abc"),
-			newNumberField("Count", "7", false),
-			newNumberField("Offset", "-1", true),
-			newChoiceField("Way", "Here", "There", "Everywhere"),
-			newCheckField("Hard", false),
+		hs.send(openDialogMsg{dialogForm("Do it?", nil, []*formField{
+			formTextField("Name", "abc"),
+			formNumberField("Count", "7", false),
+			formNumberField("Offset", "-1", true),
+			formChoiceField("Way", "Here", "There", "Everywhere"),
+			formCheckField("Hard", false),
 		}, ok)})
 	}
 	open()
@@ -237,7 +237,7 @@ func TestFormDialog(t *testing.T) {
 // number field.
 func TestFormDialogPaste(t *testing.T) {
 	hs := newHarness(t, newSession(), 100, 30)
-	d := newFormDialog("Do it?", nil, []*formField{newTextField("Name", ""), newNumberField("Count", "", false)}, formButton{label: "Go"})
+	d := dialogForm("Do it?", nil, []*formField{formTextField("Name", ""), formNumberField("Count", "", false)}, formButton{label: "Go"})
 	hs.send(openDialogMsg{d})
 	hs.send(tea.PasteMsg{Content: "web"})
 	hs.press("tab")
@@ -249,7 +249,7 @@ func TestFormDialogPaste(t *testing.T) {
 
 // No field reads the clipboard of the machine kosh runs on.
 func TestFormFieldsUseNoClipboardOfTheServer(t *testing.T) {
-	for _, f := range []*formField{newTextField("a", ""), newNumberField("b", "", true)} {
+	for _, f := range []*formField{formTextField("a", ""), formNumberField("b", "", true)} {
 		if f.in.KeyMap.Paste.Enabled() {
 			t.Errorf("ctrl+v in %s reads the clipboard of the server", f.label)
 		}
@@ -259,6 +259,6 @@ func TestFormFieldsUseNoClipboardOfTheServer(t *testing.T) {
 func TestDialogFitsTheWindow(t *testing.T) {
 	hs := newHarness(t, newSession(), 80, 12)
 	long := strings.Repeat("x", 200)
-	hs.send(openDialogMsg{newFormDialog("Do "+long+"?", []string{long, long}, []*formField{newTextField("Name "+long, long)}, formButton{label: "Go"})})
+	hs.send(openDialogMsg{dialogForm("Do "+long+"?", []string{long, long}, []*formField{formTextField("Name "+long, long)}, formButton{label: "Go"})})
 	hs.frame() // checks every line's width and the number of lines
 }

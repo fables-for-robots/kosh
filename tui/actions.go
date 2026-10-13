@@ -16,12 +16,12 @@ import (
 // the flash; the table read again. One action of a session runs at a
 // time.
 
-// textBusy is the flash of a key of an action while another runs.
-const textBusy = "an action is still running"
+// actionTextBusy is the flash of a key of an action while another runs.
+const actionTextBusy = "an action is still running"
 
-// textNothingChanged is the flash of a dialog or the editor that had
+// actionTextNothingChanged is the flash of a dialog or the editor that had
 // nothing to send.
-const textNothingChanged = "nothing changed"
+const actionTextNothingChanged = "nothing changed"
 
 // actionWords are how an action is spoken of: ask in the question
 // ("Kill pods/default/web-1?"), button on its button, done in the flash
@@ -77,7 +77,7 @@ func actionGuard(run actionRunFunc) actionRunFunc {
 			return nil
 		}
 		if actionBusy(e.sess) {
-			return flash(textBusy)
+			return flash(actionTextBusy)
 		}
 		return run(e, q, refs)
 	}
@@ -117,7 +117,7 @@ func actionQuestion(ask string, refs []kube.ObjectRef) string {
 // over refs; its button starts the action, with a context of timeout for
 // each call.
 func actionAsk(e env, refs []kube.ObjectRef, w actionWords, timeout time.Duration, do actionDo) tea.Cmd {
-	return openDialog(newConfirmDialog(actionQuestion(w.ask, refs), actionNames(refs), formButton{
+	return openDialog(dialogConfirm(actionQuestion(w.ask, refs), actionNames(refs), formButton{
 		label: w.button,
 		press: func(*formDialog) (tea.Cmd, string) {
 			return actionStart(e, refs, w.done, timeout, do), ""
@@ -132,7 +132,7 @@ func actionAsk(e env, refs []kube.ObjectRef, w actionWords, timeout time.Duratio
 // When an action of the session is running already, it says so instead.
 func actionStart(e env, refs []kube.ObjectRef, done string, timeout time.Duration, do actionDo) tea.Cmd {
 	if !actionBegin(e.sess) {
-		return flash(textBusy)
+		return flash(actionTextBusy)
 	}
 	sess := e.sess
 	return waitCmd(func() tea.Msg {

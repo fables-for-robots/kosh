@@ -89,6 +89,11 @@ func TestEditorTakesEveryKey(t *testing.T) {
 	if v.Init() != nil {
 		t.Error("the editor's Init returns a command")
 	}
+	// ctrl+c still ends the session.
+	hs.press("ctrl+c")
+	if !hs.quit {
+		t.Error("ctrl+c in the editor did not end the session")
+	}
 }
 
 // No key of the editor reads or writes the clipboard of the machine kosh
@@ -238,7 +243,7 @@ func TestEditorRefusesWhatItCannotHold(t *testing.T) {
 }
 
 func TestEditorWhileSaving(t *testing.T) {
-	sess := newActionSpySession()
+	sess := actionSpy()
 	release := sess.holdCalls("Update")
 	t.Cleanup(release)
 	sess.YAMLs[editorRef.String()] = editorYAML

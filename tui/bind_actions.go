@@ -112,15 +112,15 @@ func actionSuspend(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 			}), ""
 		}}
 	}
-	return openDialog(newConfirmDialog(actionQuestion("Suspend or resume", refs), actionNames(refs),
+	return openDialog(dialogConfirm(actionQuestion("Suspend or resume", refs), actionNames(refs),
 		button("Suspend", "Suspended", true), button("Resume", "Resumed", false)))
 }
 
 // actionDelete asks how to delete, and deletes.
 func actionDelete(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
-	prop := newChoiceField("Propagation", string(kube.PropagationBackground), string(kube.PropagationForeground), string(kube.PropagationOrphan))
-	force := newCheckField("Force", false)
-	return openDialog(newFormDialog(actionQuestion("Delete", refs), actionNames(refs), []*formField{prop, force}, formButton{
+	prop := formChoiceField("Propagation", string(kube.PropagationBackground), string(kube.PropagationForeground), string(kube.PropagationOrphan))
+	force := formCheckField("Force", false)
+	return openDialog(dialogForm(actionQuestion("Delete", refs), actionNames(refs), []*formField{prop, force}, formButton{
 		label: "Delete",
 		press: func(*formDialog) (tea.Cmd, string) {
 			opts := kube.DeleteOptions{Propagation: kube.Propagation(prop.value()), Force: force.on}
@@ -142,8 +142,8 @@ func actionScale(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 		if err != nil {
 			return flashMsg{text: err.Error(), err: true}
 		}
-		field := newNumberField("Replicas", strconv.Itoa(int(n)), false)
-		return openDialogMsg{newFormDialog(actionQuestion("Scale", refs), actionNames(refs), []*formField{field}, formButton{
+		field := formNumberField("Replicas", strconv.Itoa(int(n)), false)
+		return openDialogMsg{dialogForm(actionQuestion("Scale", refs), actionNames(refs), []*formField{field}, formButton{
 			label: "Scale",
 			press: func(*formDialog) (tea.Cmd, string) {
 				replicas, err := strconv.ParseInt(field.value(), 10, 32)
@@ -176,10 +176,10 @@ func actionSetImage(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 			if c.Init {
 				label += " (init)"
 			}
-			fields[i] = newTextField(label, cleanLine(c.Image))
+			fields[i] = formTextField(label, cleanLine(c.Image))
 			was[i] = fields[i].value()
 		}
-		return openDialogMsg{newFormDialog(actionQuestion("Set the images of", refs[:1]), nil, fields, formButton{
+		return openDialogMsg{dialogForm(actionQuestion("Set the images of", refs[:1]), nil, fields, formButton{
 			label: "Set",
 			press: func(*formDialog) (tea.Cmd, string) {
 				images := map[string]string{}
@@ -189,7 +189,7 @@ func actionSetImage(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 					}
 				}
 				if len(images) == 0 {
-					return flash(textNothingChanged), ""
+					return flash(actionTextNothingChanged), ""
 				}
 				return actionStart(e, refs[:1], "Set the images of", apiTimeout, func(ctx context.Context, ref kube.ObjectRef) (string, error) {
 					return "", sess.SetImages(ctx, ref, images)
@@ -204,14 +204,14 @@ func actionSetImage(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 // besides; without a timeout it may take as long as it takes.
 func actionDrain(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 	def := kube.DefaultDrainOptions()
-	grace := newNumberField("Grace Period", strconv.Itoa(def.GracePeriod), true)
-	timeout := newTextField("Timeout", def.Timeout.String())
-	ignore := newCheckField("Ignore DaemonSets", def.IgnoreDaemonSets)
-	emptyDir := newCheckField("Delete EmptyDir Data", def.DeleteEmptyDirData)
-	force := newCheckField("Force", def.Force)
-	noEvict := newCheckField("Disable Eviction", def.DisableEviction)
+	grace := formNumberField("Grace Period", strconv.Itoa(def.GracePeriod), true)
+	timeout := formTextField("Timeout", def.Timeout.String())
+	ignore := formCheckField("Ignore DaemonSets", def.IgnoreDaemonSets)
+	emptyDir := formCheckField("Delete EmptyDir Data", def.DeleteEmptyDirData)
+	force := formCheckField("Force", def.Force)
+	noEvict := formCheckField("Disable Eviction", def.DisableEviction)
 	fields := []*formField{grace, timeout, ignore, emptyDir, force, noEvict}
-	return openDialog(newFormDialog(actionQuestion("Drain", refs), actionNames(refs), fields, formButton{
+	return openDialog(dialogForm(actionQuestion("Drain", refs), actionNames(refs), fields, formButton{
 		label: "Drain",
 		press: func(*formDialog) (tea.Cmd, string) {
 			g, err := strconv.Atoi(grace.value())

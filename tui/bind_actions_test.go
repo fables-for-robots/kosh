@@ -71,7 +71,7 @@ func TestReadOnlyHasNoActionKeys(t *testing.T) {
 		"nodes":       clusterTable("n1"),
 	}
 	for _, plural := range []string{"pods", "deployments", "nodes"} {
-		sess := newActionSpyOf(kubetest.New(ro))
+		sess := actionSpyOf(kubetest.New(ro))
 		hs := newHarness(t, sess, 100, 30)
 		actionOpen(hs, sess.Session, plural, tables[plural])
 		hs.notFrame("Delete", "Kill", "Scale", "Restart", "Drain", "Cordon", "Edit")
@@ -330,7 +330,7 @@ func TestSetImageDialog(t *testing.T) {
 }
 
 func TestDrainDialog(t *testing.T) {
-	sess := newActionSpySession()
+	sess := actionSpy()
 	hs := newHarness(t, sess, 100, 30)
 	actionOpen(hs, sess.Session, "nodes", clusterTable("n1", "n2"))
 	hs.press("r")

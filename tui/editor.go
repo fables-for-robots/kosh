@@ -50,7 +50,7 @@ func editorOpen(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 		if err != nil {
 			return flashMsg{text: err.Error(), err: true}
 		}
-		v := newEditor(e, ref, text)
+		v := editorNew(e, ref, text)
 		if v == nil {
 			return flashMsg{text: "the YAML of " + ref.String() + " cannot be edited here: it has more lines than " +
 				"the editor holds, or characters it cannot hold", err: true}
@@ -59,11 +59,11 @@ func editorOpen(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 	}
 }
 
-// newEditor returns the editor of ref with its YAML, cleaned line by
+// editorNew returns the editor of ref with its YAML, cleaned line by
 // line, and the cursor at its start. It returns nil when the text area
 // would not hold the text as it is, as when it has more lines than
 // editorMaxLines: what was saved would then not be what was read.
-func newEditor(e env, ref kube.ObjectRef, yaml string) *editorView {
+func editorNew(e env, ref kube.ObjectRef, yaml string) *editorView {
 	lines := strings.Split(yaml, "\n")
 	if len(lines) > editorMaxLines {
 		return nil
@@ -152,10 +152,10 @@ func (v *editorView) input(msg tea.Msg) tea.Cmd {
 func (v *editorView) save() tea.Cmd {
 	text := v.ta.Value()
 	if text == v.was {
-		return tea.Batch(popView(), flash(textNothingChanged))
+		return tea.Batch(popView(), flash(actionTextNothingChanged))
 	}
 	if !actionBegin(v.e.sess) {
-		return flash(textBusy)
+		return flash(actionTextBusy)
 	}
 	v.saving = true
 	sess, ref, id := v.e.sess, v.ref, v.id
@@ -173,7 +173,7 @@ func (v *editorView) leave() tea.Cmd {
 	if !v.modified {
 		return popView()
 	}
-	return openDialog(newConfirmDialog("Discard the changes to "+v.ref.String()+"?", nil, formButton{
+	return openDialog(dialogConfirm("Discard the changes to "+v.ref.String()+"?", nil, formButton{
 		label: "Discard",
 		press: func(*formDialog) (tea.Cmd, string) { return popView(), "" },
 	}))
