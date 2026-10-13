@@ -107,9 +107,7 @@ func acceptAsync(t *testing.T, l *Listener) <-chan acceptResult {
 
 // awaitAccept waits for the result of acceptAsync and fails the test when
 // it is an error or does not come. The connection is closed when the test
-// ends, in a goroutine: its Close waits for the client to close, which
-// the client does in a cleanup that runs after this one, and the
-// listener's Close, which runs last, ends the wait in any case.
+// ends.
 func awaitAccept(t *testing.T, ch <-chan acceptResult) net.Conn {
 	t.Helper()
 	select {
@@ -117,7 +115,7 @@ func awaitAccept(t *testing.T, ch <-chan acceptResult) net.Conn {
 		if r.err != nil {
 			t.Fatalf("accept: %v", r.err)
 		}
-		t.Cleanup(func() { go r.conn.Close() })
+		t.Cleanup(func() { r.conn.Close() })
 		return r.conn
 	case <-time.After(wait):
 		t.Fatal("accept did not return")
@@ -315,42 +313,60 @@ func TestCloseOfAConnClosesTheIrohConnection(t *testing.T) {
 	}
 }
 
-// What was written last reaches the client although Close is called at
-// once, and Close returns as soon as the client has closed.
-func TestCloseWaitsForThePeer(t *testing.T) {
-	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: time.Minute})
+// A server that writes its last bytes and closes at once: Close returns
+// at once, the client still reads the bytes, and a client that never
+// closes finds the connection closed about the grace later.
+func TestCloseOfAConnGivesThePeerAMoment(t *testing.T) {
+	const grace = 200 * time.Millisecond
+	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: grace})
 	c := dial(t, l)
 	s := accept(t, l, c, "hello")
 
+	// The server writes more than the stream's window holds and closes
+	// right after the last Write, while the client is still reading.
 	big := strings.Repeat("kosh", 1<<18)
-	closed := make(chan error, 1)
+	type result struct {
+		start time.Time
+		took  time.Duration
+		err   error
+	}
+	closed := make(chan result, 1)
 	go func() {
 		if _, err := io.WriteString(s, big); err != nil {
-			closed <- err
+			closed <- result{err: err}
 			return
 		}
-		closed <- s.Close()
+		start := time.Now()
+		err := s.Close()
+		closed <- result{start, time.Since(start), err}
 	}()
 	readExactly(t, c, big)
 	readEnds(t, c)
+	var r result
 	select {
-	case err := <-closed:
-		t.Fatalf("Close returned before the client closed: %v", err)
-	default:
+	case r = <-closed:
+	case <-time.After(wait):
+		t.Fatal("the server's Write and Close did not return")
 	}
-	c.Close()
+	if r.err != nil {
+		t.Fatalf("write or close: %v", r.err)
+	}
+	if r.took >= grace/2 {
+		t.Fatalf("Close took %v; it should not wait for the peer", r.took)
+	}
+	start := r.start
 	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatalf("close: %v", err)
+	case <-c.(*conn).qc.Context().Done():
+		if d := time.Since(start); d < grace*3/4 {
+			t.Fatalf("the connection was closed %v after Close, before the grace of %v", d, grace)
 		}
 	case <-time.After(wait):
-		t.Fatal("Close did not return when the client closed")
+		t.Fatal("the client's iroh connection is still open after the grace")
 	}
 }
 
 func TestCloseUnblocksRead(t *testing.T) {
-	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: time.Minute})
+	l, _ := testListener(t, defaultTimeouts)
 	c := dial(t, l)
 	s := accept(t, l, c, "hello")
 
@@ -364,10 +380,7 @@ func TestCloseUnblocksRead(t *testing.T) {
 		t.Fatalf("Read returned before Close: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	// Close waits for the client, here a minute: the Read returns all
-	// the same, at once.
-	closed := make(chan error, 2)
-	go func() { closed <- s.Close() }()
+	s.Close()
 	select {
 	case err := <-done:
 		if err == nil {
@@ -376,15 +389,7 @@ func TestCloseUnblocksRead(t *testing.T) {
 	case <-time.After(wait):
 		t.Fatal("Read did not return after Close")
 	}
-	go func() { closed <- s.Close() }()
-	c.Close()
-	for range 2 {
-		select {
-		case <-closed:
-		case <-time.After(wait):
-			t.Fatal("Close did not return")
-		}
-	}
+	s.Close()
 }
 
 func TestDeadlines(t *testing.T) {
@@ -629,10 +634,13 @@ func TestCloseClosesEverything(t *testing.T) {
 	before := runtime.NumGoroutine()
 	l, _ := testListener(t, defaultTimeouts)
 
-	// One accepted, one that has not written, one whose stream is open
+	// One accepted, one accepted and closed by the server whose client
+	// does not close, one that has not written, one whose stream is open
 	// and that nobody accepted.
 	accepted := dial(t, l)
 	s := accept(t, l, accepted, "hello")
+	lingering := dial(t, l)
+	accept(t, l, lingering, "hello").Close()
 	waiting := dial(t, l)
 	unaccepted := dial(t, l)
 	if _, err := unaccepted.Write([]byte("anyone?")); err != nil {
@@ -644,8 +652,12 @@ func TestCloseClosesEverything(t *testing.T) {
 		return len(l.conns) == 2
 	})
 
+	start := time.Now()
 	if err := l.Close(); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+	if d := time.Since(start); d >= closeLinger/2 {
+		t.Fatalf("Close took %v: it waited for the peer of a closed connection", d)
 	}
 	if _, err := s.Read(make([]byte, 8)); err == nil {
 		t.Error("the accepted connection reads after Close")
@@ -656,8 +668,9 @@ func TestCloseClosesEverything(t *testing.T) {
 	readEnds(t, accepted)
 	readEnds(t, waiting)
 	readEnds(t, unaccepted)
+	readEnds(t, lingering)
 
-	for _, c := range []net.Conn{accepted, waiting, unaccepted} {
+	for _, c := range []net.Conn{accepted, lingering, waiting, unaccepted} {
 		c.Close()
 	}
 	waitFor(t, "the listener's goroutines to end", func() bool {

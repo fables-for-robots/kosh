@@ -109,20 +109,24 @@ func Listen(ctx context.Context, cfg Config) (*Listener, error) {
 	return listen(ctx, cfg, defaultTimeouts)
 }
 
-// closeLinger is how long closing a connection waits for the peer to
-// close it, so that what was written last is not dropped: a few round
-// trips through a relay.
+// closeLinger is how long, after a connection's stream is closed, the
+// peer is given to close the connection first, so that what was written
+// last is not dropped: a few round trips through a relay.
 const closeLinger = 2 * time.Second
 
-// maxWaiting is how many connections may wait for their stream, or for
-// Accept, at once. One more is closed at once.
+// maxWaiting is how many connections may wait at once, and one more is
+// closed at once. A connection counts from when the endpoint accepts it
+// until Accept hands it out, not only until its stream opens: stricter
+// than a bound on the wait for the stream alone, it bounds the queue of
+// connections nobody has accepted yet too.
 const maxWaiting = 64
 
 // timeouts are the times a Listener waits, which tests shorten.
 type timeouts struct {
 	// stream is how long a connection may take to open its stream.
 	stream time.Duration
-	// linger is how long closing a connection waits for the peer.
+	// linger is how long a closed connection's peer is given to close
+	// it first.
 	linger time.Duration
 }
 
@@ -245,6 +249,7 @@ func (l *Listener) awaitStream(qc *iroh.Conn) {
 		remote: Addr{ID: peer},
 		linger: l.tm.linger,
 		stop:   l.ctx.Done(),
+		spawn:  l.spawn,
 	}
 	c.onClose = l.forget
 
@@ -262,6 +267,24 @@ func (l *Listener) awaitStream(qc *iroh.Conn) {
 	case <-l.ctx.Done():
 		c.Close()
 	}
+}
+
+// spawn runs f in a goroutine that Close waits for. Once Close has begun
+// it runs f at once instead, which then finds the listener's context
+// done.
+func (l *Listener) spawn(f func()) {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		f()
+		return
+	}
+	l.wg.Add(1)
+	l.mu.Unlock()
+	go func() {
+		defer l.wg.Done()
+		f()
+	}()
 }
 
 // forget drops c from the connections Close closes.
@@ -302,6 +325,9 @@ func (l *Listener) errClosed() error {
 // Close closes the endpoint and every connection of it.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
+		// The context first: spawn relies on it being done once closed
+		// is set.
+		l.cancel()
 		l.mu.Lock()
 		l.closed = true
 		conns := make([]*conn, 0, len(l.conns))
@@ -310,7 +336,6 @@ func (l *Listener) Close() error {
 		}
 		l.mu.Unlock()
 
-		l.cancel()
 		for _, c := range conns {
 			c.Close()
 		}
