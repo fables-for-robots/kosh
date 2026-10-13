@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -60,22 +58,26 @@ func (s *session) logAction(ctx context.Context, action string, ref ObjectRef, e
 	)
 	all = append(all, attrs...)
 	if err != nil {
+		// Of an error of the API, only its reason and code: the rest may
+		// be a webhook's text, which may quote the object.
+		var api apierrors.APIStatus
+		if errors.As(err, &api) {
+			err = loggableError(action, err)
+		}
 		all = append(all, slog.String("error", err.Error()))
 	}
 	s.c.log.LogAttrs(ctx, slog.LevelInfo, "action", all...)
 }
 
 // loggableError returns what kind of error err is, in words that hold
-// nothing of its text, for an action whose error may quote what the user
-// wrote or a Secret's contents: an edit refusal's reason; or that the
-// API answered, with its reason when it is one of metav1's, its code when
-// it is an HTTP one, and the paths of at most maxLoggedFields fields it
-// names, with every [key] as [*]; or "<action> failed". It returns nil
-// for nil.
+// nothing of its text: an edit refusal's reason; or that the API
+// answered, with its reason when it is one of metav1's and its code when
+// it is an HTTP one; or "<action> failed". It returns nil for nil.
 //
-// An admission webhook's denial reaches kosh with the webhook's own
-// reason and causes, which may quote the object it was given: that is
-// why nothing of them is logged that is not a known word or a path.
+// Nothing else of an API error is logged, not even the paths of the
+// fields it names: an admission webhook's denial reaches kosh with the
+// webhook's own reason and causes, which may quote the object it was
+// given, a Secret or an edit among them. The user sees the whole error.
 func loggableError(action string, err error) error {
 	if err == nil {
 		return nil
@@ -97,36 +99,8 @@ func loggableError(action string, err error) error {
 	if status.Code >= 100 && status.Code <= 599 {
 		text += fmt.Sprintf(" (%d)", status.Code)
 	}
-	var fields []string
-	seen := map[string]bool{}
-	if status.Details != nil {
-		for _, c := range status.Details.Causes {
-			if !fieldPath.MatchString(c.Field) {
-				continue
-			}
-			f := fieldKey.ReplaceAllString(c.Field, "[*]")
-			if !seen[f] && len(fields) < maxLoggedFields {
-				seen[f] = true
-				fields = append(fields, f)
-			}
-		}
-	}
-	if len(fields) > 0 {
-		text += " at " + strings.Join(fields, ", ")
-	}
 	return errors.New(text)
 }
-
-// maxLoggedFields is how many fields of an API error loggableError names.
-const maxLoggedFields = 8
-
-var (
-	// fieldPath is a field path as the API writes one:
-	// spec.containers[0].image, data[password].
-	fieldPath = regexp.MustCompile(`^[A-Za-z0-9_-]+(\[[^\]]*\])*(\.[A-Za-z0-9_-]+(\[[^\]]*\])*)*$`)
-	// fieldKey is an index or a key of a field path.
-	fieldKey = regexp.MustCompile(`\[[^\]]*\]`)
-)
 
 // knownReasons are the reasons of metav1. Any other reason is a
 // webhook's text.

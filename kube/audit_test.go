@@ -277,6 +277,17 @@ func TestFailedActionIsLoggedWithItsError(t *testing.T) {
 		e.dyn.PrependReactor("delete", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, "web", errors.New("no"))
 		})
+		e.typed.PrependReactor("patch", "cronjobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInvalid(schema.GroupKind{Group: "batch", Kind: "CronJob"}, "nightly", field.ErrorList{
+				field.Invalid(field.NewPath("spec", "jobTemplate", "spec", "template", "spec", "containers").Index(0).Child("env").Index(0).Child("value"), auditMarker, "bad"),
+			})
+		})
+		e.typed.PrependReactor("patch", "nodes", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			if a.(k8stesting.PatchAction).GetName() != "n2" {
+				return false, nil, nil
+			}
+			return true, nil, auditWebhookStatus(400, "denied "+auditMarker, metav1.StatusCause{Field: "spec.hunter2", Message: auditMarker})
+		})
 	}
 	tests := []struct {
 		name string
@@ -287,10 +298,16 @@ func TestFailedActionIsLoggedWithItsError(t *testing.T) {
 	}{
 		{"the API refuses", func(t *testing.T, f *actionFixture) error {
 			return f.s.Delete(ctx, f.ref(t, "apps", "deployments", "default", "web"), DeleteOptions{})
-		}, "delete", ""},
+		}, "delete", "the API answered Forbidden (403)"},
 		{"the object is not there", func(t *testing.T, f *actionFixture) error {
 			return f.s.Kill(ctx, f.ref(t, "", "pods", "default", "gone"))
-		}, "kill", ""},
+		}, "kill", "the API answered NotFound (404)"},
+		{"the API finds it invalid", func(t *testing.T, f *actionFixture) error {
+			return f.s.SetSuspended(ctx, f.ref(t, "batch", "cronjobs", "default", "nightly"), true)
+		}, "suspend", "the API answered Invalid (422)"},
+		{"a webhook denies a cordon", func(t *testing.T, f *actionFixture) error {
+			return f.s.Cordon(ctx, f.ref(t, "", "nodes", "", "n2"), true)
+		}, "cordon", "the API answered unknown (400)"},
 		{"the kind", func(t *testing.T, f *actionFixture) error {
 			return f.s.Scale(ctx, f.ref(t, "", "pods", "default", "web-1"), 2)
 		}, "scale", ""},
@@ -309,7 +326,7 @@ func TestFailedActionIsLoggedWithItsError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			objs := append(actionDrainObjects(), actionDeployment("default", "web", "app"), pod("default", "web-1", nil))
+			objs := append(actionDrainObjects(), actionDeployment("default", "web", "app"), pod("default", "web-1", nil), actionCronJob("default", "nightly"), actionNode("n2"))
 			f := actionEnv(t, fullGrant, failing, objs...)
 			err := tt.call(t, f)
 			if err == nil {
@@ -326,6 +343,7 @@ func TestFailedActionIsLoggedWithItsError(t *testing.T) {
 			if got, ok := r.attr("error"); !ok || got != want {
 				t.Errorf("error %q, want %q", got, want)
 			}
+			auditNoMarker(t, f)
 		})
 	}
 }
@@ -385,7 +403,7 @@ func TestUpdateLogHoldsNoYAML(t *testing.T) {
 		{"a map under a top-level null key", nil, plain("~:\n  password: " + auditMarker + "\nkind: Secret\n"), true, "the YAML does not parse"},
 		{"an !!int scalar", nil, plain("spec:\n  replicas: !!int " + auditMarker + "\n"), true, "the YAML does not parse"},
 		{"an anchor's name", nil, plain("spec: *" + auditMarker + "\n"), true, "the YAML does not parse"},
-		{"the API finds it invalid", updateFails(invalid), edited(nil), true, "the API answered Invalid (422) at spec.replicas, metadata.labels"},
+		{"the API finds it invalid", updateFails(invalid), edited(nil), true, "the API answered Invalid (422)"},
 		{"a plain error", updateFails(errors.New("denied: " + auditMarker)), edited(nil), true, "update failed"},
 	}
 	for _, tt := range tests {
@@ -450,10 +468,6 @@ func auditWebhookStatus(code int32, reason string, causes ...metav1.StatusCause)
 }
 
 func TestLoggableError(t *testing.T) {
-	many := make([]*field.Error, 0, 10)
-	for i := 0; i < 10; i++ {
-		many = append(many, field.Invalid(field.NewPath("spec", "containers").Index(i).Child(fmt.Sprintf("f%d", i)), auditMarker, "bad"))
-	}
 	tests := []struct {
 		name string
 		err  error
@@ -462,29 +476,21 @@ func TestLoggableError(t *testing.T) {
 		{"nil", nil, ""},
 		{"a plain error", errors.New(auditMarker), "update failed"},
 		{"an edit refusal", &editRefusal{"the YAML does not parse", auditMarker}, "the YAML does not parse"},
-		{"a validation error", apierrors.NewInvalid(schema.GroupKind{Kind: "Secret"}, "creds", field.ErrorList{
+		{"a validation error: its reason and code, not its fields", apierrors.NewInvalid(schema.GroupKind{Kind: "Secret"}, "creds", field.ErrorList{
 			field.Invalid(field.NewPath("data").Key("password"), auditMarker, "bad"),
 			field.Invalid(field.NewPath("spec", "containers").Index(0).Child("image"), auditMarker, "bad"),
-			field.Invalid(field.NewPath("spec", "containers").Index(1).Child("image"), auditMarker, "bad"),
-			field.Invalid(field.NewPath("metadata", "annotations").Key("example.com/a.b"), auditMarker, "bad"),
-		}), "the API answered Invalid (422) at data[*], spec.containers[*].image, metadata.annotations[*]"},
+		}), "the API answered Invalid (422)"},
 		{"a webhook's reason", auditWebhookStatus(400, "password "+auditMarker+" not allowed"), "the API answered unknown (400)"},
 		{"a webhook's reason that looks like a word", auditWebhookStatus(400, auditMarker), "the API answered unknown (400)"},
 		{"a webhook's fields", auditWebhookStatus(422, "Invalid",
 			metav1.StatusCause{Field: "data[" + auditMarker + "]", Message: auditMarker},
+			metav1.StatusCause{Field: "data." + auditMarker, Message: auditMarker},
 			metav1.StatusCause{Field: "the password is " + auditMarker, Message: "x"},
-			metav1.StatusCause{Field: "data[x].y[" + auditMarker + "][z]", Message: "x"},
-			metav1.StatusCause{Field: "a..b", Message: "x"},
-			metav1.StatusCause{Field: "[" + auditMarker + "]", Message: "x"},
-			metav1.StatusCause{Field: "a[b", Message: "x"},
-		), "the API answered Invalid (422) at data[*], data[*].y[*][*]"},
+		), "the API answered Invalid (422)"},
 		{"a code out of range", auditWebhookStatus(7, "Forbidden"), "the API answered Forbidden"},
 		{"another code out of range", auditWebhookStatus(600, "Forbidden"), "the API answered Forbidden"},
 		{"no reason", auditWebhookStatus(500, ""), "the API answered unknown (500)"},
-		{"at most eight fields", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "p", many),
-			"the API answered Invalid (422) at " +
-				"spec.containers[*].f0, spec.containers[*].f1, spec.containers[*].f2, spec.containers[*].f3, " +
-				"spec.containers[*].f4, spec.containers[*].f5, spec.containers[*].f6, spec.containers[*].f7"},
+		{"an API error inside another", fmt.Errorf("cordon error: %w", apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, auditMarker)), "the API answered NotFound (404)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -507,6 +513,7 @@ func TestWebhookDenialOfASecretIsNotLogged(t *testing.T) {
 	denial := auditWebhookStatus(400, "password "+auditMarker+" not allowed",
 		metav1.StatusCause{Field: "data[" + auditMarker + "]", Message: "the value " + auditMarker + " is weak"},
 		metav1.StatusCause{Field: "password " + auditMarker, Message: auditMarker},
+		metav1.StatusCause{Field: "data." + auditMarker, Message: auditMarker},
 	)
 	secret := &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -530,7 +537,7 @@ func TestWebhookDenialOfASecretIsNotLogged(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), auditMarker) {
 				t.Errorf("the caller's error %v is not the API's", err)
 			}
-			if got, _ := auditOneAction(t, f).attr("error"); got != "the API answered unknown (400) at data[*]" {
+			if got, _ := auditOneAction(t, f).attr("error"); got != "the API answered unknown (400)" {
 				t.Errorf("logged error %q", got)
 			}
 			auditNoMarker(t, f)
