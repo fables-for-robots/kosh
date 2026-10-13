@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -10,6 +11,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
+
+	"github.com/fables-for-robots/kosh/render"
 )
 
 // rediscoverAfter is how long a discovery that Resolve asked for keeps
@@ -20,14 +23,14 @@ const rediscoverAfter = 5 * time.Second
 // subresources and those that cannot be listed, with the GVR of the
 // renderer where the API serves it. A group that fails is logged and
 // left out; any other failure is an error.
-func (c *Cluster) discover(ctx context.Context) ([]Resource, error) {
-	d := discovery.ToDiscoveryInterfaceWithContext(c.disc)
+func discover(ctx context.Context, disc discovery.DiscoveryInterface, renderers func(schema.GroupVersionResource) (render.Renderer, bool), log *slog.Logger) ([]Resource, error) {
+	d := discovery.ToDiscoveryInterfaceWithContext(disc)
 	preferred, err := discovery.ServerPreferredResourcesWithContext(ctx, d)
 	if err != nil {
 		if !discovery.IsGroupDiscoveryFailedError(err) {
 			return nil, fmt.Errorf("reading the API's resources: %w", err)
 		}
-		c.log.Warn("some groups of the API could not be discovered", "err", err)
+		log.Warn("some groups of the API could not be discovered", "err", err)
 	}
 	_, all, err := discovery.ServerGroupsAndResourcesWithContext(ctx, d)
 	if err != nil && !discovery.IsGroupDiscoveryFailedError(err) {
@@ -53,11 +56,11 @@ func (c *Cluster) discover(ctx context.Context) ([]Resource, error) {
 		}
 	}
 
-	var out []Resource
+	out := []Resource{}
 	for _, list := range preferred {
 		gv, err := schema.ParseGroupVersion(list.GroupVersion)
 		if err != nil {
-			c.log.Warn("the API names a group version that does not parse", "groupVersion", list.GroupVersion, "err", err)
+			log.Warn("the API names a group version that does not parse", "groupVersion", list.GroupVersion, "err", err)
 			continue
 		}
 		for _, ar := range list.APIResources {
@@ -67,7 +70,7 @@ func (c *Cluster) discover(ctx context.Context) ([]Resource, error) {
 			r := resourceOf(gv.WithResource(ar.Name), ar)
 			for _, v := range append([]schema.GroupVersion{gv}, served[r.GVR.GroupResource()]...) {
 				gvr := v.WithResource(ar.Name)
-				if _, ok := c.opts.Renderers(gvr); ok {
+				if _, ok := renderers(gvr); ok {
 					r = resourceOf(gvr, apiResources[gvr])
 					r.Typed = true
 					break
@@ -112,7 +115,7 @@ func sortResources(rr []Resource) {
 // refresh discovers the resources again and keeps them. A discovery
 // that fails keeps what was known, and is logged.
 func (c *Cluster) refresh(ctx context.Context) {
-	rr, err := c.discover(ctx)
+	rr, err := discover(ctx, c.disc, c.opts.Renderers, c.log)
 	if err != nil {
 		if ctx.Err() == nil {
 			c.log.Warn("discovery failed; keeping the resources known so far", "err", err)

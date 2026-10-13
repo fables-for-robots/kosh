@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/render"
@@ -152,7 +154,10 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 // or, when path is empty, from the ServiceAccount of the pod kosh runs
 // in.
 func RESTConfig(kubeconfig string) (*rest.Config, error) {
-	panic("not implemented")
+	if kubeconfig == "" {
+		return rest.InClusterConfig()
+	}
+	return clientcmd.BuildConfigFromFlags("", kubeconfig)
 }
 
 // New connects to the cluster cfg names, reads the API server's version
@@ -160,7 +165,36 @@ func RESTConfig(kubeconfig string) (*rest.Config, error) {
 // reading: the caller gives it 10 seconds. The Cluster lives until
 // Close.
 func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) {
-	panic("not implemented")
+	opts = opts.withDefaults()
+	cfg = rest.CopyConfig(cfg)
+	cfg.UserAgent = opts.UserAgent
+	// An interactive tool, not a controller.
+	cfg.QPS = 50
+	cfg.Burst = 100
+
+	typed, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("making the client of the API: %w", err)
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("making the client of the API: %w", err)
+	}
+	disc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("making the client of the API: %w", err)
+	}
+	info, err := disc.ServerVersionWithContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("the API server at %s could not be reached: %w", cfg.Host, err)
+	}
+	resources, err := discover(ctx, disc, opts.Renderers, opts.Log)
+	if err != nil {
+		return nil, err
+	}
+	c := newCluster(cfg, typed, dyn, disc, resources, opts)
+	c.version = info.GitVersion
+	return c, nil
 }
 
 // Session returns the handle of one SSH session. Everything it opens
