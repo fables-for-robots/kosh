@@ -1375,8 +1375,7 @@ func TestShellFullScreen(t *testing.T) {
 
 	before := running(t, "marker", "sleep 100")
 	p.send("sleep 100" + keyEnter)
-	eventually(t, wait, "sleep 100 runs in marker", func() bool { return running(t, "marker", "sleep 100") > before },
-		func() string { return "the screen:\n" + p.scr.String() })
+	started(t, p.scr, "marker", "sleep 100", before)
 	p.send(keyCtrlC)
 	p.shellRun("echo $?", "130")
 	p.backFromShell(w, h)
@@ -1399,17 +1398,34 @@ func viScreen(lines []string, first, file string) bool {
 	return true
 }
 
-// running returns how many processes of the pod's (first) container
-// run command, as ps shows them.
-func running(t *testing.T, pod, command string) int {
+// running returns the PIDs of the processes of the pod's (first)
+// container that run command, as ps shows them.
+func running(t *testing.T, pod, command string) []string {
 	t.Helper()
-	n := 0
-	for _, l := range strings.Split(kubectl(t, "--namespace", "default", "exec", pod, "--", "ps", "-o", "args"), "\n") {
-		if strings.TrimSpace(l) == command {
-			n++
+	var pids []string
+	for _, l := range strings.Split(kubectl(t, "--namespace", "default", "exec", pod, "--", "ps", "-o", "pid,args"), "\n") {
+		if pid, args, ok := strings.Cut(strings.TrimSpace(l), " "); ok && strings.TrimSpace(args) == command {
+			pids = append(pids, pid)
 		}
 	}
-	return n
+	return pids
+}
+
+// started waits until command runs in the pod's container in a process
+// that was not among before, and returns its PID.
+func started(t *testing.T, scr *screen, pod, command string, before []string) string {
+	t.Helper()
+	pid := ""
+	eventually(t, wait, command+" runs in "+pod, func() bool {
+		for _, p := range running(t, pod, command) {
+			if !slices.Contains(before, p) {
+				pid = p
+				return true
+			}
+		}
+		return false
+	}, func() string { return "the screen:\n" + scr.String() })
+	return pid
 }
 
 // A command of the user's: its words reach the container as the field
@@ -1458,6 +1474,11 @@ func TestShellCommandThatIsNotThere(t *testing.T) {
 	c.fills(120, 40)
 	c.waitRow("marker", "Running")
 	c.waitFor("Pods(default)")
+	// The screen is alive after a hand-over that returned at once: it
+	// follows the terminal's size.
+	c.resize(100, 30)
+	c.fills(100, 30)
+	c.waitRow("marker", "Running")
 }
 
 // kosh's own image has no shell at all: the default command's reason, in
@@ -1489,6 +1510,11 @@ func TestShellPodWithoutAShell(t *testing.T) {
 	c.send(keyEsc)
 	c.waitUntil(wait, "the dialog gone", func(lines []string) bool { return dialogLines(lines) == nil })
 	c.fills(120, 40)
+	c.waitRow(pod, "Running")
+	// The screen is alive after a hand-over that returned at once: it
+	// follows the terminal's size.
+	c.resize(100, 30)
+	c.fills(100, 30)
 	c.waitRow(pod, "Running")
 }
 
@@ -1723,6 +1749,15 @@ func TestShellSurvivesNothing(t *testing.T) {
 	c := connect(t, k, 120, 40)
 	c.waitRow("marker", "Running")
 	c.fills(120, 40)
+
+	// A record, not a requirement: how often a screen that the UI
+	// library left dead after a command had to be repaired, in kosh's
+	// log of every shell so far.
+	repaired := logLines(t, "the program's screen was repaired after a command")
+	t.Logf("kosh's log has %d lines of a screen repaired after a command", len(repaired))
+	for _, l := range repaired {
+		t.Log(l)
+	}
 }
 
 // setKeys installs the chart again with the key list of lines, keeping
@@ -1922,13 +1957,15 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	eventually(t, 150*time.Second, "the key of the test is accepted", func() bool { return accepted(t, k) },
 		func() string { return "it is not" })
 
+	// A session of another key, which the removal leaves alone.
+	f := connect(t, full, 120, 40)
+	f.waitFor("Pods(default)", full.name)
 	p := sshPTY(t, k, 120, 40)
 	p.openShell()
 	const orphan = "sleep 300"
 	before := running(t, "marker", orphan)
 	p.send(orphan + keyEnter)
-	eventually(t, wait, orphan+" runs in marker", func() bool { return running(t, "marker", orphan) > before },
-		func() string { return "the screen:\n" + p.scr.String() })
+	pid := started(t, p.scr, "marker", orphan, before)
 	end := []string{"key", k.name, "action", "exec", "object", "pods/default/marker", "phase", "end"}
 	shells := len(logLines(t, "action", end...))
 
@@ -1950,7 +1987,14 @@ func TestShellEndsWithItsKey(t *testing.T) {
 		t.Errorf("the shell's end line does not say ended=%q: %s", "the session ended", shell)
 	}
 	// A record of the limit the spec states, not a requirement.
-	t.Logf("%s in marker after its session ended: %d before it was typed, %d now", orphan, before, running(t, "marker", orphan))
+	t.Logf("%s, PID %s in marker, after its session ended: still running %v", orphan, pid, slices.Contains(running(t, "marker", orphan), pid))
+
+	if !f.alive() {
+		t.Fatalf("the full key's session ended too, with %v; the screen:\n%s", <-f.waited, f.scr)
+	}
+	f.send(":ns" + keyEnter)
+	f.waitFor("Namespaces(all)")
+	f.waitRow("kosh")
 }
 
 // The last test: it restarts kosh. A stop tells every session first,
