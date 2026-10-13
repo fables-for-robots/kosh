@@ -22,6 +22,9 @@ func (s *session) Cordon(ctx context.Context, node ObjectRef, on bool) (err erro
 		return err
 	}
 	defer func() { s.logAction(ctx, action, node, err) }()
+	if err := s.c.checkRef(node); err != nil {
+		return err
+	}
 	if err := kindIs(action, node, nodeKinds...); err != nil {
 		return err
 	}
@@ -53,6 +56,9 @@ func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) 
 			slog.String("output", out.String()),
 		)
 	}()
+	if err := s.c.checkRef(node); err != nil {
+		return err
+	}
 	if err := kindIs(actDrain, node, nodeKinds...); err != nil {
 		return err
 	}

@@ -94,6 +94,9 @@ func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 		s.logAction(ctx, actDelete, ref, logged,
 			slog.String("propagation", string(opts.propagation())), slog.Bool("force", opts.Force))
 	}()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	return s.delete(ctx, ref, opts)
 }
 
@@ -113,6 +116,9 @@ func (s *session) Kill(ctx context.Context, pod ObjectRef) (err error) {
 		return err
 	}
 	defer func() { s.logAction(ctx, actKill, pod, err) }()
+	if err := s.c.checkRef(pod); err != nil {
+		return err
+	}
 	if err := kindIs("kill", pod, podKinds...); err != nil {
 		return err
 	}
@@ -125,6 +131,9 @@ func (s *session) Update(ctx context.Context, ref ObjectRef, text string) (err e
 	}
 	// The log gets what kind of error it was: its text may quote the edit.
 	defer func() { s.logAction(ctx, actUpdate, ref, loggableError(actUpdate, err)) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	obj, err := parseObject(ref, text)
 	if err != nil {
 		return err
@@ -239,6 +248,9 @@ func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) (err
 		return err
 	}
 	defer func() { s.logAction(ctx, actScale, ref, err, slog.Int("replicas", int(replicas))) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	if err := kindIs("scale", ref, scaleKinds...); err != nil {
 		return err
 	}
@@ -273,6 +285,9 @@ func (s *session) Restart(ctx context.Context, ref ObjectRef) (err error) {
 		return err
 	}
 	defer func() { s.logAction(ctx, actRestart, ref, err) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	if err := kindIs("restart", ref, workloadKinds...); err != nil {
 		return err
 	}
@@ -305,6 +320,9 @@ func (s *session) SetImages(ctx context.Context, ref ObjectRef, images map[strin
 		return err
 	}
 	defer func() { s.logAction(ctx, actSetImages, ref, err, slog.Any("images", imagePairs(images))) }()
+	if err := s.c.checkRef(ref); err != nil {
+		return err
+	}
 	if err := kindIs("set the images of", ref, workloadKinds...); err != nil {
 		return err
 	}
@@ -361,6 +379,9 @@ func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error
 		return err
 	}
 	defer func() { s.logAction(ctx, actRollback, replicaSet, err) }()
+	if err := s.c.checkRef(replicaSet); err != nil {
+		return err
+	}
 	if err := kindIs("roll back to", replicaSet, rsKinds...); err != nil {
 		return err
 	}
@@ -417,6 +438,9 @@ func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (job string, e
 		return "", err
 	}
 	defer func() { s.logAction(ctx, actTrigger, cronJob, err, slog.String("job", job)) }()
+	if err := s.c.checkRef(cronJob); err != nil {
+		return "", err
+	}
 	if err := kindIs("trigger", cronJob, cronJobKinds...); err != nil {
 		return "", err
 	}
@@ -477,6 +501,9 @@ func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended
 		return err
 	}
 	defer func() { s.logAction(ctx, action, cronJob, err) }()
+	if err := s.c.checkRef(cronJob); err != nil {
+		return err
+	}
 	if err := kindIs(action, cronJob, cronJobKinds...); err != nil {
 		return err
 	}

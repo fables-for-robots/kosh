@@ -887,3 +887,79 @@ func TestWrongKindIsRefusedBeforeAnythingIsSent(t *testing.T) {
 		t.Errorf("sent %v", a)
 	}
 }
+
+func TestBadReferenceIsRefusedBeforeAnythingIsSent(t *testing.T) {
+	ctx := context.Background()
+	type call func(s *session, ref ObjectRef) error
+	methods := []struct {
+		name       string
+		group, res string // a resource the method is for
+		namespace  string
+		call       call
+	}{
+		{"Delete", "", "secrets", "default", func(s *session, r ObjectRef) error { return s.Delete(ctx, r, DeleteOptions{}) }},
+		{"Kill", "", "pods", "default", func(s *session, r ObjectRef) error { return s.Kill(ctx, r) }},
+		{"Update", "", "secrets", "default", func(s *session, r ObjectRef) error {
+			return s.Update(ctx, r, "apiVersion: v1\nkind: Secret\nmetadata: {name: secrets, namespace: default, resourceVersion: '1'}\n")
+		}},
+		{"Scale", "apps", "deployments", "default", func(s *session, r ObjectRef) error { return s.Scale(ctx, r, 2) }},
+		{"Restart", "apps", "deployments", "default", func(s *session, r ObjectRef) error { return s.Restart(ctx, r) }},
+		{"SetImages", "apps", "deployments", "default", func(s *session, r ObjectRef) error {
+			return s.SetImages(ctx, r, map[string]string{"app": "app:2"})
+		}},
+		{"SetImages with no images", "apps", "deployments", "default", func(s *session, r ObjectRef) error {
+			return s.SetImages(ctx, r, nil)
+		}},
+		{"Rollback", "apps", "replicasets", "default", func(s *session, r ObjectRef) error { return s.Rollback(ctx, r) }},
+		{"Trigger", "batch", "cronjobs", "default", func(s *session, r ObjectRef) error { _, err := s.Trigger(ctx, r); return err }},
+		{"SetSuspended", "batch", "cronjobs", "default", func(s *session, r ObjectRef) error { return s.SetSuspended(ctx, r, true) }},
+		{"Cordon", "", "nodes", "", func(s *session, r ObjectRef) error { return s.Cordon(ctx, r, true) }},
+		{"Drain", "", "nodes", "", func(s *session, r ObjectRef) error { return s.Drain(ctx, r, DefaultDrainOptions()) }},
+	}
+	refs := []struct {
+		name string
+		ref  func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef
+	}{
+		{"the resource string .", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.GVR.Resource = "."
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "secrets"}
+		}},
+		{"a GVR discovery does not have", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.GVR.Version = "v9"
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "web"}
+		}},
+		{"a discovered GVR with another kind", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.Kind = "Secret"
+			if res == "secrets" {
+				r.Kind = "ConfigMap"
+			}
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "web"}
+		}},
+		{"a discovered GVR with another scope", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.Namespaced = !r.Namespaced
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "web"}
+		}},
+	}
+	for _, m := range methods {
+		for _, rr := range refs {
+			t.Run(m.name+"/"+rr.name, func(t *testing.T) {
+				f := actionEnv(t, fullGrant, nil)
+				ref := rr.ref(t, f, m.group, m.res, m.namespace)
+				err := m.call(f.s, ref)
+				if !errors.Is(err, ErrUnknownResource) {
+					t.Errorf("%v, want ErrUnknownResource", err)
+				}
+				if a := f.sent(); len(a) != 0 {
+					t.Errorf("sent %v", a)
+				}
+				if got, _ := auditOneAction(t, f).attr("error"); got != "no such resource" {
+					t.Errorf("logged error %q", got)
+				}
+			})
+		}
+	}
+}

@@ -59,9 +59,10 @@ func (s *session) logAction(ctx context.Context, action string, ref ObjectRef, e
 	all = append(all, attrs...)
 	if err != nil {
 		// Of an error of the API, only its reason and code: the rest may
-		// be a webhook's text, which may quote the object.
+		// be a webhook's text, which may quote the object. Of a refused
+		// reference, only that it was: ref is the object attribute.
 		var api apierrors.APIStatus
-		if errors.As(err, &api) {
+		if errors.Is(err, ErrUnknownResource) || errors.As(err, &api) {
 			err = loggableError(action, err)
 		}
 		all = append(all, slog.String("error", err.Error()))
@@ -81,6 +82,9 @@ func (s *session) logAction(ctx context.Context, action string, ref ObjectRef, e
 func loggableError(action string, err error) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, ErrUnknownResource) {
+		return ErrUnknownResource
 	}
 	var refusal *editRefusal
 	if errors.As(err, &refusal) {
