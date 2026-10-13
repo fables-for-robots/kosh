@@ -185,7 +185,7 @@ func TestListenLocal(t *testing.T) {
 	key := newKey(t)
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
-	l, err := Listen(ctx, Config{Key: key, Local: true})
+	l, err := Listen(ctx, Config{Key: key, Local: true, Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
