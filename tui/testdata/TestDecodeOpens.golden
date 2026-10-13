@@ -1,0 +1,30 @@
+Key:     alice@laptop   <c> Copy                <shift-n> Prev Match
+Cluster: v1.33.1        <f> Toggle FullScreen
+kosh:    v0.1.0         <w> Toggle Wrap
+                        </> Search
+                        <n> Next Match
+
+┌───────────────────────────────── Decode(secrets/default/creds) ──────────────────────────────────┐
+│password: hunter2                                                                                 │
+│tls.crt:                                                                                          │
+│  -----BEGIN CERTIFICATE-----                                                                     │
+│  MIIBszCCAVmgAwIBAgIU                                                                            │
+│  -----END CERTIFICATE-----                                                                       │
+│user: admin                                                                                       │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<secrets> <decode>
+
