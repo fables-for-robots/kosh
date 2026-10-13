@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -67,7 +68,18 @@ type textView struct {
 	autoGen  int
 	autoStop chan struct{}
 	closed   bool
+
+	// search is the text of the / prompt, re what it searches for, and
+	// matches where it is found, in the order of the text. at is the
+	// match the view is at, -1 before it is at one.
+	search  string
+	re      *regexp.Regexp
+	matches []textMatch
+	at      int
 }
+
+// textMatch is a match of a search: bytes [from, to) of a line.
+type textMatch struct{ line, from, to int }
 
 // textRow is the cells [from, to) of a line; to is -1 for the rest of
 // it.
@@ -93,7 +105,7 @@ type textTickMsg struct {
 
 // textNew returns a text view of ref that shows text, which it cleans.
 func textNew(e env, kind textKind, ref kube.ObjectRef, text string) *textView {
-	v := &textView{id: newID(), e: e, kind: kind, ref: ref, every: textAutoEvery}
+	v := &textView{id: newID(), e: e, kind: kind, ref: ref, every: textAutoEvery, at: -1}
 	v.setLines(textLines(text))
 	return v
 }
@@ -119,6 +131,7 @@ func (v *textView) setLines(lines []string) {
 		v.width = max(v.width, ansi.StringWidth(l))
 	}
 	v.rowsOK = false
+	v.find()
 	v.clamp()
 }
 
@@ -188,6 +201,10 @@ func (v *textView) key(k tea.KeyPressMsg) tea.Cmd {
 		v.full = !v.full
 	case "c":
 		return v.copy()
+	case "n":
+		v.next(1)
+	case "N", "shift+n":
+		v.next(-1)
 	case "r":
 		if v.kind == textYAML {
 			return v.toggleAuto()
@@ -197,10 +214,106 @@ func (v *textView) key(k tea.KeyPressMsg) tea.Cmd {
 			v.managed = !v.managed
 			return v.load(false)
 		}
-	case "esc", "q":
+	case "esc":
+		if v.search != "" {
+			return v.SetFilter("")
+		}
+		return popView()
+	case "q":
 		return popView()
 	}
 	return nil
+}
+
+// SetFilter searches the content for text: a regular expression without
+// regard to case, or the text as it stands when it is no regular
+// expression. The view goes to the first match at or after the line at
+// its top, or around the end to the first one. The empty text clears
+// the search.
+func (v *textView) SetFilter(text string) tea.Cmd {
+	v.search = text
+	v.re = nil
+	if text != "" {
+		re, err := regexp.Compile("(?i)" + text)
+		if err != nil {
+			re = regexp.MustCompile("(?i)" + regexp.QuoteMeta(text))
+		}
+		v.re = re
+	}
+	v.find()
+	if len(v.matches) == 0 {
+		return nil
+	}
+	line := 0
+	if rows := v.layout(); v.top < len(rows) {
+		line = rows[v.top].line
+	}
+	v.goTo(0)
+	for i, m := range v.matches {
+		if m.line >= line {
+			v.goTo(i)
+			break
+		}
+	}
+	return nil
+}
+
+// find finds the matches of the search in the content. The view stays
+// where it is, at the match of the same number when there still is one.
+func (v *textView) find() {
+	v.matches = nil
+	if v.re == nil {
+		v.at = -1
+		return
+	}
+	for i, l := range v.lines {
+		for _, m := range v.re.FindAllStringIndex(l, -1) {
+			if m[1] > m[0] {
+				v.matches = append(v.matches, textMatch{i, m[0], m[1]})
+			}
+		}
+	}
+	if v.at >= len(v.matches) {
+		v.at = len(v.matches) - 1
+	}
+}
+
+// next goes to the match by of the one the view is at, around the ends.
+func (v *textView) next(by int) {
+	n := len(v.matches)
+	if n == 0 {
+		return
+	}
+	at := v.at
+	if at < 0 && by < 0 {
+		at = 0
+	}
+	v.goTo(((at+by)%n + n) % n)
+}
+
+// goTo makes match i the one the view is at, and puts it at the top:
+// the row it starts in, and when the lines are not wrapped, sideways to
+// where it is seen whole.
+func (v *textView) goTo(i int) {
+	v.at = i
+	m := v.matches[i]
+	l := v.lines[m.line]
+	from := ansi.StringWidth(l[:m.from])
+	to := ansi.StringWidth(l[:m.to])
+	for j, r := range v.layout() {
+		if r.line == m.line && (r.to < 0 || from < r.to || j == len(v.rows)-1 || v.rows[j+1].line != m.line) {
+			v.top = j
+			break
+		}
+	}
+	// The last cell of a line cut at the right is its "…".
+	if !v.wrap && v.w > 0 && (from < v.left || to > v.left+v.w-1) {
+		v.left = max(to-(v.w-1), 0)
+		if from < v.left {
+			v.left = from
+		}
+	}
+	v.clamp()
 }
 
 // page is how many rows a page is: the height last drawn, or 10 before.
@@ -265,15 +378,25 @@ func (v *textView) layout() []textRow {
 // toggleWrap wraps the lines or stops wrapping them, and keeps the line
 // at the top.
 func (v *textView) toggleWrap() {
-	line := -1
+	v.relayout(func() {
+		v.wrap = !v.wrap
+		v.left = 0
+	})
+}
+
+// relayout makes the change, which changes the rows, and keeps the
+// position: the row with the cell of the line that was at the top.
+func (v *textView) relayout(change func()) {
+	line, cell := -1, 0
 	if rows := v.layout(); v.top < len(rows) {
-		line = rows[v.top].line
+		line, cell = rows[v.top].line, rows[v.top].from
 	}
-	v.wrap = !v.wrap
-	v.left = 0
+	change()
+	v.rowsOK = false
 	v.top = 0
-	for i, r := range v.layout() {
-		if r.line == line {
+	rows := v.layout()
+	for i, r := range rows {
+		if r.line == line && (r.to < 0 || cell < r.to || i == len(rows)-1 || rows[i+1].line != line) {
 			v.top = i
 			break
 		}
@@ -392,9 +515,9 @@ func (v *textView) View(w, h int) string {
 		return ""
 	}
 	if w != v.w {
-		v.rowsOK = false
+		v.relayout(func() { v.w = w })
 	}
-	v.w, v.h = w, h
+	v.h = h
 	v.clamp()
 	rows := v.layout()
 	out := make([]string, 0, h)
@@ -416,19 +539,55 @@ func (v *textView) drawRow(r textRow, w int) string {
 	return fit(line, w)
 }
 
-// paint styles line i: YAML in its colours.
+// paint styles line i: YAML in its colours, and the matches of the
+// search over them.
 func (v *textView) paint(i int) string {
 	l := v.lines[i]
+	spans := []yamlSpan{{0, len(l), yamlPlain}}
 	if v.kind == textYAML {
-		return yamlColor(l)
+		spans = yamlSpans(l)
 	}
-	return l
+	if v.re != nil {
+		spans = textOverlay(spans, v.re.FindAllStringIndex(l, -1))
+	}
+	return yamlPaint(l, spans)
 }
 
-// Title is "Describe(pods/default/web-1)", with " (auto)" while the
+// textOverlay cuts spans where the matches begin and end, and makes the
+// matched pieces matches.
+func textOverlay(spans []yamlSpan, matches [][]int) []yamlSpan {
+	if len(matches) == 0 {
+		return spans
+	}
+	var out []yamlSpan
+	for _, s := range spans {
+		at := s.from
+		for _, m := range matches {
+			from, to := max(m[0], at), min(m[1], s.to)
+			if from >= to {
+				continue
+			}
+			if from > at {
+				out = append(out, yamlSpan{at, from, s.part})
+			}
+			out = append(out, yamlSpan{from, to, yamlMatch})
+			at = to
+		}
+		if at < s.to {
+			out = append(out, yamlSpan{at, s.to, s.part})
+		}
+	}
+	return out
+}
+
+// Title is "Describe(pods/default/web-1)", with the search and where
+// the view is in its matches, " </err> 3/17", and " (auto)" while the
 // YAML reads itself again.
 func (v *textView) Title() string {
 	t := map[textKind]string{textDescribe: "Describe", textYAML: "YAML", textDecode: "Decode"}[v.kind] + "(" + v.ref.String() + ")"
+	if v.search != "" {
+		t += fmt.Sprintf(" </%s> %d/%d", v.search, v.at+1, len(v.matches))
+	}
 	if v.auto {
 		t += " (auto)"
 	}
@@ -446,6 +605,9 @@ func (v *textView) Hints() []hint {
 		{"c", "Copy"},
 		{"f", "Toggle FullScreen"},
 		{"w", "Toggle Wrap"},
+		{"/", "Search"},
+		{"n", "Next Match"},
+		{"shift-n", "Prev Match"},
 	}
 	if v.kind == textYAML {
 		hs = append(hs, hint{"r", "Toggle Auto-Refresh"}, hint{"m", "Toggle ManagedFields"})

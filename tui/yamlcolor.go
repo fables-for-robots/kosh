@@ -13,12 +13,16 @@ const (
 	yamlPlain yamlPart = iota
 	yamlKey
 	yamlComment
+	// yamlMatch is a match of a search, which a text view draws over
+	// the other parts.
+	yamlMatch
 )
 
 // yamlStyles are the styles of the parts that are not plain.
 var yamlStyles = map[yamlPart]lipgloss.Style{
 	yamlKey:     styleKey,
 	yamlComment: styleDim,
+	yamlMatch:   styleMatch,
 }
 
 // yamlSpan is the part of a line from byte from to byte to.

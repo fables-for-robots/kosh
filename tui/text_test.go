@@ -25,6 +25,7 @@ func textOpenWith(t *testing.T, kind textKind, text string) (*harness, *textView
 	hs := newHarness(t, sess, 100, 30)
 	v := textNew(hs.root().e, kind, textPod, text)
 	hs.send(pushViewMsg{v})
+	hs.drawn() // as the program draws it before the next key
 	return hs, v
 }
 
@@ -220,7 +221,13 @@ func TestSidewaysAndWrap(t *testing.T) {
 		t.Errorf("unwrapped again, the first line is %q", got)
 	}
 	check("unwrapped")
-	// A narrow window.
+	// A narrow window keeps the wrapped position: the row of the cell
+	// that was at the top.
+	hs.press("w", "down", "down")
+	hs.send(tea.WindowSizeMsg{Width: 80, Height: 30})
+	if got := textFirst(hs); got != long[156:234] {
+		t.Errorf("after the window narrowed the first line is %q", got)
+	}
 	hs.send(tea.WindowSizeMsg{Width: 80, Height: 12})
 	hs.press("w")
 	hs.drawn()
@@ -277,5 +284,141 @@ func TestCopy(t *testing.T) {
 	hs.press("c")
 	if l := hs.lines()[29]; !strings.Contains(l, "copied 3 lines") {
 		t.Errorf("the flash says %q", l)
+	}
+}
+
+func TestSearch(t *testing.T) {
+	lines := strings.Split(textNumbered(80), "\n")
+	lines[5] = "error one"
+	lines[30] = "an Error, and nothing else"
+	lines[50] = "stderr"
+	lines[60] = "a [ bracket"
+	hs, _ := textOpenWith(t, textDescribe, strings.Join(lines, "\n"))
+	base := "Describe(pods/default/web-1)"
+	hs.press("/")
+	hs.typeText("err")
+	hs.press("enter")
+	if got := hs.title(); got != base+" </err> 1/3" {
+		t.Errorf("after /err the title is %q", got)
+	}
+	if got := textFirst(hs); got != "error one" {
+		t.Errorf("after /err the first line is %q", got)
+	}
+	if l := hs.drawnLine("error one"); !strings.Contains(l, styleMatch.Render("err")) {
+		t.Errorf("the match is not drawn in its style: %q", l)
+	}
+	if l := hs.drawnLine("line 006"); strings.Contains(l, sgr(styleMatch)) {
+		t.Errorf("a line without a match is drawn with one: %q", l)
+	}
+	for _, step := range []struct {
+		key, title, first string
+	}{
+		{"n", "2/3", "an Error, and nothing else"},
+		{"n", "3/3", "stderr"},
+		{"n", "1/3", "error one"},
+		{"N", "3/3", "stderr"},
+		{"shift+n", "2/3", "an Error, and nothing else"},
+		{"N", "1/3", "error one"},
+	} {
+		hs.press(step.key)
+		if got := hs.title(); got != base+" </err> "+step.title {
+			t.Errorf("after %s the title is %q, want %s", step.key, got, step.title)
+		}
+		if got := textFirst(hs); got != step.first {
+			t.Errorf("after %s the first line is %q, want %q", step.key, got, step.first)
+		}
+	}
+	hs.press("n")
+	if l := hs.drawnLine("an Error"); !strings.Contains(l, styleMatch.Render("Err")) {
+		t.Errorf("the match without regard to case is not drawn in its style: %q", l)
+	}
+
+	// The search starts at the top line.
+	hs.press("g", "/")
+	hs.typeText("line 04")
+	hs.press("enter")
+	if got, first := hs.title(), textFirst(hs); got != base+" </line 04> 1/10" || first != "line 040" {
+		t.Errorf("after /line 04 from the top the title is %q and the first line %q", got, first)
+	}
+	hs.press("/")
+	hs.typeText("line 0")
+	hs.press("enter")
+	if got, first := hs.title(), textFirst(hs); got != base+" </line 0> 39/76" || first != "line 040" {
+		t.Errorf("after /line 0 from line 40 the title is %q and the first line %q", got, first)
+	}
+
+	// No regular expression: the text as it stands.
+	hs.press("/")
+	hs.typeText("[")
+	hs.press("enter")
+	if got := hs.title(); got != base+" </[> 1/1" {
+		t.Errorf("after /[ the title is %q", got)
+	}
+	if got := textFirst(hs); got != "a [ bracket" {
+		t.Errorf("after /[ the first line is %q", got)
+	}
+	hs.press("/")
+	hs.typeText("nothing like it")
+	hs.press("enter")
+	if got := hs.title(); got != base+" </nothing like it> 0/0" {
+		t.Errorf("without a match the title is %q", got)
+	}
+	hs.press("n", "N")
+
+	// The empty text clears the search.
+	hs.press("/")
+	hs.typeText("err")
+	hs.press("backspace", "backspace", "backspace")
+	if got := hs.title(); got != base {
+		t.Errorf("after the text is taken back the title is %q", got)
+	}
+	if strings.Contains(hs.drawn(), sgr(styleMatch)) {
+		t.Error("a match is drawn after the search was cleared")
+	}
+	hs.press("esc")
+	hs.press("/")
+	hs.typeText("err")
+	hs.press("esc")
+	if got := hs.title(); got != base {
+		t.Errorf("after esc in the prompt the title is %q", got)
+	}
+
+	// esc clears the search first and pops the view second.
+	hs.press("/")
+	hs.typeText("err")
+	hs.press("enter", "esc")
+	if got := hs.title(); got != base || len(hs.root().stack) != 2 {
+		t.Errorf("after esc the title is %q and the stack %d views", got, len(hs.root().stack))
+	}
+	hs.press("esc")
+	if len(hs.root().stack) != 1 {
+		t.Errorf("after esc again the stack has %d views", len(hs.root().stack))
+	}
+}
+
+func TestSearchInAWrappedYAML(t *testing.T) {
+	long := "message: " + strings.Repeat("x", 150) + "needle" + strings.Repeat("y", 50)
+	hs, _ := textOpenWith(t, textYAML, "kind: Pod\n"+textNumbered(40)+"\n"+long+"\n"+textNumbered(40))
+	hs.press("w", "/")
+	hs.typeText("NEEDLE")
+	hs.press("enter")
+	first := textFirst(hs)
+	if !strings.Contains(first, "needle") {
+		t.Errorf("the wrapped row of the match is not at the top: %q", first)
+	}
+	if l := hs.drawnLine("needle"); !strings.Contains(l, styleMatch.Render("needle")) {
+		t.Errorf("the match in a wrapped line is not drawn in its style: %q", l)
+	}
+	// Unwrapped, the view goes sideways to the match.
+	hs.press("w", "n")
+	if l := hs.drawnLine("needle"); !strings.Contains(l, styleMatch.Render("needle")) {
+		t.Errorf("the match far in a line is not shown: %q", l)
+	}
+	// The key keeps its colour under the search.
+	hs.press("/")
+	hs.typeText("ind")
+	hs.press("enter", "g")
+	if l := hs.drawnLine("kind: Pod"); !strings.Contains(l, styleKey.Render("k")+styleMatch.Render("ind")) {
+		t.Errorf("a match in a key is drawn %q", l)
 	}
 }
