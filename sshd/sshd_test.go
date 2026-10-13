@@ -64,6 +64,10 @@ func TestAcceptedKeyGetsTheProgram(t *testing.T) {
 		t.Errorf("exit status %d after q, want 0", st)
 	}
 	eventually(t, "Sessions() to be 0 after the program ended", func() bool { return h.srv.Sessions() == 0 })
+	// The program ended by itself: the end has no reason.
+	if rec := h.log.waitFor(t, "of the end of the session", func(r logRecord) bool { return r.Msg == "session end" }); rec.Attrs["reason"] != "" {
+		t.Errorf("a session that ended by itself is logged with a reason: %v", rec)
+	}
 }
 
 func TestRejectedKey(t *testing.T) {

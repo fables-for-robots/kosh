@@ -624,8 +624,10 @@ ClusterRole; kosh then shows the API's refusal wherever it lacks a right
   the siblings.
 - **Flake** as great-machine's: nixpkgs `nixos-26.05`, the program built
   by `draganm/gonixgo` without cgo, a development shell with Go, Helm,
-  kind, kubectl, and the kube-apiserver and etcd that the tests of §19
-  start. `.envrc` with `use flake`.
+  kind and kubectl. The kube-apiserver and etcd that the tests of §19
+  start are not in the shell: `scripts/envtest-assets.sh` fetches them
+  on first use, the same ones on Linux and on a Mac, where nixpkgs has
+  no kube-apiserver. `.envrc` with `use flake`.
 - **Image** `ghcr.io/fables-for-robots/kosh`, built by Nix: the program,
   the CA certificates (the relays and number0's DNS are reached over
   HTTPS), and a `passwd` with the user it runs as. No shell and no other

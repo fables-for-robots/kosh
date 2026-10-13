@@ -283,6 +283,10 @@ func TestClosingTheChannelEndsTheSession(t *testing.T) {
 	closedAt := time.Now()
 	contextEnds(t, s, "after the client closed the session channel")
 	eventually(t, "Sessions() to be 0 after the channel was closed", func() bool { return h.srv.Sessions() == 0 })
+	rec := h.log.waitFor(t, "of the end of the session", func(r logRecord) bool { return r.Msg == "session end" })
+	if rec.Attrs["reason"] != reasonChannelClosed {
+		t.Errorf("the end of a session whose channel the client closed is logged as %v", rec)
+	}
 	if d := closedByTheServer(t, cl, "a connection whose session channel was closed").Sub(closedAt); d < idle/2 {
 		t.Errorf("the connection was closed %v after its session channel, want about %v", d, idle)
 	}
@@ -357,15 +361,20 @@ func (c *pausedConn) Read(p []byte) (int, error) {
 
 func (c *pausedConn) pause() {
 	c.mu.Lock()
-	c.gate = make(chan struct{})
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.gate == nil {
+		c.gate = make(chan struct{})
+	}
 }
 
+// resume lets what was held through; it may be called when not paused.
 func (c *pausedConn) resume() {
 	c.mu.Lock()
-	close(c.gate)
-	c.gate = nil
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.gate != nil {
+		close(c.gate)
+		c.gate = nil
+	}
 }
 
 // After the handler has returned, the session channel stays open until
@@ -374,6 +383,7 @@ func TestWindowChangeAfterTheSession(t *testing.T) {
 	h := newHarness(t)
 	key := h.key("alice", false)
 	pc := &pausedConn{Conn: h.dialRaw()}
+	t.Cleanup(pc.resume)
 	cl, err := connect(pc, h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
 	if err != nil {
 		t.Fatal(err)
@@ -387,19 +397,44 @@ func TestWindowChangeAfterTheSession(t *testing.T) {
 	if err := sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Start("ls"); err != nil {
-		t.Fatal(err)
-	}
-	// The client reads nothing more: it does not answer the close.
+
+	// The client reads nothing from now on: it sees neither the answer
+	// to exec nor the server's close, and does not answer the close.
 	pc.pause()
+	started := make(chan error, 1)
+	go func() { started <- sess.Start("ls") }()
 	h.log.waitFor(t, "of the refused command", func(r logRecord) bool { return r.Msg == "session refused" })
 	for i := range 3 {
 		windowChange(t, sess, 100+uint32(i), 30)
 	}
+	// The server has taken all three, after the handler returned and
+	// before the channel closed.
+	eventually(t, "the server to take the window changes", func() bool { return h.windowWidths()[102] })
 	pc.resume()
+	if err := <-started; err != nil {
+		t.Fatalf("exec: %v", err)
+	}
 	if st := exitStatus(t, sess.Wait()); st != 1 {
 		t.Errorf("exit status %d, want 1", st)
 	}
+}
+
+// windowWidths returns the widths of the windows of the server's open
+// session channels.
+func (h *harness) windowWidths() map[int]bool {
+	h.srv.mu.Lock()
+	ws := make([]*window, 0, len(h.srv.windows))
+	for _, w := range h.srv.windows {
+		ws = append(ws, w)
+	}
+	h.srv.mu.Unlock()
+	widths := map[int]bool{}
+	for _, w := range ws {
+		w.mu.Lock()
+		widths[w.size.Width] = true
+		w.mu.Unlock()
+	}
+	return widths
 }
 
 func TestEndAfterTheSessionFinishedDoesNothing(t *testing.T) {

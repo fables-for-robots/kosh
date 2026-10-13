@@ -71,6 +71,8 @@ type session struct {
 	// stopped is set when kosh ends the session; the model is given no
 	// message after that.
 	stopped atomic.Bool
+	// channelClosed is set when the client closes the session channel.
+	channelClosed atomic.Bool
 
 	mu sync.Mutex
 	// reason is why kosh ends the session; "" while it does not.
@@ -91,15 +93,16 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	defer cancel()
 	// The session ends when the client closes its channel, even if the
 	// connection stays: nothing would end the program then.
+	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx}
 	win := s.windowOf(ss)
 	go func() {
 		select {
 		case <-win.closed:
+			sess.channelClosed.Store(true)
 			cancel()
 		case <-ctx.Done():
 		}
 	}()
-	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx}
 	s.register(sess)
 	defer s.unregister(sess)
 	log := s.log.With("transport", c.transport, "remote", c.remote,
@@ -133,6 +136,9 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 
 			go win.forward(ctx, p)
 			_, err := p.Run()
+			// Taken now: a channel that closes after the program ended
+			// by itself is not why it ended.
+			byClient := sess.channelClosed.Load()
 			if errors.Is(err, tea.ErrProgramPanic) {
 				// A command's goroutine panicked, and Bubble Tea caught
 				// it and printed the stack to the standard error.
@@ -143,7 +149,13 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			s.mu.Lock()
 			s.running--
 			s.mu.Unlock()
-			defer func() { logEnd(log, began, sess.ending()) }()
+			defer func() {
+				reason := sess.ending()
+				if reason == "" && byClient {
+					reason = reasonChannelClosed
+				}
+				logEnd(log, began, reason)
+			}()
 		}
 	}
 
@@ -221,6 +233,10 @@ func fingerprint(key ssh.PublicKey) string {
 	}
 	return gossh.FingerprintSHA256(key)
 }
+
+// reasonChannelClosed is why a session ended when its client closed the
+// channel, in the log.
+const reasonChannelClosed = "the client closed the channel"
 
 func logEnd(log *slog.Logger, began time.Time, reason string) {
 	args := []any{"duration", time.Since(began).Round(time.Millisecond)}

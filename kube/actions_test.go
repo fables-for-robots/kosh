@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -279,43 +280,6 @@ func TestUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("a separator before and after the document", func(t *testing.T) {
-		f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
-		ref := f.ref(t, "apps", "deployments", "default", "web")
-		text := actionYAML(t, f, ref, func(m map[string]any) {
-			_ = unstructured.SetNestedField(m, int64(6), "spec", "replicas")
-		})
-		if err := f.s.Update(context.Background(), ref, "# edited\n---\n"+text+"---\n# nothing more\n"); err != nil {
-			t.Fatal(err)
-		}
-		obj, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
-		if n, _, _ := unstructured.NestedInt64(obj.(*unstructured.Unstructured).Object, "spec", "replicas"); n != 6 {
-			t.Errorf("replicas %d, want 6", n)
-		}
-	})
-
-	for _, wrap := range []struct{ name, before, after string }{
-		{"a directive before the document", "%YAML 1.2\n---\n", ""},
-		{"a directive and a comment before it", "# edited\n%YAML 1.2\n%TAG ! tag:example.com,2000:\n---\n", ""},
-		{"an end marker and comments after it", "", "...\n# the end\n\n   \n"},
-		{"an end marker and a directive", "%YAML 1.2\n---\n", "... # done\n"},
-	} {
-		t.Run(wrap.name, func(t *testing.T) {
-			f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
-			ref := f.ref(t, "apps", "deployments", "default", "web")
-			text := actionYAML(t, f, ref, func(m map[string]any) {
-				_ = unstructured.SetNestedField(m, int64(8), "spec", "replicas")
-			})
-			if err := f.s.Update(context.Background(), ref, wrap.before+text+wrap.after); err != nil {
-				t.Fatal(err)
-			}
-			obj, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
-			if n, _, _ := unstructured.NestedInt64(obj.(*unstructured.Unstructured).Object, "spec", "replicas"); n != 8 {
-				t.Errorf("replicas %d, want 8", n)
-			}
-		})
-	}
-
 	t.Run("a cluster-scoped object", func(t *testing.T) {
 		n := actionNode("n1")
 		n.ResourceVersion = "4"
@@ -339,7 +303,6 @@ func TestUpdate(t *testing.T) {
 		want string
 	}{
 		{"not YAML", func(*testing.T, *actionFixture, ObjectRef) string { return "metadata: [unclosed\n  - {" }, "the YAML does not parse"},
-		{"not an object", func(*testing.T, *actionFixture, ObjectRef) string { return "- just\n- a list\n" }, "the YAML is not an object"},
 		{"another name", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { _ = unstructured.SetNestedField(m, "api", "metadata", "name") })
 		}, "the YAML names another object: "},
@@ -355,22 +318,6 @@ func TestUpdate(t *testing.T) {
 		{"another apiVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { m["apiVersion"] = "apps/v1beta2" })
 		}, "the YAML names another object: "},
-		{"two documents", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "---\napiVersion: v1\nkind: ConfigMap\nmetadata: {name: other, namespace: default}\n"
-		}, "the YAML holds more than one document"},
-		{"the same document twice", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			text := actionYAML(t, f, ref, nil)
-			return text + "---\n" + text
-		}, "the YAML holds more than one document"},
-		{"another document after its end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "...\nkind: B\n"
-		}, "the YAML holds more than one document"},
-		{"text that is no YAML after the end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "...\n[[[ not yaml\n"
-		}, "the YAML holds more than one document"},
-		{"a directive and a document after the end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "...\n%YAML 1.2\n---\nkind: B\n"
-		}, "the YAML holds more than one document"},
 		{"no resourceVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { unstructured.RemoveNestedField(m, "metadata", "resourceVersion") })
 		}, "the YAML has no resourceVersion: it must be the object as it was read"},
@@ -388,6 +335,126 @@ func TestUpdate(t *testing.T) {
 			}
 			if a := f.sent(); len(a) != 0 {
 				t.Errorf("sent %v", a)
+			}
+		})
+	}
+}
+
+// actionJSON decodes JSON for comparison, numbers as written.
+func actionJSON(t *testing.T, b []byte) any {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("%s: %v", b, err)
+	}
+	return v
+}
+
+func TestUpdateTakesOneDocument(t *testing.T) {
+	const (
+		parse  = "the YAML does not parse"
+		more   = "the YAML holds more than one document"
+		object = "the YAML is not an object"
+	)
+	tests := []struct {
+		name string
+		text func(obj string) string // obj: the object's YAML, edited
+		want string                  // the refusal; empty: accepted
+		// extra, when not nil, is what the top-level field extra must be
+		// in what was sent, as JSON.
+		extra any
+	}{
+		{"a single document", func(o string) string { return o }, "", nil},
+		{"a leading ---", func(o string) string { return "---\n" + o }, "", nil},
+		{"a comment and ---", func(o string) string { return "# edited\n---\n" + o }, "", nil},
+		{"a trailing --- and nothing after it", func(o string) string { return o + "---\n" }, "", nil},
+		{"a second document that is only a comment", func(o string) string { return "---\n" + o + "---\n# nothing more\n" }, "", nil},
+		{"a second document that is null", func(o string) string { return o + "---\nnull\n" }, "", nil},
+		{"a second document that is an anchored null", func(o string) string { return o + "---\n&a ~\n" }, "", nil},
+		{"an end marker and a comment", func(o string) string { return o + "...\n# the end\n" }, "", nil},
+		{"a %YAML 1.1 preamble", func(o string) string { return "%YAML 1.1\n---\n" + o }, "", nil},
+		{"--- in a block scalar", func(o string) string { return o + "extra: |\n  a\n  ---\n  b\n" }, "", "a\n---\nb\n"},
+		{"--- in a quoted string", func(o string) string { return o + "extra: \"a\n  ---\n  b\"\n" }, "", "a --- b"},
+		{"folded, a more-indented line", func(o string) string { return o + "extra: >\n  a\n   b\n  c\n" }, "", "a\n b\nc\n"},
+		{"folded, strip, a more-indented line", func(o string) string { return o + "extra: >-\n  a\n   b\n  c\n" }, "", "a\n b\nc"},
+		{"folded, keep, a more-indented line", func(o string) string { return o + "extra: >+\n  a\n   b\n  c\n\n" }, "", "a\n b\nc\n\n"},
+		{"folded, a tab-led line", func(o string) string { return o + "extra: >\n  a\n  \tb\n  c\n" }, "", nil},
+		{"folded, a blank line before an indented one", func(o string) string { return o + "extra: >\n  a\n\n   b\n  c\n" }, "", nil},
+		{"literal, trailing spaces", func(o string) string { return o + "extra: |\n  a  \n  b \n\n" }, "", "a  \nb \n"},
+		{"literal, strip", func(o string) string { return o + "extra: |-\n  a  \n  b \n\n" }, "", "a  \nb "},
+		{"literal, keep", func(o string) string { return o + "extra: |+\n  a  \n  b \n\n" }, "", "a  \nb \n\n"},
+		{"YAML 1.1 booleans", func(o string) string { return o + "extra: {a: yes, b: on, c: Off}\n" }, "", nil},
+		{"numbers", func(o string) string { return o + "extra: {a: 0123, b: \"0123\", c: 1e3, d: 0x1f}\n" }, "", nil},
+		{"tags", func(o string) string { return o + "extra: {a: !!binary aGVsbG8=, b: !!str 0123}\n" }, "", nil},
+		{"an anchor, an alias and a merge", func(o string) string {
+			return o + "base: &b {x: 1, y: 2}\nextra:\n  <<: *b\n  y: 3\n  z: *b\n"
+		}, "", nil},
+		{"a duplicate key", func(o string) string { return o + "extra: one\nextra: two\n" }, "", "two"},
+		{"a multi-line plain string", func(o string) string { return o + "extra: this is\n  a plain\n\n  string\n" }, "", "this is a plain\nstring"},
+
+		{"a second document after ---", func(o string) string { return o + "---\nkind: B\n" }, more, nil},
+		{"the same document twice", func(o string) string { return o + "---\n" + o }, more, nil},
+		{"a second document that does not parse", func(o string) string { return o + "---\n[[[\n" }, more, nil},
+		{"... kind: B", func(o string) string { return o + "... kind: B\n" }, more, nil},
+		{"... {kind: B}", func(o string) string { return o + "... {kind: B}\n" }, more, nil},
+		{"... and a line of %", func(o string) string { return o + "...\n%password: x\n" }, more, nil},
+		{"... and more YAML", func(o string) string { return o + "...\nkind: B\n" }, more, nil},
+		{"... and text that is not YAML", func(o string) string { return o + "...\n[[[ not yaml\n" }, more, nil},
+		{"... and another document", func(o string) string { return o + "...\n%YAML 1.1\n---\nkind: B\n" }, more, nil},
+		{"a %YAML 1.2 preamble, which the parser does not know", func(o string) string { return "%YAML 1.2\n---\n" + o }, parse, nil},
+		{"a list", func(string) string { return "- just\n- a list\n" }, object, nil},
+		{"a scalar", func(string) string { return "just a word\n" }, object, nil},
+		{"nothing", func(string) string { return "" }, object, nil},
+		{"only a comment", func(string) string { return "# nothing\n" }, object, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
+			ref := f.ref(t, "apps", "deployments", "default", "web")
+			obj := actionYAML(t, f, ref, func(m map[string]any) {
+				_ = unstructured.SetNestedField(m, int64(9), "spec", "replicas")
+			})
+			text := tt.text(obj)
+			err := f.s.Update(context.Background(), ref, text)
+			if tt.want != "" {
+				if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+					t.Errorf("%v, want %q", err, tt.want)
+				}
+				if a := f.sent(); len(a) != 0 {
+					t.Errorf("sent %v", a)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sent *unstructured.Unstructured
+			for _, a := range f.dyn.Actions() {
+				if u, ok := a.(k8stesting.UpdateAction); ok {
+					sent = u.GetObject().(*unstructured.Unstructured)
+				}
+			}
+			if sent == nil {
+				t.Fatal("nothing was sent")
+			}
+			got, err := json.Marshal(sent.Object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := yaml.YAMLToJSON([]byte(text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(actionJSON(t, got), actionJSON(t, want)) {
+				t.Errorf("sent\n%s\nwant what sigs.k8s.io/yaml makes of the text\n%s", got, want)
+			}
+			if n, _, _ := unstructured.NestedInt64(sent.Object, "spec", "replicas"); n != 9 {
+				t.Errorf("replicas %d, want 9", n)
+			}
+			if tt.extra != nil && !reflect.DeepEqual(sent.Object["extra"], tt.extra) {
+				t.Errorf("extra %q, want %q", sent.Object["extra"], tt.extra)
 			}
 		})
 	}
@@ -869,5 +936,81 @@ func TestWrongKindIsRefusedBeforeAnythingIsSent(t *testing.T) {
 	}
 	if a := f.sent(); len(a) != 0 {
 		t.Errorf("sent %v", a)
+	}
+}
+
+func TestBadReferenceIsRefusedBeforeAnythingIsSent(t *testing.T) {
+	ctx := context.Background()
+	type call func(s *session, ref ObjectRef) error
+	methods := []struct {
+		name       string
+		group, res string // a resource the method is for
+		namespace  string
+		call       call
+	}{
+		{"Delete", "", "secrets", "default", func(s *session, r ObjectRef) error { return s.Delete(ctx, r, DeleteOptions{}) }},
+		{"Kill", "", "pods", "default", func(s *session, r ObjectRef) error { return s.Kill(ctx, r) }},
+		{"Update", "", "secrets", "default", func(s *session, r ObjectRef) error {
+			return s.Update(ctx, r, "apiVersion: v1\nkind: Secret\nmetadata: {name: secrets, namespace: default, resourceVersion: '1'}\n")
+		}},
+		{"Scale", "apps", "deployments", "default", func(s *session, r ObjectRef) error { return s.Scale(ctx, r, 2) }},
+		{"Restart", "apps", "deployments", "default", func(s *session, r ObjectRef) error { return s.Restart(ctx, r) }},
+		{"SetImages", "apps", "deployments", "default", func(s *session, r ObjectRef) error {
+			return s.SetImages(ctx, r, map[string]string{"app": "app:2"})
+		}},
+		{"SetImages with no images", "apps", "deployments", "default", func(s *session, r ObjectRef) error {
+			return s.SetImages(ctx, r, nil)
+		}},
+		{"Rollback", "apps", "replicasets", "default", func(s *session, r ObjectRef) error { return s.Rollback(ctx, r) }},
+		{"Trigger", "batch", "cronjobs", "default", func(s *session, r ObjectRef) error { _, err := s.Trigger(ctx, r); return err }},
+		{"SetSuspended", "batch", "cronjobs", "default", func(s *session, r ObjectRef) error { return s.SetSuspended(ctx, r, true) }},
+		{"Cordon", "", "nodes", "", func(s *session, r ObjectRef) error { return s.Cordon(ctx, r, true) }},
+		{"Drain", "", "nodes", "", func(s *session, r ObjectRef) error { return s.Drain(ctx, r, DefaultDrainOptions()) }},
+	}
+	refs := []struct {
+		name string
+		ref  func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef
+	}{
+		{"the resource string .", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.GVR.Resource = "."
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "secrets"}
+		}},
+		{"a GVR discovery does not have", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.GVR.Version = "v9"
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "web"}
+		}},
+		{"a discovered GVR with another kind", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.Kind = "Secret"
+			if res == "secrets" {
+				r.Kind = "ConfigMap"
+			}
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "web"}
+		}},
+		{"a discovered GVR with another scope", func(t *testing.T, f *actionFixture, group, res, namespace string) ObjectRef {
+			r := f.resource(t, group, res)
+			r.Namespaced = !r.Namespaced
+			return ObjectRef{Resource: r, Namespace: namespace, Name: "web"}
+		}},
+	}
+	for _, m := range methods {
+		for _, rr := range refs {
+			t.Run(m.name+"/"+rr.name, func(t *testing.T) {
+				f := actionEnv(t, fullGrant, nil)
+				ref := rr.ref(t, f, m.group, m.res, m.namespace)
+				err := m.call(f.s, ref)
+				if !errors.Is(err, ErrUnknownResource) {
+					t.Errorf("%v, want ErrUnknownResource", err)
+				}
+				if a := f.sent(); len(a) != 0 {
+					t.Errorf("sent %v", a)
+				}
+				if got, _ := auditOneAction(t, f).attr("error"); got != "no such resource" {
+					t.Errorf("logged error %q", got)
+				}
+			})
+		}
 	}
 }
