@@ -127,6 +127,14 @@ const closeLinger = 2 * time.Second
 // connections nobody has accepted yet too.
 const maxWaiting = 64
 
+// Bounds on the wait after the endpoint's Accept failed, so that an
+// error that persists does not spin, and one a peer can cause does not
+// hold the others up for long.
+const (
+	minAcceptBackoff = 5 * time.Millisecond
+	maxAcceptBackoff = 100 * time.Millisecond
+)
+
 // timeouts are the times a Listener waits, which tests shorten.
 type timeouts struct {
 	// stream is how long a connection may take to open its stream.
@@ -151,7 +159,10 @@ func listen(ctx context.Context, cfg Config, tm timeouts) (*Listener, error) {
 		log = slog.Default()
 	}
 
-	opts := []iroh.Option{iroh.WithSecretKey(cfg.Key), iroh.WithALPNs(ALPN)}
+	// One stream at a time: a peer that has not authenticated cannot
+	// open further streams beside the one SSH runs in.
+	opts := []iroh.Option{iroh.WithSecretKey(cfg.Key), iroh.WithALPNs(ALPN),
+		iroh.WithTransportConfig(&iroh.QUICTransportConfig{MaxIncomingStreams: 1})}
 	bind := cfg.Bind
 	if cfg.Local && !bind.IsValid() {
 		bind = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
@@ -185,7 +196,7 @@ func listen(ctx context.Context, cfg Config, tm timeouts) (*Listener, error) {
 		"local", cfg.Local, "relay", cfg.Relay && !cfg.Local, "mdns", cfg.MDNS && !cfg.Local)
 
 	l.wg.Add(1)
-	go l.acceptLoop()
+	go l.acceptLoop(ep.Accept, ep.Closed())
 	if !cfg.Local {
 		if err := l.announce(ctx, cfg); err != nil {
 			l.Close()
@@ -195,19 +206,30 @@ func listen(ctx context.Context, cfg Config, tm timeouts) (*Listener, error) {
 	return l, nil
 }
 
-// acceptLoop takes every connection the endpoint accepts and waits for its
-// stream in a goroutine of its own. It ends when the listener is closed.
-func (l *Listener) acceptLoop() {
+// acceptLoop takes every connection accept returns, the endpoint's
+// Accept, and waits for its stream in a goroutine of its own. It ends
+// when the listener is closed or closed is.
+func (l *Listener) acceptLoop(accept func(context.Context) (*iroh.Conn, error), closed <-chan struct{}) {
 	defer l.wg.Done()
+	var backoff time.Duration
 	for {
-		qc, err := l.ep.Accept(l.ctx)
+		qc, err := accept(l.ctx)
 		if err != nil {
-			if l.ctx.Err() != nil || l.endpointClosed() {
+			if l.ctx.Err() != nil || isClosed(closed) {
 				return
 			}
-			l.log.Debug("iroh connection failed before it was accepted", "error", err)
+			backoff = min(max(2*backoff, minAcceptBackoff), maxAcceptBackoff)
+			l.log.Debug("iroh connection failed before it was accepted", "error", err, "retry", backoff)
+			t := time.NewTimer(backoff)
+			select {
+			case <-l.ctx.Done():
+			case <-closed:
+			case <-t.C:
+			}
+			t.Stop()
 			continue
 		}
+		backoff = 0
 		select {
 		case l.slots <- struct{}{}:
 		default:
@@ -221,10 +243,10 @@ func (l *Listener) acceptLoop() {
 	}
 }
 
-// endpointClosed reports whether the endpoint has been shut down.
-func (l *Listener) endpointClosed() bool {
+// isClosed reports whether closed is.
+func isClosed(closed <-chan struct{}) bool {
 	select {
-	case <-l.ep.Closed():
+	case <-closed:
 		return true
 	default:
 		return false

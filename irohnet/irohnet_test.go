@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -94,7 +95,10 @@ type acceptResult struct {
 }
 
 // acceptAsync calls l.Accept in a goroutine and returns where its result
-// arrives. A connection that arrives after the test ended is closed.
+// arrives. A call still waiting when the test ends returns when the
+// listener is closed, and a connection it returned that the test did not
+// take is closed by the listener's Close, as every connection it handed
+// out.
 func acceptAsync(t *testing.T, l *Listener) <-chan acceptResult {
 	t.Helper()
 	ch := make(chan acceptResult, 1)
@@ -392,6 +396,41 @@ func TestCloseUnblocksRead(t *testing.T) {
 	s.Close()
 }
 
+func TestCloseUnblocksWrite(t *testing.T) {
+	l, _ := testListener(t, timeouts{stream: StreamTimeout, linger: time.Minute})
+	c := dial(t, l)
+	s := accept(t, l, c, "hello")
+
+	// The client never reads: the server's Write blocks once the flow
+	// control window is full.
+	written := make(chan error, 1)
+	go func() {
+		_, err := s.Write(make([]byte, 64<<20))
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		t.Fatalf("a Write of 64 MiB to a client that does not read returned: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	start := time.Now()
+	s.Close()
+	select {
+	case err := <-written:
+		if err == nil {
+			t.Fatal("the blocked Write returned no error after Close")
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("the blocked Write returned %v after Close", d)
+		}
+	case <-time.After(wait):
+		t.Fatal("the blocked Write did not return after Close")
+	}
+	if _, err := s.Write([]byte("more")); err == nil {
+		t.Fatal("a Write after Close succeeded")
+	}
+}
+
 func TestDeadlines(t *testing.T) {
 	l, _ := testListener(t, defaultTimeouts)
 	c := dial(t, l)
@@ -456,12 +495,13 @@ func TestSecondStreamIsIgnored(t *testing.T) {
 	}
 	s := accept(t, l, first, "one")
 
-	second, err := qc.OpenStreamConn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := second.Write([]byte("two")); err != nil {
-		t.Fatal(err)
+	// The listener allows one stream at a time: a second cannot be
+	// opened while the first is open.
+	openCtx, stopOpen := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer stopOpen()
+	if second, err := qc.OpenStreamConn(openCtx); err == nil {
+		second.Write([]byte("two"))
+		t.Fatal("a second stream was opened beside the first")
 	}
 	ch := acceptAsync(t, l)
 	select {
@@ -683,15 +723,27 @@ func TestWaitingConnectionsAreBounded(t *testing.T) {
 	l, _ := testListener(t, timeouts{stream: timeout, linger: closeLinger})
 	waitingNow := func() int { return len(l.slots) }
 
-	var wg sync.WaitGroup
+	// Dialled at once, in goroutines that report back here.
+	type dialed struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan dialed, maxWaiting)
 	for range maxWaiting {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			dial(t, l)
+			ctx, cancel := context.WithTimeout(context.Background(), wait)
+			defer cancel()
+			c, err := DialLocal(ctx, l.ID(), l.LocalAddrs())
+			results <- dialed{c, err}
 		}()
 	}
-	wg.Wait()
+	for range maxWaiting {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("dial: %v", r.err)
+		}
+		t.Cleanup(func() { r.conn.Close() })
+	}
 	waitFor(t, fmt.Sprintf("%d waiting connections", maxWaiting), func() bool { return waitingNow() == maxWaiting })
 
 	one := dial(t, l)
@@ -707,4 +759,32 @@ func TestWaitingConnectionsAreBounded(t *testing.T) {
 	waitFor(t, "the waiting connections to time out", func() bool { return waitingNow() == 0 })
 	c := dial(t, l)
 	accept(t, l, c, "served")
+}
+
+func TestAcceptLoopBacksOff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	l := &Listener{ctx: ctx, cancel: cancel, log: slog.New(slog.DiscardHandler)}
+	var calls atomic.Int64
+	failing := func(context.Context) (*iroh.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("it is always like this")
+	}
+	l.wg.Add(1)
+	go l.acceptLoop(failing, make(chan struct{}))
+
+	time.Sleep(300 * time.Millisecond)
+	if n := calls.Load(); n < 2 || n > 20 {
+		t.Errorf("%d calls of a failing accept in 300 ms; want a few", n)
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		l.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(wait):
+		t.Fatal("the accept loop did not end with the listener's context")
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
@@ -33,28 +34,49 @@ type conn struct {
 	// onClose, when set, is called once the connection is closed.
 	onClose func(*conn)
 
+	// wmu is held by Write while it writes, and by Close while it closes
+	// the stream: the stream may not be closed while a Write runs.
+	wmu    sync.Mutex
+	closed atomic.Bool
+
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// Write is the stream's. After Close it fails with net.ErrClosed.
+func (c *conn) Write(p []byte) (int, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return c.stream.Write(p)
 }
 
 var _ net.Conn = (*conn)(nil)
 
 func (c *conn) Read(p []byte) (int, error)         { return c.stream.Read(p) }
-func (c *conn) Write(p []byte) (int, error)        { return c.stream.Write(p) }
 func (c *conn) LocalAddr() net.Addr                { return c.local }
 func (c *conn) RemoteAddr() net.Addr               { return c.remote }
 func (c *conn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
 func (c *conn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
 func (c *conn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
 
-// Close closes the stream; a Read or Write that is blocked returns at
+// Close closes the stream; a Read or a Write that is blocked returns at
 // once. A connection of a Listener is closed after the peer has closed
 // it or the linger has passed, in a goroutine, so that Close does not
 // wait; one of DialLocal is closed at once, with its endpoint. Only the
 // first call does anything; every call returns its result.
 func (c *conn) Close() error {
 	c.closeOnce.Do(func() {
+		// A Write that is blocked returns at once with a timeout; what
+		// Writes have handed the stream so far is still sent, and the
+		// stream ends after it.
+		c.closed.Store(true)
+		c.stream.SetWriteDeadline(time.Unix(1, 0))
+		c.wmu.Lock()
 		c.closeErr = c.stream.Close()
+		c.wmu.Unlock()
 		if c.onClose != nil {
 			c.onClose(c)
 		}
