@@ -16,8 +16,8 @@ kosh:    v0.1.0
 │<space>   Mark          <->      Last View                                                        │
 │<shift-j> Owner         <esc>    Back                                                             │
 │<?>       Help          <ctrl-c> Quit                                                             │
-│                                                                                                  │
-│                                                                                                  │
+│<d>       Describe                                                                                │
+│<y>       YAML                                                                                    │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

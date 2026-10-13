@@ -1,5 +1,5 @@
-Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z> Faults
-Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter
+Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <d> Describe
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter        <y> YAML
 kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark
                                       <shift-o> Sort Column   <shift-j> Owner
                                       <ctrl-w> Wide           <?> Help
