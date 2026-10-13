@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -553,4 +554,144 @@ func TestServesAsANetListener(t *testing.T) {
 	case <-time.After(wait):
 		t.Fatal("Serve did not return after Close")
 	}
+}
+
+// waitFor polls cond until it holds, and fails the test when it does not
+// within wait.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(wait)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestConnectionWithoutAStreamIsClosed(t *testing.T) {
+	l, logs := testListener(t, timeouts{stream: 100 * time.Millisecond, linger: closeLinger})
+	ch := acceptAsync(t, l)
+
+	silent := dial(t, l)
+	start := time.Now()
+	readEnds(t, silent)
+	if d := time.Since(start); d > wait/2 {
+		t.Errorf("the silent client was closed after %v", d)
+	}
+	select {
+	case r := <-ch:
+		t.Fatalf("Accept returned the silent client: %v %v", r.conn, r.err)
+	default:
+	}
+	id := silent.LocalAddr().String()
+	waitFor(t, "the log to name the silent client", func() bool {
+		return strings.Contains(logs.String(), "level=DEBUG") && strings.Contains(logs.String(), id)
+	})
+
+	c := dial(t, l)
+	if _, err := c.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	s := awaitAccept(t, ch)
+	readExactly(t, s, "hello")
+	if s.RemoteAddr().String() != c.LocalAddr().String() {
+		t.Fatalf("accepted %s, want the second client %s", s.RemoteAddr(), c.LocalAddr())
+	}
+}
+
+func TestAcceptAfterClose(t *testing.T) {
+	l, _ := testListener(t, defaultTimeouts)
+	ch := acceptAsync(t, l)
+	select {
+	case r := <-ch:
+		t.Fatalf("Accept returned before Close: %v %v", r.conn, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	l.Close()
+	select {
+	case r := <-ch:
+		if !errors.Is(r.err, net.ErrClosed) {
+			t.Fatalf("Accept after Close: %v, want net.ErrClosed", r.err)
+		}
+	case <-time.After(wait):
+		t.Fatal("Accept did not return after Close")
+	}
+	if _, err := l.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("a later Accept: %v, want net.ErrClosed", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("a second Close: %v", err)
+	}
+}
+
+func TestCloseClosesEverything(t *testing.T) {
+	before := runtime.NumGoroutine()
+	l, _ := testListener(t, defaultTimeouts)
+
+	// One accepted, one that has not written, one whose stream is open
+	// and that nobody accepted.
+	accepted := dial(t, l)
+	s := accept(t, l, accepted, "hello")
+	waiting := dial(t, l)
+	unaccepted := dial(t, l)
+	if _, err := unaccepted.Write([]byte("anyone?")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the unaccepted stream", func() bool {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return len(l.conns) == 2
+	})
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := s.Read(make([]byte, 8)); err == nil {
+		t.Error("the accepted connection reads after Close")
+	}
+	if _, err := s.Write([]byte("x")); err == nil {
+		t.Error("the accepted connection writes after Close")
+	}
+	readEnds(t, accepted)
+	readEnds(t, waiting)
+	readEnds(t, unaccepted)
+
+	for _, c := range []net.Conn{accepted, waiting, unaccepted} {
+		c.Close()
+	}
+	waitFor(t, "the listener's goroutines to end", func() bool {
+		return runtime.NumGoroutine() <= before
+	})
+}
+
+func TestWaitingConnectionsAreBounded(t *testing.T) {
+	const timeout = 1500 * time.Millisecond
+	l, _ := testListener(t, timeouts{stream: timeout, linger: closeLinger})
+	waitingNow := func() int { return len(l.slots) }
+
+	var wg sync.WaitGroup
+	for range maxWaiting {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dial(t, l)
+		}()
+	}
+	wg.Wait()
+	waitFor(t, fmt.Sprintf("%d waiting connections", maxWaiting), func() bool { return waitingNow() == maxWaiting })
+
+	one := dial(t, l)
+	start := time.Now()
+	readEnds(t, one)
+	if d := time.Since(start); d >= timeout {
+		t.Fatalf("the connection beyond the bound was closed after %v, the timeout is %v", d, timeout)
+	}
+	if n := waitingNow(); n != maxWaiting {
+		t.Fatalf("%d connections wait when the one beyond the bound was closed, want %d", n, maxWaiting)
+	}
+
+	waitFor(t, "the waiting connections to time out", func() bool { return waitingNow() == 0 })
+	c := dial(t, l)
+	accept(t, l, c, "served")
 }

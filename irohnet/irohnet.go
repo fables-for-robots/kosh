@@ -71,6 +71,9 @@ type Listener struct {
 	cancel context.CancelFunc
 	// ready hands connections whose stream is open to Accept.
 	ready chan *conn
+	// slots holds a token for every connection that is waiting for its
+	// stream or for Accept; it holds maxWaiting at most.
+	slots chan struct{}
 	// wg counts the goroutines the listener started.
 	wg sync.WaitGroup
 
@@ -110,6 +113,10 @@ func Listen(ctx context.Context, cfg Config) (*Listener, error) {
 // close it, so that what was written last is not dropped: a few round
 // trips through a relay.
 const closeLinger = 2 * time.Second
+
+// maxWaiting is how many connections may wait for their stream, or for
+// Accept, at once. One more is closed at once.
+const maxWaiting = 64
 
 // timeouts are the times a Listener waits, which tests shorten.
 type timeouts struct {
@@ -161,6 +168,7 @@ func listen(ctx context.Context, cfg Config, tm timeouts) (*Listener, error) {
 		ctx:    lctx,
 		cancel: cancel,
 		ready:  make(chan *conn),
+		slots:  make(chan struct{}, maxWaiting),
 		conns:  make(map[*conn]struct{}),
 	}
 	log.Info("iroh endpoint bound", "id", l.id, "addr", ep.LocalAddr())
@@ -183,6 +191,14 @@ func (l *Listener) acceptLoop() {
 			l.log.Debug("iroh connection failed before it was accepted", "error", err)
 			continue
 		}
+		select {
+		case l.slots <- struct{}{}:
+		default:
+			l.log.Debug("iroh connection closed: too many are waiting for their stream",
+				"peer", qc.RemoteID().String(), "waiting", maxWaiting)
+			qc.CloseWithError(0, "busy")
+			continue
+		}
 		l.wg.Add(1)
 		go l.awaitStream(qc)
 	}
@@ -198,15 +214,21 @@ func (l *Listener) endpointClosed() bool {
 	}
 }
 
-// awaitStream waits for the stream of qc and hands it to Accept. A
-// connection whose stream does not come is closed.
+// awaitStream waits for the stream of qc, the stream timeout at most,
+// and hands it to Accept. A connection whose stream does not come is
+// closed. It holds a slot until then.
 func (l *Listener) awaitStream(qc *iroh.Conn) {
 	defer l.wg.Done()
+	defer func() { <-l.slots }()
 	peer := qc.RemoteID().String()
-	stream, err := qc.AcceptStreamConn(l.ctx)
+	ctx, cancel := context.WithTimeout(l.ctx, l.tm.stream)
+	stream, err := qc.AcceptStreamConn(ctx)
+	cancel()
 	if err != nil {
 		qc.CloseWithError(0, "no stream")
-		l.log.Debug("iroh connection closed: it opened no stream", "peer", peer, "error", err)
+		if l.ctx.Err() == nil {
+			l.log.Debug("iroh connection closed: it opened no stream", "peer", peer, "error", err)
+		}
 		return
 	}
 	c := &conn{
