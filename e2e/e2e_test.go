@@ -14,9 +14,10 @@ package e2e
 // screen model of screen_test.go.
 //
 // The tests of the cluster run in the order of this file, against one
-// cluster and one kosh: TestRoleCanBeChanged and
-// TestKeyRemovedEndsTheSession change kosh's role and its key list, and
+// cluster and one kosh: TestRoleCanBeChanged, TestKeyRemovedEndsTheSession
+// and TestShellEndsWithItsKey change kosh's role and its key list, and
 // put them back; TestStopTellsTheSessions restarts kosh and comes last.
+// The tests of a shell come before them.
 
 import (
 	"bufio"
@@ -26,6 +27,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +44,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/creack/pty"
 	"golang.org/x/crypto/ssh"
 )
@@ -1169,6 +1172,15 @@ func (p *ptySession) resize(w, h int) {
 	}
 }
 
+// The keys of a shell's dialog and of a shell, as a terminal sends them.
+const (
+	keyUp    = "\x1b[A"
+	keyDown  = "\x1b[B"
+	keyLeft  = "\x1b[D"
+	keyCtrlC = "\x03"
+	keyCtrlU = "\x15" // in a text field: everything before the cursor deleted
+)
+
 // shellDefaultEnd is how the dialog's Command field shows the default
 // command: scrolled to its end, where the cursor is.
 const shellDefaultEnd = `exec bash || exec sh"`
@@ -1197,6 +1209,13 @@ func dialogLines(lines []string) []string {
 		return inside
 	}
 	return nil
+}
+
+// dialogText is the dialog's text, its lines joined by one space, every
+// run of blanks one space: a reason wrapped onto several lines reads as
+// one.
+func dialogText(lines []string) string {
+	return strings.Join(strings.Fields(strings.Join(dialogLines(lines), " ")), " ")
 }
 
 // dialogField returns the value of the dialog's field label as drawn, and
@@ -1316,6 +1335,394 @@ func TestShell(t *testing.T) {
 		"--image-pull-policy=IfNotPresent", "--restart=Never")
 	t.Cleanup(func() { kubectl(t, "--namespace", "default", "delete", "pod", pod, "--wait=false") })
 	p.waitRow(pod)
+}
+
+// A full-screen program in the shell gets the terminal as a terminal
+// has it: its bare line feeds and its cursor's moves arrive untouched,
+// and ctrl-c reaches what runs in the shell.
+func TestShellFullScreen(t *testing.T) {
+	inCluster(t)
+	const w, h = 120, 40
+	p := sshPTY(t, fullKey(t), w, h)
+	p.openShell()
+
+	// A bare line feed moves down and not back: a staircase.
+	p.send(`stty -onlcr; printf 'kosh-ab\nkosh-cd\n'; stty onlcr` + keyEnter)
+	p.waitUntil(wait, "kosh-cd under the end of kosh-ab, then the prompt", func(lines []string) bool {
+		for i := 0; i+1 < len(lines); i++ {
+			if strings.TrimRight(lines[i], " ") == "kosh-ab" && strings.TrimRight(lines[i+1], " ") == "       kosh-cd" {
+				return prompted(lines, i+1)
+			}
+		}
+		return false
+	})
+
+	const file, text = "/tmp/kosh-e2e.txt", "kosh-e2e-vi-line"
+	// busybox's sh drops what is typed after the enter of a command
+	// before the command runs, as it does over kubectl exec -it: each
+	// key below is typed once what it is for is on the screen.
+	p.send("rm -f " + file + "; vi " + file + keyEnter)
+	p.waitUntil(wait, "vi, empty, with a ~ alone at the first column of every empty row and its status line last", func(lines []string) bool {
+		return viScreen(lines, "", file)
+	})
+	p.send("i" + text + keyEsc)
+	p.waitUntil(wait, "vi with the line typed, a ~ alone at the first column of every empty row and its status line last", func(lines []string) bool {
+		return viScreen(lines, text, file)
+	})
+	p.send(":wq" + keyEnter)
+	p.waitUntil(wait, "the prompt after vi", func(lines []string) bool { return prompted(lines, -1) })
+	p.shellRun("clear; cat "+file, text)
+
+	before := running(t, "marker", "sleep 100")
+	p.send("sleep 100" + keyEnter)
+	eventually(t, wait, "sleep 100 runs in marker", func() bool { return running(t, "marker", "sleep 100") > before },
+		func() string { return "the screen:\n" + p.scr.String() })
+	p.send(keyCtrlC)
+	p.shellRun("echo $?", "130")
+	p.backFromShell(w, h)
+}
+
+// viScreen reports whether lines are busybox vi's screen of a file of
+// one line, first (empty for an empty file): the line on the first row,
+// a ~ alone at the first column of every row after it but the last, and
+// the status line, which names the file, on the last.
+func viScreen(lines []string, first, file string) bool {
+	h := len(lines)
+	if h < 3 || !strings.Contains(lines[h-1], file) || strings.TrimRight(lines[0], " ") != first {
+		return false
+	}
+	for _, l := range lines[1 : h-1] {
+		if strings.TrimRight(l, " ") != "~" {
+			return false
+		}
+	}
+	return true
+}
+
+// running returns how many processes of the pod's (first) container
+// run command, as ps shows them.
+func running(t *testing.T, pod, command string) int {
+	t.Helper()
+	n := 0
+	for _, l := range strings.Split(kubectl(t, "--namespace", "default", "exec", pod, "--", "ps", "-o", "args"), "\n") {
+		if strings.TrimSpace(l) == command {
+			n++
+		}
+	}
+	return n
+}
+
+// A command of the user's: its words reach the container as the field
+// cuts them, the third word whole, spaces and all, and the fourth as $0.
+func TestShellEditedCommand(t *testing.T) {
+	inCluster(t)
+	p := sshPTY(t, fullKey(t), 120, 40)
+	p.waitRow("marker", "Running")
+	p.shellDialog("default/marker", "marker")
+	const command = `/bin/sh -c "echo edited-$0; exec sh" kosh-e2e`
+	p.send(keyCtrlU, command)
+	p.waitUntil(wait, "the Command field holds "+command, func(lines []string) bool {
+		got, _ := dialogField(lines, "Command")
+		return got == command
+	})
+	p.send(keyEnter)
+	p.inShell("default/marker", "marker")
+	p.waitUntil(wait, "edited-kosh-e2e, then the prompt", func(lines []string) bool {
+		for i, l := range lines {
+			if strings.TrimRight(l, " ") == "edited-kosh-e2e" {
+				return prompted(lines, i)
+			}
+		}
+		return false
+	})
+	p.backFromShell(120, 40)
+}
+
+// A command the container does not have: the dialog again, with the
+// text as typed and the runtime's reason.
+func TestShellCommandThatIsNotThere(t *testing.T) {
+	inCluster(t)
+	c := connect(t, fullKey(t), 120, 40)
+	c.waitRow("marker", "Running")
+	c.fills(120, 40)
+	c.shellDialog("default/marker", "marker")
+	const command = "/no/such/shell"
+	c.send(keyCtrlU, command, keyEnter)
+	c.waitUntil(wait, "the dialog again, with "+command+" and the reason", func(lines []string) bool {
+		got, _ := dialogField(lines, "Command")
+		return got == command && strings.Contains(dialogText(lines), "no such file or directory")
+	})
+	t.Logf("the dialog:\n%s", strings.Join(dialogLines(c.scr.lines()), "\n"))
+	c.send(keyEsc)
+	c.waitUntil(wait, "the dialog gone", func(lines []string) bool { return dialogLines(lines) == nil })
+	c.fills(120, 40)
+	c.waitRow("marker", "Running")
+	c.waitFor("Pods(default)")
+}
+
+// kosh's own image has no shell at all: the default command's reason, in
+// the dialog, at once.
+func TestShellPodWithoutAShell(t *testing.T) {
+	inCluster(t)
+	c := connect(t, fullKey(t), 120, 40)
+	c.waitFor("Pods(default)")
+	c.send(":pods " + namespace + keyEnter)
+	c.waitFor("Pods(" + namespace + ")")
+	pod := ""
+	c.waitUntil(wait, "kosh's pod, running", func(lines []string) bool {
+		for _, l := range lines {
+			cells := strings.Fields(strings.Trim(l, "│ "))
+			if len(cells) > 2 && strings.HasPrefix(cells[0], release+"-") && strings.Contains(l, "Running") {
+				pod = cells[0]
+				return true
+			}
+		}
+		return false
+	})
+	c.shellDialog(namespace+"/"+pod, "kosh")
+	c.send(keyEnter)
+	c.waitUntil(wait, "the dialog again, with the reason", func(lines []string) bool {
+		got, _ := dialogField(lines, "Command")
+		return strings.HasSuffix(got, shellDefaultEnd) && strings.Contains(dialogText(lines), "executable file not found")
+	})
+	t.Logf("the dialog:\n%s", strings.Join(dialogLines(c.scr.lines()), "\n"))
+	c.send(keyEsc)
+	c.waitUntil(wait, "the dialog gone", func(lines []string) bool { return dialogLines(lines) == nil })
+	c.fills(120, 40)
+	c.waitRow(pod, "Running")
+}
+
+func TestShellStatus(t *testing.T) {
+	inCluster(t)
+	p := sshPTY(t, fullKey(t), 120, 40)
+	p.openShell()
+	p.send("exit 3" + keyEnter)
+	p.fills(120, 40)
+	p.waitRow("marker", "Running")
+	p.waitFor("the shell ended with status 3")
+}
+
+// From a pod's containers, the container is the row's, and the focus
+// passes it by.
+func TestShellFromTheContainersTable(t *testing.T) {
+	inCluster(t)
+	p := sshPTY(t, fullKey(t), 120, 40)
+	p.waitRow("marker", "Running")
+	p.send(keyEnter)
+	p.waitFor("Containers(pods/default/marker)")
+	p.waitRow("M1", "marker")
+	p.shellDialog("default/marker", "marker")
+	p.send(keyUp)
+	p.waitUntil(wait, "the focus on Shell, past Container", func(lines []string) bool {
+		got, focused := dialogField(lines, "Container")
+		return strings.Contains(dialogText(lines), "[ Shell ]") && got == "marker" && !focused
+	})
+	p.send(keyDown)
+	p.waitUntil(wait, "the focus in Command again", func(lines []string) bool {
+		_, focused := dialogField(lines, "Command")
+		return focused
+	})
+	p.send(keyEnter)
+	p.inShell("default/marker", "marker")
+	p.send("exit" + keyEnter)
+	p.fills(120, 40)
+	p.waitFor("Containers(pods/default/marker)")
+
+	// Of pair, the container that is not the one the annotation names.
+	p.send(keyEsc)
+	p.waitFor("Pods(default)")
+	p.send("/pair" + keyEnter)
+	p.waitUntil(wait, "pair alone", func(lines []string) bool {
+		return row(lines, "pair", "Running") != "" && row(lines, "marker") == ""
+	})
+	p.send(keyEnter)
+	p.waitFor("Containers(pods/default/pair)")
+	p.waitRow("M1", "first")
+	p.waitRow("M2", "second")
+	p.shellDialog("default/pair", "first")
+	p.send(keyEnter)
+	p.inShell("default/pair", "first")
+	p.shellRun("cat /tmp/kosh-e2e-container", "kosh-e2e-in-first")
+	p.send("exit" + keyEnter)
+	p.waitFor("Containers(pods/default/pair)")
+}
+
+// A pod of two containers: the one the annotation names first, and the
+// other chosen with the arrows.
+func TestShellSeveralContainers(t *testing.T) {
+	inCluster(t)
+	p := sshPTY(t, fullKey(t), 120, 40)
+	p.waitRow("pair", "Running")
+	p.send("/pair" + keyEnter)
+	p.waitUntil(wait, "pair alone", func(lines []string) bool {
+		return row(lines, "pair", "Running") != "" && row(lines, "marker") == ""
+	})
+	p.shellDialog("default/pair", "‹ second ›")
+	p.send(keyUp)
+	p.waitUntil(wait, "the focus on Container", func(lines []string) bool {
+		_, focused := dialogField(lines, "Container")
+		return focused
+	})
+	p.send(keyLeft)
+	p.waitUntil(wait, "the container first", func(lines []string) bool {
+		got, _ := dialogField(lines, "Container")
+		return got == "‹ first ›"
+	})
+	p.send(keyDown)
+	p.waitUntil(wait, "the focus in Command again", func(lines []string) bool {
+		_, focused := dialogField(lines, "Command")
+		return focused
+	})
+	p.send(keyEnter)
+	p.inShell("default/pair", "first")
+	p.shellRun("cat /tmp/kosh-e2e-container", "kosh-e2e-in-first")
+	p.send("exit" + keyEnter)
+	p.fills(120, 40)
+	p.waitRow("pair", "Running")
+
+	// And the second, as the dialog chose it.
+	p.shellDialog("default/pair", "‹ second ›")
+	p.send(keyEnter)
+	p.inShell("default/pair", "second")
+	p.shellRun("cat /tmp/kosh-e2e-container", "kosh-e2e-in-second")
+	p.send("exit" + keyEnter)
+	p.fills(120, 40)
+	p.waitRow("pair", "Running")
+}
+
+func TestShellOverIroh(t *testing.T) {
+	inCluster(t)
+	p := irohSSH(t, fullKey(t))
+	overIroh(t, p, "the pods, and marker", func(lines []string) bool {
+		return lineWith(lines, "Pods(default)") && row(lines, "marker", "Running") != ""
+	})
+	p.shellDialog("default/marker", "marker")
+	p.send(keyEnter)
+	p.inShell("default/marker", "marker")
+	p.shellRun("echo kosh-$((6*7))", "kosh-42")
+	p.backFromShell(120, 40)
+	p.send(":q" + keyEnter)
+	if status := p.exitedWith(wait); status != 0 {
+		t.Errorf("iroh-ssh exited with status %d after :q; the screen:\n%s", status, p.scr)
+	}
+}
+
+// A read-only key has no shell: no hint, and s does nothing. TestShell
+// is the positive control: a full key sees <s> Shell.
+func TestShellReadOnlyKey(t *testing.T) {
+	inCluster(t)
+	k := readOnlyKey(t)
+	c := connect(t, k, 120, 40)
+	c.waitUntil(wait, "the key's name with [read-only] in the header", func(lines []string) bool {
+		return lineWith(lines, "Key:", k.name+" [read-only]")
+	})
+	c.waitRow("marker", "Running")
+	c.fills(120, 40)
+	before := c.scr.lines()
+	if lineWith(headerLines(before), "<s> Shell") {
+		t.Errorf("a read-only key is offered <s> Shell:\n%s", c.scr)
+	}
+	c.send("s")
+	// Nothing is to be waited for: what s would open would be there by now.
+	time.Sleep(2 * time.Second)
+	after := c.scr.lines()
+	if dialogLines(after) != nil || lineWith(after, "A shell in pod") {
+		t.Errorf("s opened something for a read-only key:\n%s", c.scr)
+	}
+	// The frame is as it was: the header, the table's title, the crumbs
+	// and the flash. (The table's ages may have moved on.)
+	same := func(a, b []string) bool { return strings.Join(a, "\n") == strings.Join(b, "\n") }
+	h := len(after)
+	if !same(headerLines(after), headerLines(before)) || !same(after[h-2:], before[h-2:]) ||
+		!same(after[len(headerLines(after)):][:1], before[len(headerLines(before)):][:1]) {
+		t.Errorf("the frame changed after s.\nbefore:\n%s\nafter:\n%s", strings.Join(before, "\n"), c.scr)
+	}
+	if lines := logLines(t, "action", "key", k.name, "action", "exec"); len(lines) > 0 {
+		t.Errorf("kosh's log has an exec of the read-only key: %s", lines[0])
+	}
+}
+
+// The two lines of a shell in kosh's log: who, in what, with which
+// command; and how it ended. Nothing of what was typed or printed.
+func TestShellIsLogged(t *testing.T) {
+	inCluster(t)
+	k := fullKey(t)
+	attrs := []string{"key", k.name, "fingerprint", ssh.FingerprintSHA256(k.signer.PublicKey()),
+		"action", "exec", "object", "pods/default/marker", "container", "marker"}
+	start := append(slices.Clone(attrs), "phase", "start",
+		"command", `"sh" "-c" "command -v bash >/dev/null && exec bash || exec sh"`)
+	end := append(slices.Clone(attrs), "phase", "end", "started", "true", "status", "0")
+	starts, ends := len(logLines(t, "action", start...)), len(logLines(t, "action", end...))
+
+	const secret = "kosh-secret-marker"
+	p := sshPTY(t, k, 120, 40)
+	p.openShell()
+	p.shellRun("echo "+secret, secret)
+	p.backFromShell(120, 40)
+
+	var got []string
+	eventually(t, wait, "kosh's log has the shell's start and end", func() bool {
+		s, e := logLines(t, "action", start...), logLines(t, "action", end...)
+		if len(s) <= starts || len(e) <= ends {
+			return false
+		}
+		got = []string{s[len(s)-1], e[len(e)-1]}
+		return true
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	t.Logf("kosh's log:\n%s\n%s", got[0], got[1])
+	if !regexp.MustCompile(` duration=\d[^ ]*s `).MatchString(got[1] + " ") {
+		t.Errorf("the end line has no duration: %s", got[1])
+	}
+	if log := koshLog(t); strings.Contains(log, secret) {
+		t.Errorf("kosh's log has what was typed in the shell, %s:\n%s", secret, log)
+	}
+}
+
+// The client killed while its shell is open: the session ends, and the
+// shell's line of the end with it; the key opens a session again.
+func TestShellSurvivesNothing(t *testing.T) {
+	inCluster(t)
+	k := fullKey(t)
+	sessions := len(logLines(t, "session start", "key", k.name))
+	end := []string{"key", k.name, "action", "exec", "object", "pods/default/marker", "phase", "end"}
+	shells := len(logLines(t, "action", end...))
+
+	p := sshPTY(t, k, 120, 40)
+	p.openShell()
+	var start string
+	eventually(t, wait, "kosh's log has the session's start", func() bool {
+		lines := logLines(t, "session start", "key", k.name)
+		if len(lines) <= sessions {
+			return false
+		}
+		start = lines[len(lines)-1]
+		return true
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	remote := regexp.MustCompile(`remote=(\S+)`).FindStringSubmatch(start)
+	if remote == nil {
+		t.Fatalf("the session's start names no remote: %s", start)
+	}
+
+	if err := p.cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	killed := time.Now()
+	var ended []string
+	eventually(t, 15*time.Second, "kosh's log has the end of the session of "+remote[1]+" and of its shell", func() bool {
+		ended = logLines(t, "action", end...)
+		return len(logLines(t, "session end", "remote", remote[1])) > 0 && len(ended) > shells
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	t.Logf("%v after the kill: %s", time.Since(killed).Round(100*time.Millisecond), logLines(t, "session end", "remote", remote[1])[0])
+	shell := ended[len(ended)-1]
+	t.Logf("and: %s", shell)
+	// The stream was cut, not the shell ended: the spec's §7.
+	if !hasAttr(shell, "ended", "the session ended") {
+		t.Errorf("the shell's end line does not say ended=%q: %s", "the session ended", shell)
+	}
+
+	c := connect(t, k, 120, 40)
+	c.waitRow("marker", "Running")
+	c.fills(120, 40)
 }
 
 // setKeys installs the chart again with the key list of lines, keeping
@@ -1457,6 +1864,93 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "unable to authenticate") {
 		t.Errorf("a new connection of the read-only key: %v, want a failed handshake", err)
 	}
+}
+
+// newKey makes a key of the test's own, named name, with its files in a
+// temporary directory.
+func newKey(t *testing.T, name string) key {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(file, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))) + " " + name
+	if err := os.WriteFile(file+".pub", []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return loadKey(t, file)
+}
+
+// accepted reports whether k opens a session.
+func accepted(t *testing.T, k key) bool {
+	t.Helper()
+	c, err := dialSSH(t, k, 120, 40)
+	if err != nil {
+		return false
+	}
+	_ = c.client.Close()
+	return true
+}
+
+// A shell ends with its session when its key leaves the list. What it
+// ran in the container may go on (the spec's §7): the test says whether
+// it did, and does not require either.
+func TestShellEndsWithItsKey(t *testing.T) {
+	inCluster(t)
+	full, ro := fullKey(t), readOnlyKey(t)
+	k := newKey(t, "carol@kosh-e2e")
+	setKeys(t, full.line, "read-only "+ro.line, k.line)
+	t.Cleanup(func() {
+		// The list as it was, and waited for.
+		setKeys(t, full.line, "read-only "+ro.line)
+		eventually(t, 150*time.Second, "the key of the test is refused again", func() bool { return !accepted(t, k) },
+			func() string { return "it is still accepted" })
+	})
+	// The kubelet updates a mounted ConfigMap in its own time.
+	eventually(t, 150*time.Second, "the key of the test is accepted", func() bool { return accepted(t, k) },
+		func() string { return "it is not" })
+
+	p := sshPTY(t, k, 120, 40)
+	p.openShell()
+	const orphan = "sleep 300"
+	before := running(t, "marker", orphan)
+	p.send(orphan + keyEnter)
+	eventually(t, wait, orphan+" runs in marker", func() bool { return running(t, "marker", orphan) > before },
+		func() string { return "the screen:\n" + p.scr.String() })
+	end := []string{"key", k.name, "action", "exec", "object", "pods/default/marker", "phase", "end"}
+	shells := len(logLines(t, "action", end...))
+
+	setKeys(t, full.line, "read-only "+ro.line)
+	changed := time.Now()
+	status := p.exitedWith(120 * time.Second)
+	t.Logf("ssh ended %v after the list changed, with status %d", time.Since(changed).Round(100*time.Millisecond), status)
+	if said := p.scr.String() + "\n" + ansi.Strip(p.scr.raw()); !strings.Contains(said, "this key is no longer accepted") {
+		t.Errorf("the client was not told that its key is no longer accepted:\n%s", p.scr)
+	}
+	var ended []string
+	eventually(t, wait, "kosh's log has the end of the shell", func() bool {
+		ended = logLines(t, "action", end...)
+		return len(ended) > shells
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	shell := ended[len(ended)-1]
+	t.Logf("kosh's log: %s", shell)
+	if !hasAttr(shell, "ended", "the session ended") {
+		t.Errorf("the shell's end line does not say ended=%q: %s", "the session ended", shell)
+	}
+	// A record of the limit the spec states, not a requirement.
+	t.Logf("%s in marker after its session ended: %d before it was typed, %d now", orphan, before, running(t, "marker", orphan))
 }
 
 // The last test: it restarts kosh. A stop tells every session first,
