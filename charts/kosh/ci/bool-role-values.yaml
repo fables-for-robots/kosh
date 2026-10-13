@@ -1,0 +1,5 @@
+state:
+  existingSecret: kosh-state
+rbac:
+  # A name YAML reads as a boolean when it is not quoted.
+  clusterRole: "true"
