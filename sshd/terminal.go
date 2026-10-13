@@ -94,6 +94,37 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 // left to the scheduler is what watchScreen is for.
 const minTurn = 10 * time.Millisecond
 
+// terminalReset is written to the client when a command has returned,
+// before the program takes the terminal back or the session says why it
+// ends. A command is given the terminal in its normal state, and what it
+// leaves is its own business: a full-screen program that was killed, or
+// a binary file printed, leaves modes that Bubble Tea, which sets only
+// what the program needs, would draw the program in for the rest of the
+// session. Each part undoes one thing; none clears the screen or moves
+// the cursor.
+const terminalReset = "" +
+	"\x1b[?1049l" + // the normal screen, not the alternate one
+	"\x1b[0m" + // no colour, no attribute
+	"\x1b(B" + // G0 is ASCII, not the line-drawing set
+	"\x0f" + // and G0 is the set in use (SI)
+	"\x1b[r" + // no scroll region: the margins are the screen's
+	"\x1b[?6l" + // positions count from the screen's corner, not the region's
+	"\x1b[?7h" + // a line that is full wraps
+	"\x1b[4l" + // characters replace, they are not inserted
+	"\x1b[?1l" + // the cursor keys send their normal sequences
+	"\x1b>" + // and the keypad its digits
+	"\x1b[?1000l" + // no mouse reports: of buttons,
+	"\x1b[?1002l" + // of drags,
+	"\x1b[?1003l" + // of every move,
+	"\x1b[?1005l" + // nor their encodings: UTF-8,
+	"\x1b[?1006l" + // SGR,
+	"\x1b[?1015l" + // urxvt
+	"\x1b[?1004l" + // no reports of focus
+	"\x1b[?2004l" + // a paste is not bracketed
+	"\x1b[?2026l" + // output is not held back for synchronised updates
+	"\x1b[=0u" + // no flags of the kitty keyboard protocol
+	"\x1b[?25h" // the cursor is shown
+
 // turn is the time one command has the terminal, as a tea.ExecCommand:
 // Bubble Tea calls Run in the program's event loop when it has released
 // the terminal, and takes the terminal back when Run has returned.
@@ -116,8 +147,9 @@ func (t *turn) SetStderr(io.Writer) {}
 
 // Run calls the command with the terminal, and returns what it
 // returned. When Run returns the turn is over: the command's reader is
-// told io.EOF, its writer is closed, and the input is the program's, for
-// the reader Bubble Tea starts next.
+// told io.EOF, its writer is closed, the terminal is reset to its normal
+// state (terminalReset), and the input is the program's, for the reader
+// Bubble Tea starts next.
 //
 // The command's context is done when the session ends, by the client or
 // by kosh, and from that moment the command reads io.EOF and its writes
@@ -135,6 +167,9 @@ func (t *turn) Run() error {
 		sess.in.cut(t.in)
 		out.close()
 	})
+	// called is set when the command is: a turn whose command was never
+	// called has nothing to undo.
+	called := false
 	defer func() {
 		stop()
 		cancel()
@@ -143,6 +178,13 @@ func (t *turn) Run() error {
 		// does not take ends with the channel or the connection.
 		sess.commandWaits(waitsForWrite)
 		out.close()
+		if called {
+			// Whatever the command left: see terminalReset. A session
+			// that ends here has it before its last message; a client
+			// that does not read holds this write up as it does the
+			// command's, and a connection that is gone refuses it.
+			_, _ = io.WriteString(sess.raw, terminalReset)
+		}
 		sess.commandWaits("")
 		sess.in.takeBack(t.in)
 		// See minTurn. What the command left unread waits for the
@@ -155,6 +197,7 @@ func (t *turn) Run() error {
 	if !sess.beginCommand(cancel) {
 		return ErrSessionEnded
 	}
+	called = true
 	size, resized, unwatch := sess.win.watch()
 	defer unwatch()
 	return t.run(ctx, Terminal{In: t.in, Out: out, Size: size, Resized: resized})

@@ -1511,7 +1511,10 @@ func TestScreenCheck(t *testing.T) {
 		defer sess.mu.Unlock()
 		return sess.screenTimer
 	}
-	releases := func() int { return strings.Count(tm.stdout.String(), "\x1b[?1049l") }
+	// The program's own leaving of the alternate screen is followed by
+	// its showing of the cursor; the reset's is not.
+	const release = "\x1b[?1049l\x1b[?25h"
+	releases := func() int { return strings.Count(tm.stdout.String(), release) }
 
 	tm.press("x")
 	hv.wait(t, "the model has the key", func() bool { return len(hv.keys) == 1 })
@@ -1685,4 +1688,74 @@ func TestSessionEndsWhileTheClientDoesNotRead(t *testing.T) {
 	}
 	h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" && r.Attrs["reason"] == MsgKeyRemoved })
 	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+}
+
+// leftModes is what a full-screen program that was killed leaves, and
+// more: the alternate screen, mouse reports, application cursor keys, a
+// scroll region with origin mode, the line-drawing set, a red
+// background.
+const leftModes = "\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[5;10r\x1b[?6h\x1b(0\x1b[41m"
+
+// TestTerminalIsResetAfterACommand has a command leave the terminal in
+// modes of its own: the first thing the client receives after the
+// command's last byte is the reset, before anything of the program's,
+// and the program's frame is then drawn as it would be on a terminal
+// nobody had touched.
+func TestTerminalIsResetAfterACommand(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+	tm.press("!")
+	turn := next(t, turns)
+	if _, err := io.WriteString(turn.t.Out, leftModes+"LASTBYTE"); err != nil {
+		t.Fatal(err)
+	}
+	tm.waitFor("LASTBYTE")
+	turn.finish <- nil
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.waitFor("done:1 ")
+
+	out := tm.stdout.String()
+	after := out[strings.Index(out, "LASTBYTE")+len("LASTBYTE"):]
+	t.Logf("the client received after the command's last byte: %q", after[:min(len(after), len(terminalReset)+60)])
+	if !strings.HasPrefix(after, terminalReset) {
+		t.Errorf("what the client received after the command's last byte does not begin with the reset")
+	}
+	if !strings.Contains(strings.TrimPrefix(after, terminalReset), "\x1b[?1049h") {
+		t.Error("the program did not take the terminal back after the reset")
+	}
+	want := strings.Join(handoverFrame(1, 80, 24), "\n")
+	eventually(t, "the model's frame fills the screen after the return", func() bool { return screenOf(tm).String() == want })
+}
+
+// TestTerminalIsResetWhenTheSessionEndsInACommand removes the key of a
+// session whose command has left the terminal in modes of its own: the
+// reset arrives before the session's last message.
+func TestTerminalIsResetWhenTheSessionEndsInACommand(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	h, tm := startHandover(t, hv)
+	tm.press("!")
+	turn := next(t, turns)
+	if _, err := io.WriteString(turn.t.Out, leftModes+"LASTBYTE"); err != nil {
+		t.Fatal(err)
+	}
+	tm.waitFor("LASTBYTE")
+	setKeys(t, h.list)
+	if status := tm.exit(); status != 1 {
+		t.Errorf("exit status %d, want 1", status)
+	}
+	out := tm.stdout.String()
+	after := out[strings.Index(out, "LASTBYTE")+len("LASTBYTE"):]
+	if !strings.HasPrefix(after, terminalReset) {
+		t.Errorf("what the client received after the command's last byte does not begin with the reset: %q", after[:min(len(after), 80)])
+	}
+	if !strings.HasSuffix(after, MsgKeyRemoved+"\r\n") {
+		t.Errorf("the client was not told %q at the end: %q", MsgKeyRemoved, after[max(0, len(after)-80):])
+	}
+	// The message is on the normal screen, in the first column.
+	scr := screenOf(tm).String()
+	if !strings.Contains("\n"+scr, "\n"+MsgKeyRemoved) {
+		t.Errorf("the session's last message is not at the start of a line of the screen:\n%s", scr)
+	}
 }
