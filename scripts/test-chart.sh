@@ -79,6 +79,7 @@ eq secret Deployment ".spec.template.metadata.annotations" null "no checksum ann
 eq secret Deployment "$D.hostNetwork" null "no host network"
 eq secret Deployment "$C.args | join(\" \")" "serve --ssh-listen=:2222 --iroh=true --iroh-relay=true --iroh-mdns=true --state-dir=/var/lib/kosh --authorized-keys=/etc/kosh/authorized_keys" "arguments"
 eq secret ClusterRoleBinding .roleRef.name cluster-admin "binds cluster-admin"
+eq secret ClusterRoleBinding .metadata.name kosh-cluster-admin "the binding is named for cluster-admin"
 count secret PersistentVolumeClaim 0
 count secret ServiceAccount 1
 count secret ConfigMap 1
@@ -131,6 +132,17 @@ eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("^read-
 # --- narrow-rbac
 render narrow-rbac
 eq narrow-rbac ClusterRoleBinding .roleRef.name view "binds view"
+eq narrow-rbac ClusterRoleBinding .metadata.name kosh-view "the binding is named for view"
+# A changed role is a new binding, which Helm makes and the old one it
+# removes: a binding's roleRef cannot be changed.
+[ "$(q secret ClusterRoleBinding .metadata.name)" != "$(q narrow-rbac ClusterRoleBinding .metadata.name)" ] ||
+  fail "narrow-rbac: the binding of view is named as that of cluster-admin"
+echo "ok   another role is another binding"
+
+# --- system-role
+render system-role
+eq system-role ClusterRoleBinding .roleRef.name system:aggregate-to-view "binds system:aggregate-to-view"
+eq system-role ClusterRoleBinding .metadata.name kosh-system:aggregate-to-view "the binding is named for system:aggregate-to-view"
 
 # --- the refusals
 # refuses NAME MESSAGE ARGS...: helm template with ARGS must fail with MESSAGE on standard error.
