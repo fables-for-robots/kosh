@@ -284,7 +284,7 @@ func TestInputIsTheOneReadersWhoseTurnItIs(t *testing.T) {
 	// The hand-over: the program's reader, which is waiting, gets the
 	// mark and then its end, and nothing of what the client sends.
 	waiting := readOnce(program)
-	command, drained, told := in.give()
+	command, drained, told := in.give(0)
 	if command == nil {
 		t.Fatal("the terminal was not given")
 	}
@@ -307,7 +307,7 @@ func TestInputIsTheOneReadersWhoseTurnItIs(t *testing.T) {
 	wantRead(t, "the command has the terminal", readOnce(command), "cd", nil)
 
 	// One command at a time.
-	if second, _, _ := in.give(); second != nil {
+	if second, _, _ := in.give(0); second != nil {
 		t.Error("the terminal was given to a second command")
 	}
 
@@ -322,7 +322,7 @@ func TestInputIsTheOneReadersWhoseTurnItIs(t *testing.T) {
 
 	// A turn that is cut short: the command is told the end, and what it
 	// has not read waits for the program.
-	command, _, _ = in.give()
+	command, _, _ = in.give(0)
 	wantRead(t, "the program's reader at the second hand-over", readOnce(program), drainMark, nil)
 	send("gh")
 	eventually(t, "the bytes are in", func() bool {
@@ -345,7 +345,7 @@ func TestInputIsTheOneReadersWhoseTurnItIs(t *testing.T) {
 		t.Fatal("the pump has not ended with the channel")
 	}
 	// No reader is left to tell: a hand-over does not wait for one.
-	command, drained, told = in.give()
+	command, drained, told = in.give(0)
 	if command == nil || !isClosed(drained) || !isClosed(told) {
 		t.Error("a hand-over after the program's reader has ended waits for that reader")
 	}
@@ -411,9 +411,14 @@ func TestInputIsBounded(t *testing.T) {
 	sess := h.onlySession()
 
 	// A paste, so that megabytes are one message for the model.
-	const size = 16 << 20
-	body := bytes.Repeat([]byte("0123456789abcdef"), size/16)
-	payload := append(append([]byte("\x1b[200~"), body...), "\x1b[201~"...)
+	// Pastes, so that megabytes are few messages for the model; each of
+	// less than pasteLimit, beyond which a paste is cut.
+	const size, pastes = 16 << 20, 32
+	body := bytes.Repeat([]byte("0123456789abcdef"), size/pastes/16)
+	var payload []byte
+	for range pastes {
+		payload = append(append(append(payload, pasteStart...), body...), pasteEnd...)
+	}
 
 	// The program does not read: its Update waits, and its read loop
 	// waits for it with the key after.
@@ -481,12 +486,12 @@ func TestInputIsBounded(t *testing.T) {
 	case <-time.After(longWait):
 		t.Fatalf("the client has sent %d of %d bytes", sent.Load(), len(payload))
 	}
-	hv.wait(t, "the model has the paste", func() bool { return len(hv.pastes) > 0 })
+	hv.wait(t, "the model has the pastes", func() bool { return len(hv.pastes) == pastes })
 	hv.mu.Lock()
-	got := hv.pastes[0]
+	got := strings.Join(hv.pastes, "")
 	hv.mu.Unlock()
-	if got != string(body) {
-		t.Errorf("the model was pasted %d bytes, want the %d that were sent, the same", len(got), len(body))
+	if got != strings.Repeat(string(body), pastes) {
+		t.Errorf("the model was pasted %d bytes, want the %d that were sent, the same", len(got), len(body)*pastes)
 	}
 	if n := buffered(); n > inputBuffer {
 		t.Errorf("the server holds %d bytes of input, more than its bound of %d", n, inputBuffer)
@@ -1757,5 +1762,272 @@ func TestTerminalIsResetWhenTheSessionEndsInACommand(t *testing.T) {
 	scr := screenOf(tm).String()
 	if !strings.Contains("\n"+scr, "\n"+MsgKeyRemoved) {
 		t.Errorf("the session's last message is not at the start of a line of the screen:\n%s", scr)
+	}
+}
+
+// heapNow returns the bytes of the heap that are in use after a
+// collection.
+func heapNow() int64 {
+	// Twice: what a finalizer frees is gone with the second.
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapAlloc)
+}
+
+// sendAll writes payload to the session in pieces, and returns where
+// the result will be and how much has been sent.
+func sendAll(tm *term, payload []byte) (<-chan error, *atomic.Int64) {
+	var sent atomic.Int64
+	wrote := make(chan error, 1)
+	go func() {
+		for rest := payload; len(rest) > 0; {
+			n, err := tm.stdin.Write(rest[:min(len(rest), 16<<10)])
+			sent.Add(int64(n))
+			if err != nil {
+				wrote <- err
+				return
+			}
+			rest = rest[n:]
+		}
+		wrote <- nil
+	}()
+	return wrote, &sent
+}
+
+// TestPasteToTheProgramIsBounded sends the program a paste of 16 MiB:
+// the model gets one paste, of pasteLimit bytes, properly ended, the keys
+// before and after it, and what the server holds meanwhile does not
+// grow with what the client sends. A paste within the limit is the
+// program's as it was sent.
+func TestPasteToTheProgramIsBounded(t *testing.T) {
+	hv := newHandover(nil)
+	_, tm := startHandover(t, hv)
+	const size = 16 << 20
+	body := bytes.Repeat([]byte("0123456789abcdef"), size/16)
+	payload := []byte("a" + pasteStart)
+	payload = append(payload, body...)
+	payload = append(payload, pasteEnd+"xyz"...)
+
+	before := heapNow()
+	wrote, sent := sendAll(tm, payload)
+	var most int64
+	sending := true
+	for deadline := time.Now().Add(longWait); sending || hv.typed() != "axyz"; {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %v: %d of %d bytes are sent, the model has the keys %q", longWait, sent.Load(), len(payload), hv.typed())
+		}
+		most = max(most, heapNow()-before)
+		select {
+		case err := <-wrote:
+			if err != nil {
+				t.Fatalf("sending: %v", err)
+			}
+			sending = false
+		case <-time.After(time.Millisecond):
+		}
+	}
+	hv.mu.Lock()
+	pastes := append([]string(nil), hv.pastes...)
+	hv.mu.Unlock()
+	if len(pastes) != 1 {
+		t.Fatalf("the model was given %d pastes, want 1", len(pastes))
+	}
+	t.Logf("of a paste of %d bytes the model was given %d; the heap grew by %d bytes at most while it was sent", size, len(pastes[0]), most)
+	if len(pastes[0]) > pasteLimit || len(pastes[0]) < pasteLimit-len(pasteEnd) || pastes[0] != string(body[:len(pastes[0])]) {
+		t.Errorf("the model was given a paste of %d bytes, want the first %d of what was sent", len(pastes[0]), pasteLimit)
+	}
+	// The library makes of the megabyte it is given a slice of runes, a
+	// string, and an event for every piece on the way: tens of megabytes
+	// for a moment, as measured, and the same however much the client
+	// sends. Without the limit this paste took 146 MB.
+	if most > 64<<20 {
+		t.Errorf("the heap grew by %d bytes while a paste of %d was sent", most, size)
+	}
+
+	// A paste within the limit, and what follows it.
+	small := strings.Repeat("0123456789abcdef", 64)
+	tm.press(pasteStart + small + pasteEnd + "b")
+	hv.wait(t, "the model has the second paste and the key after it", func() bool { return len(hv.pastes) == 2 && strings.Join(hv.keys, "") == "axyzb" })
+	if hv.pastes[1] != small {
+		t.Errorf("a paste of %d bytes reached the model as %d bytes", len(small), len(hv.pastes[1]))
+	}
+}
+
+// TestPasteThatNeverEnds sends megabytes after the start of a paste and
+// no end: the server takes them all off the channel and holds none of
+// what is beyond the limit, and the session ends as any other.
+func TestPasteThatNeverEnds(t *testing.T) {
+	hv := newHandover(nil)
+	h, tm := startHandover(t, hv)
+	sess := h.onlySession()
+	// SSH's window is 2 MiB: when the client has sent the last 3 MiB,
+	// the server has taken the 16 MiB before them off the channel, and
+	// out of its own buffer.
+	const size, more = 16 << 20, 3 << 20
+	payload := append([]byte(pasteStart), bytes.Repeat([]byte("0123456789abcdef"), (size+more)/16)...)
+
+	before := heapNow()
+	wrote, sent := sendAll(tm, payload)
+	select {
+	case err := <-wrote:
+		if err != nil {
+			t.Fatalf("sending: %v", err)
+		}
+	case <-time.After(longWait):
+		t.Fatalf("the client has sent %d of %d bytes of a paste that does not end", sent.Load(), len(payload))
+	}
+	grown := heapNow() - before
+	// What was sent is in both measurements.
+	runtime.KeepAlive(payload)
+	t.Logf("after %d bytes of a paste that does not end the heap has grown by %d bytes", size, grown)
+	if grown > 8<<20 {
+		t.Errorf("the heap grew by %d bytes for a paste of %d that does not end", grown, size)
+	}
+
+	setKeys(t, h.list)
+	if status := tm.exit(); status != 1 {
+		t.Errorf("exit status %d, want 1", status)
+	}
+	if out := tm.stdout.String(); !strings.HasSuffix(out, MsgKeyRemoved+"\r\n") {
+		t.Errorf("the client was not told %q at the end", MsgKeyRemoved)
+	}
+	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+	sess.in.mu.Lock()
+	defer sess.in.mu.Unlock()
+	if len(sess.in.buf) != 0 {
+		t.Errorf("the input of a session that has ended holds %d bytes", len(sess.in.buf))
+	}
+}
+
+// TestPasteToACommandIsWhole sends the same 16 MiB, with the marks of a
+// paste, while a command has the terminal: every byte is the command's.
+func TestPasteToACommandIsWhole(t *testing.T) {
+	const size = 16 << 20
+	payload := []byte(pasteStart)
+	payload = append(payload, bytes.Repeat([]byte("0123456789abcdef"), size/16)...)
+	payload = append(payload, pasteEnd...)
+	got := make(chan []byte, 1)
+	hv := newHandover(func(_ context.Context, tt Terminal) error {
+		b := make([]byte, len(payload))
+		n, _ := io.ReadFull(tt.In, b)
+		got <- b[:n]
+		return nil
+	})
+	_, tm := startHandover(t, hv)
+	tm.press("!")
+	hv.wait(t, "the command has begun", func() bool { return hv.began == 1 })
+	wrote, sent := sendAll(tm, payload)
+	select {
+	case b := <-got:
+		if !bytes.Equal(b, payload) {
+			t.Errorf("the command read %d bytes, want the %d that were sent, the same", len(b), len(payload))
+		}
+	case <-time.After(longWait):
+		t.Fatalf("the command has not read what was sent: %d of %d bytes are sent", sent.Load(), len(payload))
+	}
+	if err := <-wrote; err != nil {
+		t.Fatalf("sending: %v", err)
+	}
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+}
+
+// scan passes src through a pasteScanner in reads of the sizes given,
+// the last of them repeated, into a buffer of room bytes, and returns
+// what came out.
+func scan(src string, room int, sizes ...int) string {
+	var s pasteScanner
+	var out []byte
+	dst := make([]byte, room)
+	rest := []byte(src)
+	for i := 0; len(rest) > 0 || len(s.pending) > 0; i++ {
+		piece := rest[:min(len(rest), sizes[min(i, len(sizes)-1)])]
+		for len(piece) > 0 || len(s.pending) > 0 {
+			nd, ns := s.filter(dst, piece)
+			out = append(out, dst[:nd]...)
+			piece, rest = piece[ns:], rest[ns:]
+		}
+	}
+	return string(out)
+}
+
+// TestPasteScanner feeds the scanner what a client may send, in one
+// piece and cut at every place, into buffers large and of one byte: what
+// comes out is the same however it was cut.
+func TestPasteScanner(t *testing.T) {
+	big := strings.Repeat("0123456789abcdef", (pasteLimit+4096)/16)
+	cases := []struct{ name, in, want string }{
+		{"keys", "abc\x1b[A\x1b\x1bOP", "abc\x1b[A\x1b\x1bOP"},
+		{"a paste within the limit", "a" + pasteStart + "pasted" + pasteEnd + "b", "a" + pasteStart + "pasted" + pasteEnd + "b"},
+		{"an end without a start", "a" + pasteEnd + "b", "a" + pasteEnd + "b"},
+		{"what looks like a mark and is none", "\x1b[20x\x1b[200\x1b[201", "\x1b[20x\x1b[200\x1b[201"},
+		{"a paste beyond the limit", "a" + pasteStart + big + pasteEnd + "b" + pasteStart + "x" + pasteEnd, "a" + pasteStart + big[:pasteLimit] + pasteEnd + "b" + pasteStart + "x" + pasteEnd},
+		{"escapes in what is dropped", pasteStart + big + "\x1b[20\x1b[201\x1b\x1b[200~" + pasteEnd + "c", pasteStart + big[:pasteLimit] + pasteEnd + "c"},
+		{"a paste that does not end", pasteStart + big + big, pasteStart + big[:pasteLimit]},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := scan(c.in, 4096, len(c.in)); got != c.want {
+				t.Fatalf("in one piece: %d bytes came out, want %d", len(got), len(c.want))
+			}
+			if got := scan(c.in, 1, 7); got != c.want {
+				t.Fatalf("into a buffer of one byte: %d bytes came out, want %d", len(got), len(c.want))
+			}
+			// Cut in two at every place near a mark, and at every place
+			// when the input is short.
+			for cut := 1; cut < len(c.in); cut++ {
+				if len(c.in) > 200 && !strings.Contains(c.in[max(0, cut-8):min(len(c.in), cut+8)], "\x1b") && cut%4099 != 0 {
+					continue
+				}
+				if got := scan(c.in, 4096, cut, len(c.in)); got != c.want {
+					t.Fatalf("cut after %d bytes: %d bytes came out, want %d", cut, len(got), len(c.want))
+				}
+			}
+		})
+	}
+	// The end of a paste whose limit is reached in the middle of the end
+	// mark: the mark comes out whole, once.
+	for k := 1; k < len(pasteEnd); k++ {
+		body := big[:pasteLimit-k]
+		in := pasteStart + body + pasteEnd + "z"
+		if got := scan(in, 4096, len(in)); got != in {
+			t.Errorf("a paste that ends %d bytes before the limit: %d bytes came out, want the %d that went in", k, len(got), len(in))
+		}
+	}
+}
+
+// TestPasteMarkAcrossThePumpsBuffer sends a paste whose end mark lies
+// across the place where the session's buffer is full, and across two
+// reads of the program: the program is given the bytes as they were
+// sent, and the scanner knows the paste has ended.
+func TestPasteMarkAcrossThePumpsBuffer(t *testing.T) {
+	for split := 1; split < len(pasteEnd); split++ {
+		channel, client := io.Pipe()
+		in := newInput()
+		go in.pump(channel)
+		sent := pasteStart + strings.Repeat("x", inputBuffer-len(pasteStart)-split) + pasteEnd + "after"
+		go func() { _, _ = io.WriteString(client, sent) }()
+		eventually(t, "the buffer is full", func() bool {
+			in.mu.Lock()
+			defer in.mu.Unlock()
+			return len(in.buf) == inputBuffer
+		})
+		var got []byte
+		b := make([]byte, 1000)
+		for len(got) < len(sent) {
+			n, err := programInput{in}.Read(b)
+			if err != nil {
+				t.Fatalf("split %d: reading: %v", split, err)
+			}
+			got = append(got, b[:n]...)
+		}
+		in.mu.Lock()
+		inPaste := in.paste.in
+		in.mu.Unlock()
+		if string(got) != sent || inPaste {
+			t.Errorf("split %d: the program read %d bytes of %d, the same: %v; the scanner is in a paste: %v", split, len(got), len(sent), string(got) == sent, inPaste)
+		}
+		_ = client.Close()
 	}
 }

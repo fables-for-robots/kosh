@@ -1,6 +1,7 @@
 package sshd
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -40,7 +41,7 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 		}
 		// From here on what the client sends is the command's, and the
 		// program's reader is given the mark and its end.
-		in, drained, told := sess.in.give()
+		in, drained, told := sess.in.give(0)
 		if in == nil {
 			return tell(ErrTerminalBusy)
 		}
@@ -332,6 +333,132 @@ const (
 	drainWait = 250 * time.Millisecond
 )
 
+// A paste, as a terminal in bracketed paste mode sends it, and how much
+// of one the program is given.
+const (
+	pasteStart = "\x1b[200~"
+	pasteEnd   = "\x1b[201~"
+	// pasteLimit is how many bytes of one paste the program is given.
+	pasteLimit = 1 << 20
+)
+
+// pasteScanner is what the program's input passes on its way to the
+// program. Bubble Tea's reader collects a bracketed paste until its end
+// mark, however long that takes and however much comes before it: a
+// client that sends the start mark and then megabytes has the server
+// hold them all. So a paste is cut at pasteLimit: the scanner knows the
+// two marks, counts the bytes between them, and of what is beyond the
+// limit it hands nothing on until the end mark, which it hands on whole.
+// The program sees a paste of pasteLimit bytes at most, properly ended;
+// what was dropped is held nowhere.
+//
+// Nothing is held back to wait for more: a byte that may be the
+// beginning of a mark is handed on as what it is until then, since it
+// may as well be the Escape key.
+type pasteScanner struct {
+	// in is set between a start mark and its end mark.
+	in bool
+	// n is how many bytes of the paste have been handed on.
+	n int
+	// mark holds the last bytes handed in when they are the beginning of
+	// a mark, start or end: the two begin alike. passed is how many of
+	// them were handed on.
+	mark   []byte
+	passed int
+	// pending is what was to be handed on and found no room.
+	pending []byte
+}
+
+// filter hands the bytes of src on into dst. It returns how many bytes
+// it put into dst and how many of src it took, which are more when it
+// dropped some. It takes none while dst is full.
+func (s *pasteScanner) filter(dst, src []byte) (nd, ns int) {
+	nd = copy(dst, s.pending)
+	s.pending = s.pending[nd:]
+	for ns < len(src) && len(s.pending) == 0 && nd < len(dst) {
+		if len(s.mark) == 0 && src[ns] != '\x1b' {
+			// A run of bytes that are no part of a mark: all at once.
+			run := src[ns:]
+			if i := bytes.IndexByte(run, '\x1b'); i >= 0 {
+				run = run[:i]
+			}
+			if s.in {
+				left := pasteLimit - s.n
+				if left == 0 {
+					// Beyond the limit: dropped.
+					ns += len(run)
+					continue
+				}
+				run = run[:min(len(run), left)]
+			}
+			k := copy(dst[nd:], run)
+			if s.in {
+				s.n += k
+			}
+			nd, ns = nd+k, ns+k
+			continue
+		}
+		for _, b := range s.step(src[ns]) {
+			if nd < len(dst) {
+				dst[nd] = b
+				nd++
+			} else {
+				s.pending = append(s.pending, b)
+			}
+		}
+		ns++
+	}
+	return nd, ns
+}
+
+// step takes one byte that is, or may be, part of a mark, and returns
+// what is to be handed on for it: the byte, nothing when it is dropped,
+// or the end mark, as much of it as was not handed on yet.
+func (s *pasteScanner) step(b byte) []byte {
+	if n := len(s.mark); b != pasteStart[n] && b != pasteEnd[n] {
+		// Not a mark after all. An escape begins the next try.
+		s.mark, s.passed = s.mark[:0], 0
+		if b != '\x1b' {
+			return s.data(b)
+		}
+	}
+	s.mark = append(s.mark, b)
+	out := s.data(b)
+	if len(out) > 0 && s.passed == len(s.mark)-1 {
+		s.passed++
+	}
+	switch string(s.mark) {
+	case pasteEnd:
+		if s.in {
+			// Whole, whatever of it was dropped as a part of the paste.
+			out = append(out, pasteEnd[s.passed:]...)
+			s.in, s.n = false, 0
+		}
+	case pasteStart:
+		if !s.in {
+			s.in, s.n = true, 0
+		}
+	default:
+		if len(s.mark) < len(pasteStart) {
+			return out
+		}
+	}
+	s.mark, s.passed = s.mark[:0], 0
+	return out
+}
+
+// data returns b to be handed on, or nothing when b is a byte of a
+// paste beyond the limit.
+func (s *pasteScanner) data(b byte) []byte {
+	if s.in {
+		if s.n >= pasteLimit {
+			return nil
+		}
+		s.n++
+	}
+	return []byte{b}
+}
+
 // input is what the client sends on the session channel. One goroutine,
 // pump, reads the channel; the bytes wait in buf, inputBuffer of them at
 // most, for the one who has the terminal: the program, or the command
@@ -357,6 +484,12 @@ type input struct {
 	// gone is set when the program's reader was told err: the program
 	// reads no more.
 	gone bool
+
+	// paste is what the bytes pass on their way to the program, and
+	// only to the program: a command's input has backpressure of its
+	// own, and a large paste into a shell is the user's business. It
+	// begins anew whenever the terminal changes hands.
+	paste pasteScanner
 
 	// turn is the reader of the command that has the terminal, or nil
 	// when the program has it.
@@ -449,6 +582,20 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 		case c != nil && (in.turn != c || c.over):
 			// A command's reader after its turn.
 			return 0, io.EOF
+		case c == nil && (len(in.buf) > 0 || len(in.paste.pending) > 0):
+			// The program's bytes, through the scanner: see pasteScanner.
+			nd, ns := in.paste.filter(p, in.buf)
+			in.buf = in.buf[ns:]
+			if len(in.buf) == 0 {
+				in.buf = nil
+			}
+			in.cond.Broadcast()
+			if nd > 0 {
+				return nd, nil
+			}
+			// All of it was dropped: the pump has room, and the program
+			// waits for more.
+			continue
 		case len(in.buf) > 0:
 			n := copy(p, in.buf)
 			in.buf = in.buf[n:]
@@ -476,14 +623,14 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 // program's reader has been told io.EOF; both are closed already when
 // the program reads no more. give returns nil when a command has the
 // terminal.
-func (in *input) give() (c *commandInput, drained, told <-chan struct{}) {
+func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan struct{}) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	if in.turn != nil {
 		return nil, nil, nil
 	}
 	c = &commandInput{in: in}
-	in.turn = c
+	in.turn, in.paste = c, pasteScanner{}
 	d, t := make(chan struct{}), make(chan struct{})
 	if in.gone {
 		close(d)
@@ -524,6 +671,7 @@ func (in *input) takeBack(c *commandInput) {
 	c.over = true
 	if in.turn == c {
 		in.turn, in.mark, in.drained, in.told = nil, false, nil, nil
+		in.paste = pasteScanner{}
 	}
 	in.cond.Broadcast()
 }
