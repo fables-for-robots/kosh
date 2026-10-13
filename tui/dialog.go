@@ -209,10 +209,6 @@ type formDialog struct {
 	why string
 	// onOpen, when set, is called once, when the dialog is opened.
 	onOpen func()
-	// onCancel, when set, is called once, when the dialog closes with
-	// nothing done: on esc, on a button without a press (Cancel), and on
-	// Drop. It is not called after a button's press has closed it.
-	onCancel func()
 }
 
 // dialogConfirm returns a dialog that asks question about names,
@@ -301,31 +297,16 @@ func (d *formDialog) moveFocus(step int) {
 
 // Init calls onOpen.
 func (d *formDialog) Init() tea.Cmd {
-	d.opened()
+	d.Drop()
 	return nil
 }
 
-// Drop calls onOpen and onCancel, once each: what they release was held
-// until the dialog opened, or while it was open, and is released as well
-// when it is not opened or is closed by the root.
+// Drop calls onOpen, once: what it releases was held until the dialog
+// opened, and is released as well when it is not.
 func (d *formDialog) Drop() {
-	d.opened()
-	d.cancelled()
-}
-
-// opened calls onOpen, once.
-func (d *formDialog) opened() {
 	if d.onOpen != nil {
 		d.onOpen()
 		d.onOpen = nil
-	}
-}
-
-// cancelled calls onCancel, once.
-func (d *formDialog) cancelled() {
-	if d.onCancel != nil {
-		d.onCancel()
-		d.onCancel = nil
 	}
 }
 
@@ -354,7 +335,6 @@ func (d *formDialog) key(k tea.KeyPressMsg) tea.Cmd {
 	f := d.focused()
 	switch k.String() {
 	case "esc":
-		d.cancelled()
 		return closeDialog()
 	case "tab", "down":
 		d.moveFocus(1)
@@ -416,7 +396,6 @@ func (d *formDialog) key(k tea.KeyPressMsg) tea.Cmd {
 // press presses a button.
 func (d *formDialog) press(b formButton) tea.Cmd {
 	if b.press == nil {
-		d.cancelled()
 		return closeDialog()
 	}
 	cmd, why := b.press(d)
@@ -424,8 +403,6 @@ func (d *formDialog) press(b formButton) tea.Cmd {
 		d.why = why
 		return nil
 	}
-	// What onCancel would release is the press's now.
-	d.onCancel = nil
 	if b.after {
 		return tea.Sequence(closeDialog(), cmd)
 	}
