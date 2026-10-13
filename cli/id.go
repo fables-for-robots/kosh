@@ -25,11 +25,11 @@ func idCommand() *ucli.Command {
 		Action: func(c *ucli.Context) error {
 			dir := c.String("state-dir")
 			if dir == "" {
-				return errors.New("kosh id: --state-dir is required")
+				return errors.New("--state-dir is required")
 			}
 			st, err := state.Load(dir)
 			if err != nil {
-				return fmt.Errorf("kosh id: the state directory %s could not be loaded: %w", dir, err)
+				return fmt.Errorf("the state directory %s could not be loaded: %w", dir, err)
 			}
 			id := st.EndpointID()
 			_, err = fmt.Fprintf(c.App.Writer,

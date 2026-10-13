@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,8 @@ type serveOptions struct {
 	irohLocal bool
 	// idleStop is kube.Options.IdleStop. Zero means its default.
 	idleStop time.Duration
+	// stopTimeout bounds the stop. Zero means the constant stopTimeout.
+	stopTimeout time.Duration
 	// wrapTCP, when it is set, is given the TCP listener and returns
 	// the listener the SSH server is given in its place.
 	wrapTCP func(net.Listener) net.Listener
@@ -104,14 +107,14 @@ func serveCommand(runServe func(context.Context, serveOptions) error) *ucli.Comm
 // anything is started.
 func (o serveOptions) check() (bind netip.AddrPort, err error) {
 	if o.sshListen == "" && !o.iroh {
-		return bind, errors.New("kosh serve: both transports are off: set --ssh-listen or --iroh")
+		return bind, errors.New("both transports are off: set --ssh-listen or --iroh")
 	}
 	if o.iroh && !o.irohRelay && !o.irohMDNS {
-		return bind, errors.New("kosh serve: iroh is on and nobody could find it: set --iroh-relay or --iroh-mdns")
+		return bind, errors.New("iroh is on and nobody could find it: set --iroh-relay or --iroh-mdns")
 	}
 	if o.irohBind != "" {
 		if bind, err = netip.ParseAddrPort(o.irohBind); err != nil {
-			return bind, fmt.Errorf("kosh serve: --iroh-bind %q is not an address and port: %w", o.irohBind, err)
+			return bind, fmt.Errorf("--iroh-bind %q is not an address and port: %w", o.irohBind, err)
 		}
 	}
 	return bind, nil
@@ -133,10 +136,12 @@ const (
 // serve is kosh serve. It starts, in order, what kosh needs: the state
 // directory, the key list, the cluster, the SSH server and its
 // listeners. Each failure is one error that says which step failed, and
-// what was started before it is stopped again before serve returns.
+// what was started before it is stopped again before serve returns; a
+// step that fails because ctx is done is a stop, and serve returns nil.
 // serve then runs until ctx is done, and returns nil, or until a
-// listener fails, and returns its error. Either way it stops everything
-// it started, within stopTimeout.
+// listener stops by itself, and returns an error that names it. Either
+// way it stops everything it started, and returns after stopTimeout at
+// most, whether the stop has finished or not.
 func serve(ctx context.Context, o serveOptions) error {
 	bind, err := o.check()
 	if err != nil {
@@ -148,9 +153,17 @@ func serve(ctx context.Context, o serveOptions) error {
 	}
 	routeKlog(log)
 
+	timeout := o.stopTimeout
+	if timeout <= 0 {
+		timeout = stopTimeout
+	}
 	r := &running{log: log, failed: make(chan error, 2)}
 	if err := r.start(ctx, o, bind); err != nil {
-		r.stop()
+		r.stop(timeout)
+		if ctx.Err() != nil {
+			log.Info("kosh has stopped before it served")
+			return nil
+		}
 		return err
 	}
 
@@ -159,7 +172,7 @@ func serve(ctx context.Context, o serveOptions) error {
 	case <-ctx.Done():
 	case fail = <-r.failed:
 	}
-	r.stop()
+	r.stop(timeout)
 	log.Info("kosh has stopped")
 	return fail
 }
@@ -177,7 +190,10 @@ type running struct {
 	// wg counts the goroutines start started: the key list's Watch and
 	// each listener's Serve.
 	wg sync.WaitGroup
-	// failed receives the error of a Serve that failed.
+	// stopping is set when stop begins: a Serve that returns after it
+	// was asked to.
+	stopping atomic.Bool
+	// failed receives the error of a Serve that returned by itself.
 	failed chan error
 }
 
@@ -189,12 +205,12 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 
 	st, err := state.Load(o.stateDir)
 	if err != nil {
-		return fmt.Errorf("kosh serve: the state directory could not be loaded: %w", err)
+		return fmt.Errorf("the state directory could not be loaded: %w", err)
 	}
 
 	list, err := keys.Open(o.authorizedKeys, log)
 	if err != nil {
-		return fmt.Errorf("kosh serve: the key list could not be read: %w", err)
+		return fmt.Errorf("the key list could not be read: %w", err)
 	}
 	watchCtx, stopKeys := context.WithCancel(context.Background())
 	r.stopKeys = stopKeys
@@ -206,13 +222,13 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 
 	cfg, err := kube.RESTConfig(o.kubeconfig)
 	if err != nil {
-		return fmt.Errorf("kosh serve: the cluster's configuration could not be read: %w", err)
+		return fmt.Errorf("the cluster's configuration could not be read: %w", err)
 	}
 	kctx, cancel := context.WithTimeout(ctx, clusterTimeout)
 	r.cluster, err = kube.New(kctx, cfg, kube.Options{Log: log, UserAgent: "kosh/" + Version, IdleStop: o.idleStop})
 	cancel()
 	if err != nil {
-		return fmt.Errorf("kosh serve: the cluster could not be reached: %w", err)
+		return fmt.Errorf("the cluster could not be reached: %w", err)
 	}
 	cluster := r.cluster
 
@@ -226,19 +242,19 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("kosh serve: the SSH server could not be made: %w", err)
+		return fmt.Errorf("the SSH server could not be made: %w", err)
 	}
 
 	if o.sshListen != "" {
 		r.tcp, err = net.Listen("tcp", o.sshListen)
 		if err != nil {
-			return fmt.Errorf("kosh serve: the SSH port could not be bound: %w", err)
+			return fmt.Errorf("the SSH port could not be bound: %w", err)
 		}
 		l := r.tcp
 		if o.wrapTCP != nil {
 			l = o.wrapTCP(l)
 		}
-		r.serve(l, "tcp")
+		r.serve(l, "tcp", "ssh")
 	}
 
 	if o.iroh {
@@ -253,13 +269,11 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("kosh serve: the iroh endpoint could not be bound: %w", err)
+			return fmt.Errorf("the iroh endpoint could not be bound: %w", err)
 		}
-		r.serve(r.iroh, "iroh")
+		r.serve(r.iroh, "iroh", "iroh")
 	}
 
-	// The Cluster tells the API server's version only through a
-	// Session; one that is asked nothing else opens nothing.
 	args := []any{"version", Version}
 	if r.iroh != nil {
 		args = append(args, "endpoint", r.iroh.ID())
@@ -268,7 +282,7 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		args = append(args, "ssh", r.tcp.Addr().String())
 	}
 	args = append(args, "hostkey", st.HostKeyFingerprint(),
-		"cluster", cluster.Session(ctx, keys.Grant{}).ClusterVersion())
+		"cluster", cluster.Version())
 	log.Info("kosh is serving", args...)
 
 	if o.started != nil {
@@ -281,46 +295,100 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	return nil
 }
 
-// serve runs the server's Serve for l in a goroutine. An error of it is
-// sent to r.failed.
-func (r *running) serve(l net.Listener, transport string) {
+// serve runs the server's Serve for l, the transport transport, in a
+// goroutine. A Serve that returns before stop was asked for, with an
+// error or without, is sent to r.failed as the listener called name
+// having stopped.
+func (r *running) serve(l net.Listener, transport, name string) {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		if err := r.server.Serve(l, transport); err != nil {
-			r.failed <- fmt.Errorf("kosh serve: the %s listener failed: %w", transport, err)
+		err := r.server.Serve(l, transport)
+		if r.stopping.Load() {
+			return
+		}
+		if err != nil {
+			r.failed <- fmt.Errorf("the %s listener stopped: %w", name, err)
+		} else {
+			r.failed <- fmt.Errorf("the %s listener stopped", name)
 		}
 	}()
 }
 
-// stop stops what start started: the sessions are told and closed,
-// stopTimeout at most, the listeners closed, the key list no longer
-// read, and the cluster closed. It returns when every goroutine start
-// started has ended.
-func (r *running) stop() {
-	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+// stop stops what start started, in order: the sessions are told and
+// ended, the listeners closed, the key list no longer read, and the
+// cluster closed last. It returns when all of that has ended, or after
+// timeout, whichever comes first; then the log says what it was still
+// waiting for, and what has not ended goes on in its goroutine.
+func (r *running) stop(timeout time.Duration) {
+	r.stopping.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if r.server != nil {
-		if err := r.server.Shutdown(ctx); err != nil {
-			r.log.Warn("the sessions did not end in time: their connections are closed", "err", err)
+
+	var mu sync.Mutex
+	var waiting []string // what has not ended: what failed, then the step
+	step := ""
+	begin := func(what string) {
+		mu.Lock()
+		step = what
+		mu.Unlock()
+	}
+	failed := func(what string) {
+		mu.Lock()
+		waiting = append(waiting, what)
+		mu.Unlock()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if r.server != nil {
+			begin("the SSH server")
+			if err := r.server.Shutdown(ctx); err != nil {
+				failed("the sessions")
+			}
 		}
-	}
-	// Shutdown has closed the listeners that Serve was given; these
-	// close those it was not given yet, and do nothing more.
-	if r.tcp != nil {
-		_ = r.tcp.Close()
-	}
-	if r.iroh != nil {
-		if err := r.iroh.Close(); err != nil {
-			r.log.Warn("the iroh endpoint did not close cleanly", "err", err)
+		// Shutdown has closed the listeners that Serve was given; these
+		// close those it was not given yet, and do nothing more.
+		if r.tcp != nil {
+			begin("the SSH port")
+			_ = r.tcp.Close()
 		}
-	}
-	if r.stopKeys != nil {
-		r.stopKeys()
-	}
-	r.wg.Wait()
-	if r.cluster != nil {
-		r.cluster.Close()
+		if r.iroh != nil {
+			begin("the iroh endpoint")
+			if err := r.iroh.Close(); err != nil {
+				r.log.Warn("the iroh endpoint did not close cleanly", "err", err)
+			}
+		}
+		if r.stopKeys != nil {
+			r.stopKeys()
+		}
+		begin("the listeners and the key list")
+		r.wg.Wait()
+		if r.cluster != nil {
+			begin("the cluster")
+			r.cluster.Close()
+		}
+		begin("")
+	}()
+
+	select {
+	case <-done:
+		mu.Lock()
+		defer mu.Unlock()
+		if len(waiting) > 0 {
+			r.log.Warn("kosh did not stop in time", "waiting_for", strings.Join(waiting, ", "), "timeout", timeout)
+		}
+	case <-ctx.Done():
+		mu.Lock()
+		defer mu.Unlock()
+		if step != "" {
+			waiting = append(waiting, step)
+		}
+		if len(waiting) == 0 {
+			return // it ended as the time ran out
+		}
+		r.log.Warn("kosh did not stop in time", "waiting_for", strings.Join(waiting, ", "), "timeout", timeout)
 	}
 }
 
@@ -331,10 +399,10 @@ var (
 	klogOnce sync.Once
 )
 
-// routeKlog sends what client-go logs through klog to log, at debug
-// level, instead of to standard error. klog is set once for the
-// process, before any of client-go runs; after that only the log it
-// goes to changes.
+// routeKlog sends what client-go logs through klog at verbosity 0, and
+// its errors, to log, at debug level, instead of to standard error.
+// klog is set once for the process, before any of client-go runs; after
+// that only the log it goes to changes.
 func routeKlog(log *slog.Logger) {
 	klogTo.Store(log)
 	klogOnce.Do(func() {
@@ -342,10 +410,14 @@ func routeKlog(log *slog.Logger) {
 	})
 }
 
-// klogHandler hands every record to the handler of klogTo at debug
-// level: what client-go has to say, such as a reflector's failed list
-// or watch, is noise next to what kosh logs, and the table that list
-// was for shows its error.
+// klogHandler hands the records of klog's verbosity 0, and its errors,
+// to the handler of klogTo at debug level: what client-go has to say,
+// such as a reflector's failed list or watch, is noise next to what kosh
+// logs, and the table that list was for shows its error. A record of a
+// higher verbosity, which logr gives a level below info, is dropped
+// whatever the level of the log: client-go logs the bodies of requests
+// and responses there, and a Secret's YAML or an edit's text must not
+// reach the log.
 type klogHandler struct {
 	// with are the WithAttrs and WithGroup made of this handler, applied
 	// to the handler of klogTo when a record is handled.
@@ -360,12 +432,15 @@ func (h klogHandler) target() slog.Handler {
 	return t
 }
 
-func (h klogHandler) Enabled(ctx context.Context, _ slog.Level) bool {
-	return klogTo.Load().Handler().Enabled(ctx, slog.LevelDebug)
+func (h klogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return level >= slog.LevelInfo && klogTo.Load().Handler().Enabled(ctx, slog.LevelDebug)
 }
 
 func (h klogHandler) Handle(ctx context.Context, rec slog.Record) error {
 	// logr hands an error over without asking Enabled first.
+	if rec.Level < slog.LevelInfo {
+		return nil
+	}
 	t := h.target()
 	if !t.Enabled(ctx, slog.LevelDebug) {
 		return nil

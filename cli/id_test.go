@@ -56,7 +56,7 @@ func TestIDIsStable(t *testing.T) {
 func TestIDNeedsStateDir(t *testing.T) {
 	unsetenv(t, "KOSH_STATE_DIR")
 	out, _, err := run(t, App(), "id")
-	if err == nil || err.Error() != "kosh id: --state-dir is required" {
+	if err == nil || err.Error() != "--state-dir is required" {
 		t.Errorf("error %v", err)
 	}
 	if out != "" {
@@ -82,8 +82,8 @@ func TestIDFailsOnABadStateDir(t *testing.T) {
 	// A key file that does not parse is an error, and is left as it is.
 	writeFile(t, dir+"/iroh.key", "not a key\n")
 	out, _, err := run(t, App(), "id", "--state-dir", dir)
-	if err == nil || !strings.HasPrefix(err.Error(), "kosh id: ") || !strings.Contains(err.Error(), dir) {
-		t.Errorf("error %v, want one of kosh id that names the directory", err)
+	if err == nil || !strings.HasPrefix(err.Error(), "the state directory ") || !strings.Contains(err.Error(), dir) {
+		t.Errorf("error %v, want one that names the directory", err)
 	}
 	if out != "" {
 		t.Errorf("printed %q", out)

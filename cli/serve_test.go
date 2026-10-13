@@ -130,14 +130,14 @@ func refused(t *testing.T, args ...string) error {
 
 func TestServeRefusesBothTransportsOff(t *testing.T) {
 	err := refused(t, "--ssh-listen", "", "--iroh=false")
-	if err == nil || err.Error() != "kosh serve: both transports are off: set --ssh-listen or --iroh" {
+	if err == nil || err.Error() != "both transports are off: set --ssh-listen or --iroh" {
 		t.Errorf("error %v", err)
 	}
 }
 
 func TestServeRefusesIrohNobodyCanFind(t *testing.T) {
 	err := refused(t, "--iroh-relay=false", "--iroh-mdns=false")
-	if err == nil || err.Error() != "kosh serve: iroh is on and nobody could find it: set --iroh-relay or --iroh-mdns" {
+	if err == nil || err.Error() != "iroh is on and nobody could find it: set --iroh-relay or --iroh-mdns" {
 		t.Errorf("error %v", err)
 	}
 }
@@ -145,7 +145,7 @@ func TestServeRefusesIrohNobodyCanFind(t *testing.T) {
 func TestServeRefusesBadBind(t *testing.T) {
 	for _, bind := range []string{"nonsense", "127.0.0.1", ":4433", "localhost:4433"} {
 		err := refused(t, "--iroh-bind", bind)
-		if err == nil || !strings.Contains(err.Error(), "--iroh-bind") || !strings.Contains(err.Error(), `"`+bind+`"`) {
+		if err == nil || !strings.HasPrefix(err.Error(), "--iroh-bind ") || !strings.Contains(err.Error(), `"`+bind+`"`) {
 			t.Errorf("--iroh-bind %s: error %v, want one that names the flag and the value", bind, err)
 		}
 	}
@@ -325,8 +325,8 @@ func TestServeFailsOnBadStateDir(t *testing.T) {
 		sshListen: freePort(t), stateDir: dir, authorizedKeys: keyListFile(t),
 		kubeconfig: unreachableKubeconfig(t), log: (&recorder{}).logger(),
 	})
-	if err == nil || !strings.HasPrefix(err.Error(), "kosh serve: ") ||
-		!strings.Contains(err.Error(), "state directory") || !strings.Contains(err.Error(), dir) {
+	if err == nil || !strings.HasPrefix(err.Error(), "the state directory could not be loaded") ||
+		!strings.Contains(err.Error(), dir) {
 		t.Errorf("error %v, want one that says the state directory could not be loaded", err)
 	}
 }
@@ -338,7 +338,7 @@ func TestServeFailsOnMissingKeyList(t *testing.T) {
 		sshListen: freePort(t), stateDir: t.TempDir(), authorizedKeys: path,
 		kubeconfig: unreachableKubeconfig(t), log: (&recorder{}).logger(),
 	})
-	if err == nil || !strings.HasPrefix(err.Error(), "kosh serve: the key list could not be read") ||
+	if err == nil || !strings.HasPrefix(err.Error(), "the key list could not be read") ||
 		!strings.Contains(err.Error(), path) || !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("error %v, want one that says the key list could not be read and names %s", err, path)
 	}
@@ -352,7 +352,7 @@ func TestServeFailsOnMissingKubeconfig(t *testing.T) {
 		sshListen: freePort(t), stateDir: t.TempDir(), authorizedKeys: keyListFile(t),
 		kubeconfig: path, log: (&recorder{}).logger(),
 	})
-	if err == nil || !strings.HasPrefix(err.Error(), "kosh serve: ") || !strings.Contains(err.Error(), path) {
+	if err == nil || !strings.HasPrefix(err.Error(), "the cluster's configuration could not be read") || !strings.Contains(err.Error(), path) {
 		t.Errorf("error %v, want one that names %s", err, path)
 	}
 	noGoroutinesLeft(t, before)
@@ -369,7 +369,7 @@ func TestServeFailsOnUnreachableCluster(t *testing.T) {
 	if took := time.Since(start); took > clusterTimeout {
 		t.Errorf("took %v", took)
 	}
-	if err == nil || !strings.HasPrefix(err.Error(), "kosh serve: the cluster could not be reached") {
+	if err == nil || !strings.HasPrefix(err.Error(), "the cluster could not be reached") {
 		t.Errorf("error %v, want one that says the cluster could not be reached", err)
 	}
 	portIsFree(t, addr)
@@ -411,4 +411,115 @@ func TestKlogGoesToTheLogAtDebug(t *testing.T) {
 	if buf.Len() > 0 {
 		t.Errorf("written at info level: %s", buf.String())
 	}
+}
+
+// What client-go logs at a verbosity above 0, request and response
+// bodies among it, never reaches the log, even at debug level: a
+// Secret's YAML and the text of an edit are such bodies.
+func TestKlogVerboseLinesAreDropped(t *testing.T) {
+	var buf bytes.Buffer
+	routeKlog(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ctx := klog.NewContext(context.Background(), klog.Background())
+	klog.FromContext(ctx).V(2).Info("Request Body", "body", "SECRETVALUE")
+	klog.Background().V(7).Info("Response Body", "body", "SECRETVALUE")
+	klog.Background().V(1).Info("verbose", "body", "SECRETVALUE")
+	klog.Background().Info("an informational line of klog")
+	klog.Background().Error(errors.New("boom"), "an error of klog")
+	klog.Flush()
+	out := buf.String()
+	if strings.Contains(out, "SECRETVALUE") {
+		t.Errorf("a verbose line is in the log:\n%s", out)
+	}
+	for _, want := range []string{`level=DEBUG msg="an informational line of klog"`, `level=DEBUG msg="an error of klog"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %s in the log:\n%s", want, out)
+		}
+	}
+}
+
+// A stop asked for while the cluster is being reached is a stop: serve
+// returns nil at once, and leaves nothing behind.
+func TestServeStopDuringStart(t *testing.T) {
+	// An API server that accepts connections and never answers.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	accepted := make(chan struct{}, 1)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			select {
+			case accepted <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	writeFile(t, kubeconfig, `apiVersion: v1
+kind: Config
+clusters:
+- name: silent
+  cluster: {server: "https://`+l.Addr().String()+`", insecure-skip-tls-verify: true}
+users:
+- name: me
+  user: {token: nothing}
+contexts:
+- name: silent
+  context: {cluster: silent, user: me}
+current-context: silent
+`)
+
+	before := runtime.NumGoroutine()
+	addr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serve(ctx, serveOptions{
+			sshListen: addr, stateDir: t.TempDir(), authorizedKeys: keyListFile(t),
+			kubeconfig: kubeconfig, log: (&recorder{}).logger(),
+		})
+	}()
+	select {
+	case <-accepted:
+	case err := <-done:
+		t.Fatalf("serve returned %v before it reached the API server", err)
+	case <-time.After(waitTime):
+		t.Fatal("serve has not reached the API server")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serve returned %v after a stop that was asked for", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve has not returned 2 seconds after its context was cancelled")
+	}
+	portIsFree(t, addr)
+	// net/http goes on with a TLS handshake it began, for its pool,
+	// after the request was cancelled; the API server that never
+	// answers ends it here.
+	mu.Lock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	mu.Unlock()
+	noGoroutinesLeft(t, before+1) // the API server's Accept
 }

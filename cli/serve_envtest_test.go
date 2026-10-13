@@ -659,7 +659,7 @@ func TestServeFailsOnPortInUse(t *testing.T) {
 	defer func() { _ = l.Close() }()
 	o := envOptions(t, cfg, newUser(t, "alice", false))
 	o.sshListen = l.Addr().String()
-	failsLeavingNothing(t, o, "kosh serve: the SSH port could not be bound")
+	failsLeavingNothing(t, o, "the SSH port could not be bound")
 }
 
 // The iroh endpoint is bound after the SSH port, whose Serve runs by
@@ -674,14 +674,16 @@ func TestServeFailsWhenIrohCannotBind(t *testing.T) {
 	o := envOptions(t, cfg, newUser(t, "alice", false))
 	o.sshListen = freePort(t)
 	o.iroh, o.irohLocal, o.irohBind = true, true, pc.LocalAddr().String()
-	failsLeavingNothing(t, o, "kosh serve: the iroh endpoint could not be bound")
+	failsLeavingNothing(t, o, "the iroh endpoint could not be bound")
 	portIsFree(t, o.sshListen)
 }
 
 // failingListener is a listener whose Accept fails, once it is told to,
-// with an error that is not temporary.
+// with err: one that is not temporary, or net.ErrClosed as if it had
+// been closed.
 type failingListener struct {
 	net.Listener
+	err  error
 	fail chan struct{}
 }
 
@@ -701,17 +703,19 @@ func (l *failingListener) Accept() (net.Conn, error) {
 	case r := <-got:
 		return r.c, r.err
 	case <-l.fail:
-		return nil, errAcceptBroke
+		return nil, l.err
 	}
 }
 
-// A listener that fails ends serve with its error, and everything is
-// stopped as for a stop that was asked for.
-func TestServeListenerFails(t *testing.T) {
+// listenerEnds runs serve with a TCP listener that fails with err once
+// a session runs, and returns serve's error. Everything is stopped as
+// for a stop that was asked for.
+func listenerEnds(t *testing.T, err error) error {
+	t.Helper()
 	cfg := startAPIServer(t)
 	alice := newUser(t, "alice", false)
 	o := envOptions(t, cfg, alice)
-	fl := &failingListener{fail: make(chan struct{})}
+	fl := &failingListener{err: err, fail: make(chan struct{})}
 	o.wrapTCP = func(l net.Listener) net.Listener {
 		fl.Listener = l
 		return fl
@@ -721,11 +725,9 @@ func TestServeListenerFails(t *testing.T) {
 	c.waitFor(t, "Pods(default)")
 
 	close(fl.fail)
+	var got error
 	select {
-	case err := <-k.done:
-		if !errors.Is(err, errAcceptBroke) || !strings.HasPrefix(err.Error(), "kosh serve: ") {
-			t.Errorf("serve returned %v, want the listener's error", err)
-		}
+	case got = <-k.done:
 	case <-time.After(stopTimeout):
 		t.Fatalf("serve has not returned %v after its listener failed", stopTimeout)
 	}
@@ -738,5 +740,77 @@ func TestServeListenerFails(t *testing.T) {
 	}
 	if _, ok := k.log.find("kosh has stopped"); !ok {
 		t.Errorf("no line kosh has stopped:\n%s", k.log.dump())
+	}
+	return got
+}
+
+// A listener that fails ends serve with its error.
+func TestServeListenerFails(t *testing.T) {
+	err := listenerEnds(t, errAcceptBroke)
+	if !errors.Is(err, errAcceptBroke) || !strings.HasPrefix(err.Error(), "the ssh listener stopped: ") {
+		t.Errorf("serve returned %v, want the listener's error", err)
+	}
+}
+
+// A listener that ends as if it had been closed, which Serve takes for
+// a stop and returns nil for, ends serve too: kosh does not go on
+// without a transport.
+func TestServeListenerStopsByItself(t *testing.T) {
+	err := listenerEnds(t, &net.OpError{Op: "accept", Net: "tcp", Err: net.ErrClosed})
+	if err == nil || err.Error() != "the ssh listener stopped" {
+		t.Errorf("serve returned %v, want: the ssh listener stopped", err)
+	}
+}
+
+// blockingListener is a listener whose Close does not return until
+// release is closed.
+type blockingListener struct {
+	net.Listener
+	release chan struct{}
+}
+
+func (l *blockingListener) Close() error {
+	<-l.release
+	return l.Listener.Close()
+}
+
+// A stop that cannot finish is given up on after stopTimeout: serve
+// returns, and the log says what it was still waiting for.
+func TestServeStopIsBounded(t *testing.T) {
+	cfg := startAPIServer(t)
+	alice := newUser(t, "alice", false)
+	o := envOptions(t, cfg, alice)
+	bl := &blockingListener{release: make(chan struct{})}
+	o.wrapTCP = func(l net.Listener) net.Listener {
+		bl.Listener = l
+		return bl
+	}
+	o.stopTimeout = 300 * time.Millisecond
+	k := startKosh(t, o)
+	t.Cleanup(func() { close(bl.release) })
+	c := dialTCP(t, k, alice)
+	c.waitFor(t, "Pods(default)")
+
+	start := time.Now()
+	k.cancel()
+	select {
+	case err := <-k.done:
+		if err != nil {
+			t.Errorf("serve returned %v after a stop that was asked for", err)
+		}
+	case <-time.After(o.stopTimeout + time.Second):
+		t.Fatalf("serve has not returned %v after its context was cancelled", o.stopTimeout+time.Second)
+	}
+	t.Logf("returned in %v", time.Since(start))
+	k.done <- nil // for the cleanup
+
+	var warned *record
+	for _, r := range k.log.records() {
+		if r.Level == slog.LevelWarn && r.Msg == "kosh did not stop in time" {
+			warned = &r
+		}
+	}
+	if warned == nil || !strings.Contains(warned.Attrs["waiting_for"], "the SSH server") {
+		t.Errorf("no warning that names the SSH server:\n%s", k.log.dump())
 	}
 }
