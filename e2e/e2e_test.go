@@ -18,20 +18,28 @@ package e2e
 // key out of the list and comes last.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -447,6 +455,106 @@ func (c *goSession) alive() bool {
 	}
 }
 
+// A ptySession is a program, ssh or iroh-ssh, run on a pseudo-terminal
+// as a user runs it.
+type ptySession struct {
+	term
+	cmd    *exec.Cmd
+	ptmx   *os.File
+	exited chan error
+}
+
+// startPTY starts cmd on a pseudo-terminal of w by h, with TERM set as a
+// terminal emulator sets it.
+func startPTY(t *testing.T, cmd *exec.Cmd, w, h int) *ptySession {
+	t.Helper()
+	cmd.Env = append(cmd.Environ(), "TERM=xterm-256color")
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
+	if err != nil {
+		t.Fatalf("starting %s: %v", cmd.Path, err)
+	}
+	p := &ptySession{cmd: cmd, ptmx: ptmx, exited: make(chan error, 1)}
+	p.term = term{t: t, scr: newScreen(w, h), in: ptmx, what: filepath.Base(cmd.Path)}
+	copied := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(p.scr, ptmx) // ends with EIO once the program has exited
+		close(copied)
+	}()
+	go func() {
+		err := cmd.Wait()
+		select {
+		case <-copied:
+		case <-time.After(time.Second):
+		}
+		p.exited <- err
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = ptmx.Close()
+	})
+	return p
+}
+
+// exitedWith waits for the program to exit and returns its status.
+func (p *ptySession) exitedWith(within time.Duration) int {
+	p.t.Helper()
+	select {
+	case err := <-p.exited:
+		p.exited <- err
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return exit.ExitCode()
+		}
+		if err != nil {
+			p.t.Fatalf("%s: %v", p.what, err)
+		}
+		return 0
+	case <-time.After(within):
+		p.t.Fatalf("%s has not exited in %v; the screen:\n%s", p.what, within, p.scr)
+		return -1
+	}
+}
+
+// knownHosts writes a known_hosts file with kosh's host key for the
+// forwarded port, for the real ssh to check it against.
+func knownHosts(t *testing.T) string {
+	t.Helper()
+	host, port, err := net.SplitHostPort(cfg.sshAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := knownHostsLine(fmt.Sprintf("[%s]:%s", host, port), hostKey(t))
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func knownHostsLine(host string, k ssh.PublicKey) string {
+	return host + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k)))
+}
+
+// sshCommand is the real ssh, to kosh over the forwarded port as k,
+// with the host key checked and nothing of the user's configuration:
+// ssh with options, the destination, and command.
+func sshCommand(t *testing.T, k key, options []string, command ...string) *exec.Cmd {
+	t.Helper()
+	host, port, err := net.SplitHostPort(cfg.sshAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := []string{
+		"-F", "/dev/null", "-p", port, "-i", k.file,
+		"-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + knownHosts(t), "-o", "GlobalKnownHostsFile=/dev/null",
+	}
+	all = append(all, options...)
+	all = append(all, "kosh@"+host)
+	all = append(all, command...)
+	return exec.Command("ssh", all...)
+}
+
 // serverVersion is the API server's version, as kubectl has it.
 func serverVersion(t *testing.T) string {
 	t.Helper()
@@ -703,4 +811,174 @@ func TestReadOnlyKey(t *testing.T) {
 	eventually(t, wait, "kosh's log has a refused line", func() bool {
 		return len(logLines(t, "refused", "key", k.name)) > 0
 	}, func() string { return "kosh's log:\n" + koshLog(t) })
+}
+
+func TestUnknownKeyIsRefused(t *testing.T) {
+	inCluster(t)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger := key{signer: signer, name: "stranger"}
+	if c, err := dialSSH(t, stranger, 120, 40); err == nil {
+		c.client.Close()
+		t.Fatal("a key that is not in the list was accepted")
+	} else if !strings.Contains(err.Error(), "unable to authenticate") {
+		t.Fatalf("a key that is not in the list: %v, want a failed handshake", err)
+	}
+}
+
+// runSSH runs the real ssh without a terminal and returns what it wrote
+// on standard error and its exit status.
+func runSSH(t *testing.T, cmd *exec.Cmd) (string, int) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, &stdout, &stderr
+	err := cmd.Run()
+	var exit *exec.ExitError
+	switch {
+	case err == nil:
+		return stdout.String() + stderr.String(), 0
+	case errors.As(err, &exit):
+		return stdout.String() + stderr.String(), exit.ExitCode()
+	default:
+		t.Fatal(err)
+		return "", -1
+	}
+}
+
+func TestNoCommandNoShell(t *testing.T) {
+	inCluster(t)
+	k := fullKey(t)
+	out, status := runSSH(t, sshCommand(t, k, []string{"-T"}, "ls"))
+	if status != 1 || !strings.Contains(out, "kosh runs no commands") {
+		t.Errorf("ssh -T kosh ls: status %d, output:\n%s\nwant status 1 and kosh runs no commands", status, out)
+	}
+	out, status = runSSH(t, sshCommand(t, k, []string{"-T"}))
+	if status != 1 || !strings.Contains(out, "kosh needs a terminal") {
+		t.Errorf("ssh -T kosh: status %d, output:\n%s\nwant status 1 and kosh needs a terminal", status, out)
+	}
+}
+
+// logStreams is how many requests for a pod's log the API server is
+// serving now, by its gauge of long-running requests.
+func logStreams(t *testing.T) int {
+	t.Helper()
+	metrics := kubectl(t, "get", "--raw", "/metrics")
+	n, found := 0, false
+	sc := bufio.NewScanner(strings.NewReader(metrics))
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		l := sc.Text()
+		if !strings.HasPrefix(l, "apiserver_longrunning_requests{") {
+			continue
+		}
+		found = true
+		if !strings.Contains(l, `resource="pods"`) || !strings.Contains(l, `subresource="log"`) {
+			continue
+		}
+		f := strings.Fields(l)
+		v, err := strconv.ParseFloat(f[len(f)-1], 64)
+		if err != nil {
+			t.Fatalf("%q: %v", l, err)
+		}
+		n += int(v)
+	}
+	if !found {
+		t.Fatal("the API server has no gauge apiserver_longrunning_requests")
+	}
+	return n
+}
+
+// A client that vanishes, killed instead of quitting, ends its session,
+// and the log it was following is no longer read.
+func TestVanishedClientEndsItsSession(t *testing.T) {
+	inCluster(t)
+	k := fullKey(t)
+	eventually(t, wait, "no pod's log is being read", func() bool { return logStreams(t) == 0 },
+		func() string { return fmt.Sprintf("%d logs are read", logStreams(t)) })
+	before := len(logLines(t, "session start", "key", k.name))
+
+	p := startPTY(t, sshCommand(t, k, []string{"-t"}), 120, 40)
+	p.waitRow("marker", "Running")
+	p.send("l")
+	p.waitFor("kosh-e2e-marker")
+	eventually(t, wait, "the API server serves the marker's log", func() bool { return logStreams(t) > 0 },
+		func() string { return "the screen:\n" + p.scr.String() })
+
+	var start string
+	eventually(t, wait, "kosh's log has the session's start", func() bool {
+		lines := logLines(t, "session start", "key", k.name)
+		if len(lines) <= before {
+			return false
+		}
+		start = lines[len(lines)-1]
+		return true
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	remote := regexp.MustCompile(`remote=(\S+)`).FindStringSubmatch(start)
+	if remote == nil {
+		t.Fatalf("the session's start names no remote: %s", start)
+	}
+
+	if err := p.cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, wait, "kosh's log has the end of the session of "+remote[1], func() bool {
+		return len(logLines(t, "session end", "remote", remote[1])) > 0
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	eventually(t, wait, "the marker's log is no longer read", func() bool { return logStreams(t) == 0 },
+		func() string { return fmt.Sprintf("%d logs are read", logStreams(t)) })
+}
+
+// setKeys installs the chart again with the key list of lines, keeping
+// every other value.
+func setKeys(t *testing.T, lines ...string) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "authorized_keys")
+	if err := os.WriteFile(file, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("helm", "upgrade", release, chart, "--namespace", namespace, "--reuse-values",
+		"--set-file", "authorizedKeys="+file); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Last: it takes the read-only key out of the list.
+func TestKeyRemovedEndsTheSession(t *testing.T) {
+	inCluster(t)
+	full, ro := fullKey(t), readOnlyKey(t)
+	f := connect(t, full, 120, 40)
+	f.waitFor("Pods(default)", full.name)
+	r := connect(t, ro, 120, 40)
+	r.waitFor("Pods(default)", ro.name+" [read-only]")
+
+	setKeys(t, full.line)
+	t.Cleanup(func() { setKeys(t, full.line, "read-only "+ro.line) })
+
+	// The kubelet updates a mounted ConfigMap in its own time.
+	err := r.ended(120 * time.Second)
+	var exit *ssh.ExitError
+	if !errors.As(err, &exit) || exit.ExitStatus() != 1 {
+		t.Errorf("the read-only key's session ended with %v, want status 1", err)
+	}
+	said := r.scr.String() + "\n" + r.stderr.String()
+	if !strings.Contains(said, "this key is no longer accepted") {
+		t.Errorf("the session was not told that its key is no longer accepted:\n%s", said)
+	}
+
+	if !f.alive() {
+		t.Fatal("the full key's session ended too")
+	}
+	f.send(":ns" + keyEnter)
+	f.waitFor("Namespaces(all)")
+	f.waitRow("kosh")
+
+	if _, err := dialSSH(t, ro, 120, 40); err == nil {
+		t.Error("the read-only key is still accepted for a new connection")
+	}
 }
