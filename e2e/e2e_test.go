@@ -14,8 +14,9 @@ package e2e
 // screen model of screen_test.go.
 //
 // The tests of the cluster run in the order of this file, against one
-// cluster and one kosh: TestKeyRemovedEndsTheSession takes the read-only
-// key out of the list and comes last.
+// cluster and one kosh: TestRoleCanBeChanged and
+// TestKeyRemovedEndsTheSession change kosh's role and its key list, and
+// put them back; TestStopTellsTheSessions restarts kosh and comes last.
 
 import (
 	"bufio"
@@ -780,13 +781,19 @@ func TestSSHKillAsksFirst(t *testing.T) {
 // secretValue is the value of the Secret hidden.
 const secretValue = "kosh-e2e-secret-value"
 
+// secretBase64 is the Secret's value as the YAML of the Secret has it,
+// and as a copy of it to the clipboard (OSC 52) would carry the text.
+var secretBase64 = base64.StdEncoding.EncodeToString([]byte(secretValue))
+
 // secretForms are the forms a leak of the Secret's value would take: as
-// it is, as x shows it, and in base64, as the YAML of the Secret has it.
-var secretForms = []string{secretValue, base64.StdEncoding.EncodeToString([]byte(secretValue))}
+// it is, as x shows it, and in base64; and a distinctive beginning of
+// each, for a value cut by a narrow column. ("kosh-e2e-" alone is in
+// other names of the test.)
+var secretForms = []string{secretValue, secretBase64, secretValue[:len("kosh-e2e-secr")], secretBase64[:16]}
 
 // noSecret fails the test when any of secretForms was ever on c's screen,
-// or in what kosh sent it with the escape sequences taken out, since c's
-// screen began watching for them.
+// on it with its rows joined, or in what kosh sent it, raw or with the
+// escape sequences taken out, since c's screen began watching for them.
 func noSecret(t *testing.T, c *term, when string) {
 	t.Helper()
 	if seen := c.scr.seen(); len(seen) > 0 {
@@ -802,8 +809,14 @@ func TestReadOnlyKey(t *testing.T) {
 		return lineWith(lines, "Key:", k.name+" [read-only]")
 	})
 	// From here on, every write to the terminal is looked at for the
-	// Secret's value in each of its forms.
+	// Secret's value in each of its forms, to the end of the test and
+	// what is received while it ends.
 	c.scr.watch(secretForms...)
+	t.Cleanup(func() {
+		if seen := c.scr.seen(); len(seen) > 0 {
+			t.Errorf("by the end: the Secret's value reached the terminal: %s", strings.Join(seen, "\n"))
+		}
+	})
 
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
@@ -839,8 +852,10 @@ func TestReadOnlyKey(t *testing.T) {
 			return lineWith(lines, "this key is read-only") && lineWith(lines, "Secrets(default)") && row(lines, "hidden") != ""
 		})
 		noSecret(t, &c.term, key+" on the Secret")
-		// The flash goes after 5 seconds; the next key's own is then
-		// to be seen.
+		// An error stays until a key is pressed, and 5 seconds at least:
+		// k, the cursor up on the only row, then the next key's own
+		// refusal is to be seen.
+		c.send("k")
 		c.waitUntil(wait, "the flash is gone", func(lines []string) bool { return !lineWith(lines, "this key is read-only") })
 		if row(c.scr.lines(), "hidden") == "" {
 			t.Fatalf("after %s the table of secrets is gone:\n%s", key, c.scr)
@@ -850,9 +865,11 @@ func TestReadOnlyKey(t *testing.T) {
 
 	noSecret(t, &c.term, "at the end")
 
-	eventually(t, wait, "kosh's log has a refused line", func() bool {
-		return len(logLines(t, "refused", "key", k.name)) > 0
-	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	for _, action := range []string{"yaml", "describe", "secret-data"} {
+		eventually(t, wait, "kosh's log has the refused "+action, func() bool {
+			return len(logLines(t, "refused", "key", k.name, "action", action, "object", "secrets/default/hidden")) > 0
+		}, func() string { return "kosh's log:\n" + koshLog(t) })
+	}
 }
 
 func TestUnknownKeyIsRefused(t *testing.T) {
@@ -903,6 +920,98 @@ func TestNoCommandNoShell(t *testing.T) {
 	out, status = runSSH(t, sshCommand(t, k, []string{"-T"}))
 	if status != 1 || !strings.Contains(out, "kosh needs a terminal") {
 		t.Errorf("ssh -T kosh: status %d, output:\n%s\nwant status 1 and kosh needs a terminal", status, out)
+	}
+}
+
+// headerLines returns the lines above the table's top border.
+func headerLines(lines []string) []string {
+	for i, l := range lines {
+		if strings.HasPrefix(l, "┌") {
+			return lines[:i]
+		}
+	}
+	return lines
+}
+
+// cutHeader returns a line of the header that ends in "…", or "".
+func cutHeader(lines []string) string {
+	for _, l := range headerLines(lines) {
+		if strings.HasSuffix(strings.TrimRight(l, " "), "…") {
+			return l
+		}
+	}
+	return ""
+}
+
+// The header shows only the columns of hints that fit whole, at 80
+// columns as at 120.
+func TestHeaderAt80(t *testing.T) {
+	inCluster(t)
+	c := connect(t, fullKey(t), 80, 24)
+	c.waitFor("Pods(default)")
+	c.fills(80, 24)
+	if l := cutHeader(c.scr.lines()); l != "" {
+		t.Errorf("at 80x24 a line of the header is cut: %q\n%s", l, c.scr)
+	}
+	c.resize(120, 40)
+	c.fills(120, 40)
+	if l := cutHeader(c.scr.lines()); l != "" {
+		t.Errorf("at 120x40 a line of the header is cut: %q\n%s", l, c.scr)
+	}
+}
+
+// servedAt is when kosh logged that it serves.
+func servedAt(t *testing.T) time.Time {
+	t.Helper()
+	lines := logLines(t, "kosh is serving")
+	if len(lines) == 0 {
+		t.Fatalf("kosh's log has no line kosh is serving:\n%s", koshLog(t))
+	}
+	m := regexp.MustCompile(`^time=(\S+)`).FindStringSubmatch(lines[len(lines)-1])
+	if m == nil {
+		t.Fatalf("no time in %q", lines[len(lines)-1])
+	}
+	at, err := time.Parse(time.RFC3339Nano, m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+// The kubelet's probes, connections that send no byte, are not in kosh's
+// log at info level.
+func TestProbesAreNotInTheLog(t *testing.T) {
+	inCluster(t)
+	at := servedAt(t)
+	if d := 31*time.Second - time.Since(at); d > 0 {
+		time.Sleep(d) // three probes of each kind at least
+	}
+	if lines := logLines(t, "connection closed before authenticating", "reason", "EOF"); len(lines) > 0 {
+		t.Errorf("kosh has served %v and its log has %d probes, as: %s",
+			time.Since(at).Round(time.Second), len(lines), lines[0])
+	}
+}
+
+// A namespace given at the prompt must be a namespace's name: a path
+// that would make the API server proxy a request is refused, and nothing
+// of what such a request would answer reaches the terminal.
+func TestNamespaceMustBeAName(t *testing.T) {
+	inCluster(t)
+	c := connect(t, readOnlyKey(t), 120, 40)
+	c.waitFor("Pods(default)")
+	// gitVersion is in what the API server's /version answers.
+	c.scr.watch("gitVersion")
+	t.Cleanup(func() {
+		if seen := c.scr.seen(); len(seen) > 0 {
+			t.Errorf("the API server's /version reached the terminal: %s", strings.Join(seen, "\n"))
+		}
+	})
+	c.send(":leases ../../../../api/v1/namespaces/default/services/kubernetes:https/proxy/version" + keyEnter)
+	c.waitFor("not a namespace")
+	// Nothing is to be waited for: what would open would be there by now.
+	time.Sleep(2 * time.Second)
+	if lines := c.scr.lines(); !lineWith(lines, "Pods(default)") || lineWith(lines, "Leases(") {
+		t.Errorf("the table shown is not the pods' any more:\n%s", c.scr)
 	}
 }
 
@@ -1056,7 +1165,81 @@ func setKeys(t *testing.T, lines ...string) {
 	}
 }
 
-// Last: it takes the read-only key out of the list.
+// bindingRole returns the role of the ClusterRoleBinding name, or "" when
+// there is none.
+func bindingRole(t *testing.T, name string) string {
+	t.Helper()
+	return strings.TrimSpace(kubectl(t, "get", "clusterrolebinding", name, "--ignore-not-found", "-o", "jsonpath={.roleRef.name}"))
+}
+
+// koshMayScale is kubectl auth can-i for kosh's ServiceAccount and a
+// scale in default: "yes" or "no".
+func koshMayScale(t *testing.T) string {
+	t.Helper()
+	out, _ := run("kubectl", "auth", "can-i", "update", "deployments.apps/scale", "--namespace", "default",
+		"--as", "system:serviceaccount:"+namespace+":"+release)
+	return strings.TrimSpace(out)
+}
+
+// setRole installs the chart again with rbac.clusterRole, keeping every
+// other value.
+func setRole(t *testing.T, role string) {
+	t.Helper()
+	if _, err := run("helm", "upgrade", release, chart, "--namespace", namespace, "--reuse-values",
+		"--set", "rbac.clusterRole="+role); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The ClusterRole can be changed with helm upgrade, and a full key then
+// meets the API's refusal, readably.
+func TestRoleCanBeChanged(t *testing.T) {
+	inCluster(t)
+	setRole(t, "view")
+	t.Cleanup(func() {
+		setRole(t, "cluster-admin")
+		eventually(t, wait, "cluster-admin is kosh's again", func() bool {
+			return bindingRole(t, release+"-cluster-admin") == "cluster-admin" && bindingRole(t, release+"-view") == "" &&
+				koshMayScale(t) == "yes"
+		}, func() string { return "can-i: " + koshMayScale(t) })
+	})
+	if got := bindingRole(t, release+"-view"); got != "view" {
+		t.Errorf("the binding %s-view binds %q, want view", release, got)
+	}
+	if got := bindingRole(t, release+"-cluster-admin"); got != "" {
+		t.Errorf("the binding %s-cluster-admin is still there, binding %s", release, got)
+	}
+	eventually(t, wait, "kosh may no longer scale", func() bool { return koshMayScale(t) == "no" },
+		func() string { return "can-i: " + koshMayScale(t) })
+
+	before := replicas(t)
+	c := connect(t, fullKey(t), 120, 40)
+	c.waitFor("Pods(default)")
+	c.send(":deploy" + keyEnter)
+	c.waitRow("web")
+	c.send("s")
+	c.waitFor("Scale deployments/default/web?", "Replicas")
+	c.send(scaleTo3...)
+	c.send(scaleConfirm...)
+	c.waitUntil(wait, "the API's refusal, whole", func(lines []string) bool {
+		var trimmed []string
+		for _, l := range lines {
+			trimmed = append(trimmed, strings.TrimSpace(l))
+		}
+		all := strings.Join(trimmed, " ")
+		return strings.Contains(all, "forbidden") && strings.Contains(all, "cannot update")
+	})
+	for _, l := range c.scr.lines() {
+		if strings.Contains(l, "forbidden") && strings.HasSuffix(strings.TrimRight(l, " "), "…") {
+			t.Errorf("the refusal is cut: %q\n%s", l, c.scr)
+		}
+	}
+	if after := replicas(t); after != before {
+		t.Errorf("the replicas of web went from %s to %s under the role view", before, after)
+	}
+}
+
+// It takes the read-only key out of the list, and puts it back.
 func TestKeyRemovedEndsTheSession(t *testing.T) {
 	inCluster(t)
 	full, ro := fullKey(t), readOnlyKey(t)
@@ -1108,6 +1291,71 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 		t.Errorf("a new connection of the read-only key: %v, want a failed handshake", err)
 	}
 }
+
+// The last test: it restarts kosh. A stop tells every session first,
+// over TCP and over iroh, and logs why each ended.
+func TestStopTellsTheSessions(t *testing.T) {
+	inCluster(t)
+	pods := strings.Fields(kubectl(t, "--namespace", namespace, "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"))
+	if len(pods) != 1 {
+		t.Fatalf("pods of kosh: %q, want one", pods)
+	}
+	// The log of the pod that stops, followed from before the stop: the
+	// pod is deleted with it.
+	var podLog syncBuffer
+	follow := exec.Command("kubectl", "--namespace", namespace, "logs", "--follow", pods[0])
+	follow.Stdout, follow.Stderr = &podLog, &podLog
+	if err := follow.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = follow.Process.Kill()
+		_ = follow.Wait()
+	})
+
+	k := fullKey(t)
+	c := connect(t, k, 120, 40)
+	c.waitFor("Pods(default)")
+	c.scr.watch(stopping)
+	var p *ptySession
+	if !cfg.noNetwork {
+		p = irohSSH(t, k)
+		overIroh(t, p, "the pods", func(lines []string) bool { return lineWith(lines, "Pods(default)") })
+		p.scr.watch(stopping)
+	}
+
+	kubectl(t, "--namespace", namespace, "rollout", "restart", "deployment/"+release)
+	t.Cleanup(func() {
+		if _, err := run("kubectl", "--namespace", namespace, "rollout", "status", "deployment/"+release, "--timeout=180s"); err != nil {
+			t.Errorf("kosh is not back: %v", err)
+		}
+	})
+
+	told := func(scr *screen) bool { return len(scr.seen()) > 0 }
+	eventually(t, wait, "the session over TCP is told", func() bool { return told(c.scr) },
+		func() string { return "the screen:\n" + c.scr.String() })
+	_ = c.ended(wait)
+	transports := []string{"tcp"}
+	if p != nil {
+		eventually(t, wait, "the session over iroh is told", func() bool { return told(p.scr) },
+			func() string { return "the screen:\n" + p.scr.String() })
+		p.exitedWith(wait)
+		transports = append(transports, "iroh")
+	}
+	for _, tr := range transports {
+		eventually(t, wait, "the log of the old pod has the end of the session over "+tr, func() bool {
+			for _, l := range strings.Split(podLog.String(), "\n") {
+				if hasAttr(l, "msg", "session end") && hasAttrs(l, "transport", tr, "key", k.name, "reason", stopping) {
+					return true
+				}
+			}
+			return false
+		}, func() string { return "the log of the old pod:\n" + podLog.String() })
+	}
+}
+
+// stopping is what a session is told when kosh stops.
+const stopping = "kosh is shutting down"
 
 // iroh-ssh finds kosh, which runs as a process on this machine with the
 // relays off, by mDNS alone: scripts/test-mdns.sh.
