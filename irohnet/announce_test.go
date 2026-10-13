@@ -23,78 +23,86 @@ func ipNet(s string) *net.IPNet {
 	return n
 }
 
-func TestAdvertisedAddrPorts(t *testing.T) {
-	in := []ifaceAddrs{
-		{name: "en0", up: true, addrs: []net.Addr{
-			ipNet("192.168.1.50/24"),   // LAN IPv4: keep
-			ipNet("fe80::1/64"),        // link-local: drop
-			ipNet("192.168.1.50/24"),   // duplicate: drop
-			ipNet("2001:db8::1234/64"), // global IPv6: keep
-		}},
-		{name: "lo0", up: true, addrs: []net.Addr{
-			ipNet("127.0.0.1/8"), // loopback: drop
-			ipNet("::1/128"),     // loopback: drop
-		}},
-		{name: "en5", up: false, addrs: []net.Addr{
-			ipNet("10.9.9.9/8"), // interface down: drop
-		}},
-		{name: "cni0", up: true, addrs: []net.Addr{
-			ipNet("10.42.1.1/24"), // container bridge: drop
-		}},
-		{name: "en1", up: true, addrs: []net.Addr{
-			ipNet("::ffff:192.168.1.9/96"),                // IPv4 written as IPv6: keep as IPv4
-			ipNet("0.0.0.0/0"),                            // unspecified: drop
-			&net.TCPAddr{IP: net.ParseIP("192.168.1.60")}, // not an interface address: drop
-		}},
-	}
-	got := advertisedAddrPorts(in, 4242)
-	want := []netip.AddrPort{
-		netip.MustParseAddrPort("192.168.1.50:4242"),
-		netip.MustParseAddrPort("[2001:db8::1234]:4242"),
-		netip.MustParseAddrPort("192.168.1.9:4242"),
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
+const (
+	lan    = net.FlagUp | net.FlagBroadcast | net.FlagMulticast
+	tunnel = net.FlagUp | net.FlagPointToPoint | net.FlagMulticast
+	loop   = net.FlagUp | net.FlagLoopback | net.FlagMulticast
+)
+
+// madeUpInterfaces are a laptop's, more or less: Wi-Fi, a tunnel, a
+// down Ethernet port, loopback and a container bridge.
+var madeUpInterfaces = []iface{
+	{name: "en0", flags: lan, addrs: []net.Addr{
+		ipNet("192.168.1.50/24"),                      // LAN IPv4: kept
+		ipNet("fe80::1/64"),                           // link-local: left out
+		ipNet("192.168.1.50/24"),                      // twice: once
+		ipNet("2001:db8::1234/64"),                    // global IPv6: kept
+		ipNet("::ffff:192.168.1.51/96"),               // IPv4 written as IPv6: kept as IPv4
+		ipNet("0.0.0.0/0"),                            // unspecified: left out
+		&net.TCPAddr{IP: net.ParseIP("192.168.1.60")}, // no interface address
+	}},
+	{name: "utun6", flags: tunnel, addrs: []net.Addr{
+		ipNet("100.79.132.116/32"), // tunnel: left out
+		ipNet("fd7a:115c:a1e0::4f01:8474/128"),
+	}},
+	{name: "en5", flags: net.FlagBroadcast | net.FlagMulticast, addrs: []net.Addr{
+		ipNet("10.9.9.9/8"), // down: left out
+	}},
+	{name: "lo0", flags: loop, addrs: []net.Addr{
+		ipNet("127.0.0.1/8"), // loopback: left out
+		ipNet("::1/128"),
+	}},
+	{name: "cni0", flags: lan, addrs: []net.Addr{
+		ipNet("10.42.1.1/24"), // container bridge: left out
+	}},
 }
 
-func TestDirectAddrsFollowTheBoundSocket(t *testing.T) {
-	ifaces := []ifaceAddrs{
-		{name: "eth0", up: true, addrs: []net.Addr{ipNet("203.0.113.7/24"), ipNet("2001:db8::7/64")}},
-		{name: "lo", up: true, addrs: []net.Addr{ipNet("127.0.0.1/8")}},
+func addrPorts(ss ...string) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, s := range ss {
+		out = append(out, netip.MustParseAddrPort(s))
 	}
+	return out
+}
+
+func TestAnnouncedAddresses(t *testing.T) {
 	for _, tc := range []struct {
 		local string
-		want  []string
+		want  []netip.AddrPort
 	}{
-		{"[::]:4435", []string{"203.0.113.7:4435", "[2001:db8::7]:4435"}},
-		{"0.0.0.0:4435", []string{"203.0.113.7:4435"}},
-		{"203.0.113.7:4435", []string{"203.0.113.7:4435"}},
+		{"[::]:4435", addrPorts("192.168.1.50:4435", "[2001:db8::1234]:4435", "192.168.1.51:4435")},
+		{"0.0.0.0:4435", addrPorts("192.168.1.50:4435", "192.168.1.51:4435")},
+		{"192.168.1.50:4435", addrPorts("192.168.1.50:4435")},
+		{"100.79.132.116:4435", nil},
 		{"127.0.0.1:4435", nil},
 	} {
-		var want []netip.AddrPort
-		for _, s := range tc.want {
-			want = append(want, netip.MustParseAddrPort(s))
-		}
-		if got := directAddrs(ifaces, netip.MustParseAddrPort(tc.local)); !slices.Equal(got, want) {
-			t.Errorf("bound to %s: got %v, want %v", tc.local, got, want)
+		got := announcedAddrs(madeUpInterfaces, netip.MustParseAddrPort(tc.local))
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("bound to %s: got %v, want %v", tc.local, got, tc.want)
 		}
 	}
 }
 
-func TestPublishableAddrsDropsWildcard(t *testing.T) {
+func TestPublishableAddrs(t *testing.T) {
+	announced := announcedAddrs(madeUpInterfaces, netip.MustParseAddrPort("[::]:1"))
+	hidden := hiddenAddrs(madeUpInterfaces, announced)
 	relay := netaddr.RelayAddr{}
-	keep := netaddr.IPAddr{Addr: netip.MustParseAddrPort("192.168.1.9:1")}
+	lanAddr := netaddr.IPAddr{Addr: netip.MustParseAddrPort("192.168.1.50:1")}
+	reflexive := netaddr.IPAddr{Addr: netip.MustParseAddrPort("203.0.113.7:61234")}
 	in := []netaddr.TransportAddr{
 		relay,
-		keep,
+		lanAddr,
+		reflexive, // found by the net report: no interface has it
+		netaddr.IPAddr{Addr: netip.MustParseAddrPort("100.79.132.116:1")},              // tunnel
+		netaddr.IPAddr{Addr: netip.MustParseAddrPort("[fd7a:115c:a1e0::4f01:8474]:1")}, // tunnel
+		netaddr.IPAddr{Addr: netip.MustParseAddrPort("10.42.1.1:1")},                   // bridge
 		netaddr.IPAddr{Addr: netip.MustParseAddrPort("[::]:1")},
 		netaddr.IPAddr{Addr: netip.MustParseAddrPort("0.0.0.0:1")},
 		netaddr.IPAddr{},
 	}
-	got := publishableAddrs(in)
-	if len(got) != 2 || got[0] != relay || got[1] != keep {
-		t.Fatalf("got %v", got)
+	got := publishable(in, hidden)
+	if want := []netaddr.TransportAddr{relay, lanAddr, reflexive}; !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }
 
@@ -118,7 +126,7 @@ func TestAnnounced(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	for _, want := range []string{"the relay answered", "mDNS announces"} {
+	for _, want := range []string{"the relay answered", "mDNS announces", "._irohv1._udp.local."} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("the log does not say %q", want)
 		}

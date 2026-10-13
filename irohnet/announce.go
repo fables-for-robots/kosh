@@ -251,3 +251,116 @@ func publishableAddrs(addrs []netaddr.TransportAddr) []netaddr.TransportAddr {
 	}
 	return out
 }
+
+// iface is the name, the flags and the addresses of one network
+// interface: what announcedAddrs decides on, so that it can be tested
+// with interfaces the test makes up.
+type iface struct {
+	name  string
+	flags net.Flags
+	addrs []net.Addr
+}
+
+// readInterfaces lists the machine's interfaces. An interface whose
+// addresses cannot be read is listed without them.
+func readInterfaces() ([]iface, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]iface, 0, len(ifaces))
+	for _, ifc := range ifaces {
+		addrs, _ := ifc.Addrs()
+		out = append(out, iface{name: ifc.Name, flags: ifc.Flags, addrs: addrs})
+	}
+	return out, nil
+}
+
+// isLAN reports whether addresses of an interface with flags are worth
+// announcing: it is up, broadcast and multicast, and neither a tunnel
+// (point-to-point) nor loopback. The probe found that a tunnel's address
+// in an announcement makes iroh-ssh's connections time out.
+func isLAN(flags net.Flags) bool {
+	return flags&net.FlagUp != 0 && flags&net.FlagBroadcast != 0 && flags&net.FlagMulticast != 0 &&
+		flags&net.FlagPointToPoint == 0 && flags&net.FlagLoopback == 0
+}
+
+// ifaceIPs returns the unicast addresses of ifc, an IPv4 address written
+// as IPv6 as IPv4.
+func ifaceIPs(ifc iface) []netip.Addr {
+	var out []netip.Addr
+	for _, a := range ifc.addrs {
+		n, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip, ok := netip.AddrFromSlice(n.IP); ok {
+			out = append(out, ip.Unmap())
+		}
+	}
+	return out
+}
+
+// announcedAddrs returns the addresses that mDNS and the pkarr record
+// announce for an endpoint bound to local: the addresses of the LAN
+// interfaces (isLAN), less container bridges and loopback, link-local and
+// unspecified addresses, each with the bound port, in the order of the
+// interfaces and none twice. A socket bound to 0.0.0.0 is reached over
+// IPv4 alone, and one bound to one address at that address alone, if it
+// is one of them.
+func announcedAddrs(ifaces []iface, local netip.AddrPort) []netip.AddrPort {
+	bound := local.Addr().Unmap()
+	var out []netip.AddrPort
+	seen := make(map[netip.Addr]bool)
+	for _, ifc := range ifaces {
+		if !isLAN(ifc.flags) || isBridgeName(ifc.name) {
+			continue
+		}
+		for _, ip := range ifaceIPs(ifc) {
+			if seen[ip] || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+				continue
+			}
+			switch {
+			case !bound.IsUnspecified() && ip != bound:
+				continue
+			case bound.IsUnspecified() && bound.Is4() && !ip.Is4():
+				continue
+			}
+			seen[ip] = true
+			out = append(out, netip.AddrPortFrom(ip, local.Port()))
+		}
+	}
+	return out
+}
+
+// hiddenAddrs returns the addresses of the machine's interfaces that are
+// not announced: those of tunnels, bridges, loopback and the like, which
+// the pkarr record leaves out although go-iroh may know them.
+func hiddenAddrs(ifaces []iface, announced []netip.AddrPort) map[netip.Addr]bool {
+	hidden := make(map[netip.Addr]bool)
+	for _, ifc := range ifaces {
+		for _, ip := range ifaceIPs(ifc) {
+			hidden[ip] = true
+		}
+	}
+	for _, ap := range announced {
+		delete(hidden, ap.Addr())
+	}
+	return hidden
+}
+
+// publishable is what of the endpoint's addresses the pkarr record
+// holds: every address but the IP addresses nobody can dial (invalid,
+// unspecified) and those that are hidden. The publisher's own default
+// filter would publish the relay alone.
+func publishable(addrs []netaddr.TransportAddr, hidden map[netip.Addr]bool) []netaddr.TransportAddr {
+	out := make([]netaddr.TransportAddr, 0, len(addrs))
+	for _, a := range addrs {
+		if ip, ok := a.(netaddr.IPAddr); ok &&
+			(!ip.Addr.IsValid() || ip.Addr.Addr().IsUnspecified() || hidden[ip.Addr.Addr().Unmap()]) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
