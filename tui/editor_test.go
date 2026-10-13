@@ -168,10 +168,11 @@ func TestEditorSaveRefused(t *testing.T) {
 	if got := sess.Called("Update"); len(got) != 1 || got[0].Args[1] != v.ta.Value() {
 		t.Errorf("Update was called %v", got)
 	}
+	// The error stays while the text is edited (TestEditorErrorStays).
 	hs.press("right")
-	hs.notFrame("the object has been modified")
+	hs.wantFrame("the object has been modified")
 	if v.ta.Value() != "x: y\n"+editorYAML {
-		t.Error("the key that took the error away changed the text")
+		t.Error("right changed the text")
 	}
 }
 

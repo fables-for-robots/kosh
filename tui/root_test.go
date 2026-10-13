@@ -293,11 +293,13 @@ func (v *namedView) Update(msg tea.Msg) (view, tea.Cmd) {
 	return v, nil
 }
 
-func TestTheStartErrorIsOneLine(t *testing.T) {
+// The error of the start is wrapped into the body, its line feeds
+// breaking its lines, and cleaned.
+func TestTheStartErrorIsWrapped(t *testing.T) {
 	sess := newSession()
 	sess.Errs["Resolve"] = errors.New("down\nfor maintenance \x1b[2J")
 	hs := newHarness(t, sess, 100, 30)
-	hs.wantFrame("│down for maintenance")
+	hs.wantFrame("│down ", "│for maintenance ")
 	if strings.Contains(hs.drawn(), "\x1b[2J") {
 		t.Error("the error is drawn raw")
 	}

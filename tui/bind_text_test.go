@@ -300,7 +300,10 @@ func TestReadOnlySecret(t *testing.T) {
 		}
 		hs.notFrame("hunter2", "aHVudGVy")
 	}
+	// An error stays after its time until a key is pressed: k, which
+	// moves nothing in a table of one row.
 	hs.clock.advance(time.Minute)
+	hs.press("k")
 	if hs.frame() != before {
 		t.Errorf("the table is not as it was:\n%s\nwas\n%s", hs.frame(), before)
 	}

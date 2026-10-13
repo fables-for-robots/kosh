@@ -88,8 +88,10 @@ type (
 	pushViewMsg struct{ v view }
 	// popViewMsg takes the top view off the stack. The last view stays.
 	popViewMsg struct{}
-	// flashMsg shows a line in the flash, in the colour of an error
-	// when err is set, until the next one or for 5 seconds.
+	// flashMsg shows a line in the flash for 5 seconds, or until the
+	// next one. With err set it is an error: in the colour of one,
+	// wrapped onto up to 4 lines, and shown until a key is pressed
+	// after its 5 seconds.
 	flashMsg struct {
 		text string
 		err  bool

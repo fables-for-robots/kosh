@@ -118,6 +118,7 @@ func (r *root) key(k tea.KeyPressMsg) tea.Cmd {
 	if s == "ctrl+c" {
 		return tea.Quit
 	}
+	r.flash.key()
 	if r.dlg != nil {
 		var cmd tea.Cmd
 		r.dlg, cmd = r.dlg.Update(k)
@@ -226,9 +227,13 @@ func (r *root) render() string {
 		lines = append(lines, r.prompt.line(r.w))
 	}
 	bodyTop := len(lines)
-	bodyH := r.h - bodyTop - 2
+	// The lines of an error in the flash are taken from the body, which
+	// keeps its frame and a line inside it.
+	fl := r.flash.lines(r.w, min(flashMaxLines, r.h-bodyTop-1-3), r.e.now())
+	bodyH := r.h - bodyTop - 1 - len(fl)
 	lines = append(lines, r.body(bodyH)...)
-	lines = append(lines, r.crumbs(), r.flash.line(r.w, r.e.now()))
+	lines = append(lines, r.crumbs())
+	lines = append(lines, fl...)
 	r.overlayDialog(lines)
 	return strings.Join(lines, "\n")
 }
@@ -243,11 +248,13 @@ func (r *root) body(h int) []string {
 		title = cleanLine(top.Title())
 		inner = block(top.View(iw, ih), iw, ih)
 	} else {
-		var text string
+		var text []string
 		if r.startErr != nil {
-			text = styleError.Render(fit(cleanLine(r.startErr.Error()), iw))
+			for _, l := range wrapText(r.startErr.Error(), iw, ih) {
+				text = append(text, styleError.Render(fit(l, iw)))
+			}
 		}
-		inner = block(text, iw, ih)
+		inner = block(strings.Join(text, "\n"), iw, ih)
 	}
 	lines := make([]string, 0, h)
 	lines = append(lines, topBorder(title, w))

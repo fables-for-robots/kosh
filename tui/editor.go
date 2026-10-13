@@ -34,8 +34,10 @@ type editorView struct {
 	onOpen   func()
 	modified bool
 	saving   bool
-	// why is the error of a refused update, shown until the next key.
-	why string
+	// why is the error of a refused update, cleaned, shown under the
+	// text until the next update is sent; whyWrap keeps its lines.
+	why     string
+	whyWrap wrapped
 }
 
 // editorSavedMsg is what came of the update of the editor id.
@@ -135,7 +137,7 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		}
 		v.saving = false
 		if msg.err != nil {
-			v.why = cleanLine(msg.err.Error())
+			v.why = clean(msg.err.Error())
 			return v, nil
 		}
 		return v, tea.Sequence(popView(), flash("Updated "+v.ref.String()), refresh())
@@ -143,7 +145,6 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		if v.saving {
 			return v, nil
 		}
-		v.why = ""
 		switch msg.String() {
 		case "ctrl+s":
 			return v, v.save()
@@ -155,7 +156,6 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		if v.saving {
 			return v, nil
 		}
-		v.why = ""
 		return v, v.input(msg)
 	}
 	return v, nil
@@ -180,6 +180,7 @@ func (v *editorView) save() tea.Cmd {
 		return flash(actionTextBusy)
 	}
 	v.saving = true
+	v.why = ""
 	sess, ref, id := v.e.sess, v.ref, v.id
 	return waitCmd(func() tea.Msg {
 		defer actionEnd(sess)
@@ -202,15 +203,16 @@ func (v *editorView) leave() tea.Cmd {
 }
 
 // View draws the text area over the body, and under it the error of a
-// refused update.
+// refused update, wrapped onto up to half the lines.
 func (v *editorView) View(w, h int) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	th := h
+	var why []string
 	if v.why != "" {
-		th--
+		why = v.whyWrap.get(v.why, w, max(h/2, 1))
 	}
+	th := h - len(why)
 	var out []string
 	if th > 0 {
 		v.ta.SetWidth(w)
@@ -224,8 +226,8 @@ func (v *editorView) View(w, h int) string {
 			out = append(out, fit(l, w))
 		}
 	}
-	if v.why != "" {
-		out = append(out, styleError.Render(fit(v.why, w)))
+	for _, l := range why {
+		out = append(out, styleError.Render(fit(l, w)))
 	}
 	return strings.Join(out, "\n")
 }
