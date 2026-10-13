@@ -58,15 +58,29 @@ type mdnsAnnouncer struct {
 	pc   net.PacketConn
 	p    *ipv4.PacketConn
 	kick chan struct{}
-	// send multicasts a packet: multicast, unless a test says otherwise.
+	// grp is where the group is joined and left: p, unless a test says
+	// otherwise.
+	grp groupMember
+	// send multicasts a packet on every interface the group is joined
+	// on: multicast, unless a test says otherwise.
 	send func(packet []byte)
+	// sendOn multicasts a packet on one interface: writeOn, unless a
+	// test says otherwise.
+	sendOn func(ifc *net.Interface, packet []byte)
 
 	// sendMu makes the choice of the interface and the write of one
 	// packet one step.
 	sendMu sync.Mutex
 
+	// ifMu is held while the memberships are made what setInterfaces was
+	// given: one call at a time.
+	ifMu sync.Mutex
+	// joinFailed are the interfaces on which the join failed and was
+	// said to have, by index, so that it is said once; guarded by ifMu.
+	joinFailed map[int]bool
+
 	mu sync.Mutex
-	// joined are the interfaces the group was joined on, by index.
+	// joined are the interfaces the group is joined on, by index.
 	joined map[int]net.Interface
 	// addrs are the addresses announced, and announcement and goodbye
 	// their packets; nil while there is none.
@@ -74,26 +88,106 @@ type mdnsAnnouncer struct {
 	announcement, goodbye []byte
 }
 
-// join joins the group on every interface whose addresses are announced
-// and that it has not joined on yet, and returns on how many it is
-// joined.
-func (m *mdnsAnnouncer) join() int {
-	all, _ := net.Interfaces()
+// groupMember is what joins and leaves a multicast group on an
+// interface: an ipv4.PacketConn.
+type groupMember interface {
+	JoinGroup(ifi *net.Interface, group net.Addr) error
+	LeaveGroup(ifi *net.Interface, group net.Addr) error
+}
+
+// setInterfaces makes on the interfaces the group is joined on: those
+// that have an address that is announced. An interface that is no longer
+// among them is sent the goodbye of what is announced, so that who
+// listens there forgets it, and is left. One that is new is joined, and
+// the announcement is then made anew. A join that fails (the kernel
+// allows one socket 20 memberships on Linux) is a warning that names the
+// interface, once for as long as the interface is among them, and is
+// tried again at every call.
+func (m *mdnsAnnouncer) setInterfaces(on []net.Interface) {
+	m.ifMu.Lock()
+	defer m.ifMu.Unlock()
+
+	want := make(map[int]bool, len(on))
+	for _, ifc := range on {
+		want[ifc.Index] = true
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i := range all {
-		ifc := all[i]
-		if !announcesOn(ifc.Name, ifc.Flags) {
-			continue
-		}
-		if _, ok := m.joined[ifc.Index]; ok {
-			continue
-		}
-		if err := m.p.JoinGroup(&ifc, mdnsGroup4); err == nil {
-			m.joined[ifc.Index] = ifc
+	var leave []net.Interface
+	for index, ifc := range m.joined {
+		if !want[index] {
+			leave = append(leave, ifc)
 		}
 	}
-	return len(m.joined)
+	var join []net.Interface
+	for _, ifc := range on {
+		if _, ok := m.joined[ifc.Index]; !ok {
+			join = append(join, ifc)
+		}
+	}
+	goodbye := m.goodbye
+	m.mu.Unlock()
+
+	slices.SortFunc(leave, func(a, b net.Interface) int { return a.Index - b.Index })
+	for i := range leave {
+		ifc := &leave[i]
+		if goodbye != nil {
+			m.sendOn(ifc, goodbye)
+		}
+		// Whatever the kernel says: the interface may be gone.
+		if err := m.grp.LeaveGroup(ifc, mdnsGroup4); err != nil {
+			m.log.Debug("mDNS: leaving the group", "interface", ifc.Name, "error", err)
+		}
+		m.mu.Lock()
+		delete(m.joined, ifc.Index)
+		m.mu.Unlock()
+	}
+	for index := range m.joinFailed {
+		if !want[index] {
+			delete(m.joinFailed, index)
+		}
+	}
+
+	joined := false
+	for i := range join {
+		ifc := &join[i]
+		if err := m.grp.JoinGroup(ifc, mdnsGroup4); err != nil {
+			if !m.joinFailed[ifc.Index] {
+				if m.joinFailed == nil {
+					m.joinFailed = make(map[int]bool)
+				}
+				m.joinFailed[ifc.Index] = true
+				m.log.Warn("mDNS cannot join the group on an interface, and is not announced there; it tries again when it reads the addresses",
+					"interface", ifc.Name, "error", err)
+			}
+			continue
+		}
+		delete(m.joinFailed, ifc.Index)
+		m.mu.Lock()
+		m.joined[ifc.Index] = *ifc
+		m.mu.Unlock()
+		joined = true
+	}
+	if joined {
+		select {
+		case m.kick <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// answersOn reports whether a question that arrived on the interface
+// with index is answered: the group is joined there. The kernel hands
+// the socket questions from other interfaces too, when another program
+// on the machine joined the group on them. A packet whose interface is
+// not known (index 0) is answered.
+func (m *mdnsAnnouncer) answersOn(index int) bool {
+	if index == 0 {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.joined[index]
+	return ok
 }
 
 // setAddrs makes addrs what is announced, and announces them anew when
@@ -123,9 +217,6 @@ func (m *mdnsAnnouncer) setAddrs(addrs []netip.AddrPort) {
 	if announcement == nil && old != nil {
 		m.send(old)
 	}
-	if m.p != nil {
-		m.join()
-	}
 	select {
 	case m.kick <- struct{}{}:
 	default:
@@ -139,7 +230,7 @@ func (m *mdnsAnnouncer) packets() (announcement, goodbye []byte) {
 	return m.announcement, m.goodbye
 }
 
-// multicast sends packet on every interface the group was joined on.
+// multicast sends packet on every interface the group is joined on.
 func (m *mdnsAnnouncer) multicast(packet []byte) {
 	if packet == nil {
 		return
@@ -150,14 +241,19 @@ func (m *mdnsAnnouncer) multicast(packet []byte) {
 		ifaces = append(ifaces, ifc)
 	}
 	m.mu.Unlock()
+	for i := range ifaces {
+		m.sendOn(&ifaces[i], packet)
+	}
+}
+
+// writeOn sends packet to the group on ifc.
+func (m *mdnsAnnouncer) writeOn(ifc *net.Interface, packet []byte) {
 	m.sendMu.Lock()
 	defer m.sendMu.Unlock()
-	for i := range ifaces {
-		if err := m.p.SetMulticastInterface(&ifaces[i]); err != nil {
-			continue
-		}
-		_, _ = m.pc.WriteTo(packet, mdnsGroup4)
+	if err := m.p.SetMulticastInterface(ifc); err != nil {
+		return
 	}
+	_, _ = m.pc.WriteTo(packet, mdnsGroup4)
 }
 
 // run announces and answers until ctx is done, then says goodbye and
@@ -219,9 +315,14 @@ func (m *mdnsAnnouncer) answer(ctx context.Context) {
 			return
 		}
 		var dst netip.Addr
+		index := 0
 		if cm != nil {
 			dst, _ = netip.AddrFromSlice(cm.Dst)
 			dst = dst.Unmap()
+			index = cm.IfIndex
+		}
+		if !m.answersOn(index) {
+			continue
 		}
 		now := time.Now()
 		if ok, _ := mdnsShouldAnswer(buf[:n], dst, now, lastSent, instance, host); !ok {

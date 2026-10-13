@@ -130,11 +130,82 @@ func TestPublishableAddrs(t *testing.T) {
 	}
 }
 
-// recordingAnnouncer stands for mDNS, and records what it was given.
-type recordingAnnouncer struct{ calls [][]netip.AddrPort }
+// recordingAnnouncer stands for mDNS, and records what it was given: the
+// addresses, and at every reading the names of the interfaces to be
+// joined on.
+type recordingAnnouncer struct {
+	calls [][]netip.AddrPort
+	on    [][]string
+}
 
 func (r *recordingAnnouncer) setAddrs(addrs []netip.AddrPort) {
 	r.calls = append(r.calls, slices.Clone(addrs))
+}
+
+func (r *recordingAnnouncer) setInterfaces(on []net.Interface) {
+	r.on = append(r.on, ifaceNames(on))
+}
+
+func ifaceNames(ifcs []net.Interface) []string {
+	names := []string{}
+	for _, ifc := range ifcs {
+		names = append(names, ifc.Name)
+	}
+	return names
+}
+
+// A node of a cluster, more or less: its own interface, a veth to a pod
+// without an address (Calico's), three veths that each carry the same
+// address of the pods' gateway (kindnet's), a bridge of the pods' network
+// (flannel's), and a tunnel.
+var madeUpNode = []iface{
+	{name: "lo", index: 1, flags: loop, addrs: []net.Addr{ipNet("127.0.0.1/8")}},
+	{name: "eth0", index: 2, flags: lan, addrs: []net.Addr{ipNet("172.18.0.2/16"), ipNet("fe80::2/64")}},
+	{name: "cali0123", index: 3, flags: lan, addrs: []net.Addr{ipNet("fe80::3/64")}},
+	{name: "veth1", index: 4, flags: lan, addrs: []net.Addr{ipNet("10.244.0.1/32"), ipNet("fe80::4/64")}},
+	{name: "veth2", index: 5, flags: lan, addrs: []net.Addr{ipNet("10.244.0.1/32")}},
+	{name: "veth3", index: 6, flags: lan, addrs: []net.Addr{ipNet("10.244.0.1/32")}},
+	{name: "cni0", index: 7, flags: lan, addrs: []net.Addr{ipNet("10.244.1.1/24")}},
+	{name: "docker0", index: 8, flags: lan, addrs: []net.Addr{ipNet("172.17.0.1/16")}},
+	{name: "tun0", index: 9, flags: tunnel, addrs: []net.Addr{ipNet("10.8.0.2/32")}},
+	{name: "eth1", index: 10, flags: net.FlagBroadcast | net.FlagMulticast, addrs: []net.Addr{ipNet("192.168.7.7/24")}},
+}
+
+// The group is joined where an announced address is: on the interface
+// that has it, and on the first only when several have the same. An
+// interface without an address, with only a link-local one, or with
+// addresses that are not announced is not among them.
+func TestAnnouncingInterfaces(t *testing.T) {
+	for _, tc := range []struct {
+		local string
+		want  []string
+	}{
+		{"0.0.0.0:4435", []string{"eth0", "veth1", "cni0"}},
+		{"[::]:4435", []string{"eth0", "veth1", "cni0"}},
+		{"172.18.0.2:4435", []string{"eth0"}},
+		{"10.244.0.1:4435", []string{"veth1"}},
+		{"127.0.0.1:4435", []string{}},
+	} {
+		local := netip.MustParseAddrPort(tc.local)
+		on := announcingOn(madeUpNode, announcedAddrs(madeUpNode, local))
+		if got := ifaceNames(on); !slices.Equal(got, tc.want) {
+			t.Errorf("bound to %s: joined on %v, want %v", tc.local, got, tc.want)
+		}
+		for _, ifc := range on {
+			var want iface
+			for _, m := range madeUpNode {
+				if m.name == ifc.Name {
+					want = m
+				}
+			}
+			if ifc.Index != want.index || ifc.Flags != want.flags {
+				t.Errorf("bound to %s: %s has index %d and flags %v, want %d and %v", tc.local, ifc.Name, ifc.Index, ifc.Flags, want.index, want.flags)
+			}
+		}
+	}
+	if on := announcingOn(madeUpNode, nil); len(on) != 0 {
+		t.Errorf("nothing announced: joined on %v", ifaceNames(on))
+	}
 }
 
 func TestAnnouncementsFollowTheAddresses(t *testing.T) {
@@ -158,6 +229,9 @@ func TestAnnouncementsFollowTheAddresses(t *testing.T) {
 	if !changed || !slices.Equal(addrs, want) || len(rec.calls) != 1 || !slices.Equal(rec.calls[0], want) {
 		t.Fatalf("first reading: %v %v, mDNS given %v; want %v", addrs, changed, rec.calls, want)
 	}
+	if len(rec.on) != 1 || !slices.Equal(rec.on[0], []string{"en0", "br-lan"}) {
+		t.Fatalf("first reading: mDNS told to join on %v, want en0 and br-lan", rec.on)
+	}
 	for _, ap := range want {
 		if !slices.Contains(pinned(), ap) {
 			t.Errorf("%v is not among the endpoint's addresses %v", ap, pinned())
@@ -170,6 +244,23 @@ func TestAnnouncementsFollowTheAddresses(t *testing.T) {
 	if _, changed := l.refreshAddrs(read, local, rec); changed || len(rec.calls) != 1 {
 		t.Fatalf("the same addresses again: changed %v, mDNS given %v", changed, rec.calls)
 	}
+	// The interfaces are handed over at every reading, changed or not: a
+	// join that failed is tried again.
+	if len(rec.on) != 2 || !slices.Equal(rec.on[1], []string{"en0", "br-lan"}) {
+		t.Fatalf("the same addresses again: mDNS told to join on %v", rec.on)
+	}
+
+	// The LAN bridge loses its address: it is left.
+	bridge := ifaces[6]
+	ifaces[6] = iface{name: bridge.name, index: bridge.index, flags: bridge.flags}
+	if _, changed := l.refreshAddrs(read, local, rec); !changed || len(rec.on) != 3 || !slices.Equal(rec.on[2], []string{"en0"}) {
+		t.Fatalf("br-lan without an address: changed %v, mDNS told to join on %v, want en0 alone", changed, rec.on)
+	}
+	ifaces[6] = bridge
+	if _, changed := l.refreshAddrs(read, local, rec); !changed || len(rec.on) != 4 || !slices.Equal(rec.on[3], []string{"en0", "br-lan"}) {
+		t.Fatalf("br-lan with its address again: changed %v, mDNS told to join on %v", changed, rec.on)
+	}
+	rec.calls = rec.calls[:1]
 
 	ifaces[0].addrs = ifaces[0].addrs[:4] // 192.168.1.51 is gone
 	want = addrPorts("192.168.1.50:4435", "[2001:db8::1234]:4435", "10.0.0.2:4435")
@@ -182,8 +273,9 @@ func TestAnnouncementsFollowTheAddresses(t *testing.T) {
 	}
 
 	readErr = errors.New("no interfaces today")
-	if _, changed := l.refreshAddrs(read, local, rec); changed || len(rec.calls) != 2 {
-		t.Fatalf("unreadable interfaces: changed %v, mDNS given %v", changed, rec.calls)
+	readings := len(rec.on)
+	if _, changed := l.refreshAddrs(read, local, rec); changed || len(rec.calls) != 2 || len(rec.on) != readings {
+		t.Fatalf("unreadable interfaces: changed %v, mDNS given %v, and told to join on %v", changed, rec.calls, rec.on[readings:])
 	}
 	if got := l.publishableNow([]netaddr.TransportAddr{relay, lanAddr}); !slices.Equal(got, []netaddr.TransportAddr{relay}) {
 		t.Fatalf("while the interfaces cannot be read the record holds %v, want the relay alone", got)

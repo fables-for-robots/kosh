@@ -4,7 +4,6 @@ package irohnet
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,10 +15,9 @@ import (
 )
 
 // listenMDNS binds the mDNS port, sharing it with other responders on
-// the machine, and joins the group on every interface whose addresses
-// are announced (announcesOn). It fails when that cannot be had: the port
-// taken without sharing, no interface to join on, or no way to read where
-// a packet was sent.
+// the machine. The group it joins later, on the interfaces setInterfaces
+// is given. It fails when the port cannot be had, taken without sharing,
+// or there is no way to read where a packet was sent.
 func listenMDNS(ctx context.Context, id irohkey.EndpointID, log *slog.Logger) (*mdnsAnnouncer, error) {
 	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
 		var serr error
@@ -41,8 +39,9 @@ func listenMDNS(ctx context.Context, id irohkey.EndpointID, log *slog.Logger) (*
 	p := ipv4.NewPacketConn(pc)
 	_ = p.SetMulticastLoopback(true) // clients on this machine must hear it
 	_ = p.SetMulticastTTL(255)
-	// Where a packet was sent: only questions to the group are answered.
-	if err := p.SetControlMessage(ipv4.FlagDst, true); err != nil {
+	// Where a packet was sent, and on which interface it arrived: only
+	// questions to the group are answered, and only where it is joined.
+	if err := p.SetControlMessage(ipv4.FlagDst|ipv4.FlagInterface, true); err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("mdns: the destination of packets cannot be read: %w", err)
 	}
@@ -52,12 +51,10 @@ func listenMDNS(ctx context.Context, id irohkey.EndpointID, log *slog.Logger) (*
 		pc:     pc,
 		p:      p,
 		kick:   make(chan struct{}, 1),
+		grp:    p,
 		joined: make(map[int]net.Interface),
 	}
 	m.send = m.multicast
-	if m.join() == 0 {
-		pc.Close()
-		return nil, errors.New("mdns: no multicast interface")
-	}
+	m.sendOn = m.writeOn
 	return m, nil
 }

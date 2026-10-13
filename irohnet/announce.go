@@ -22,9 +22,11 @@ import (
 // relayWait is how long Listen waits for the home relay.
 const relayWait = 15 * time.Second
 
-// addrAnnouncer is what refreshAddrs hands the addresses to: mDNS.
+// addrAnnouncer is what refreshAddrs hands the addresses to, and at
+// every reading the interfaces that have them: mDNS.
 type addrAnnouncer interface {
 	setAddrs(addrs []netip.AddrPort)
+	setInterfaces(on []net.Interface)
 }
 
 // addrRefresh is how often the machine's addresses are read again, so
@@ -96,7 +98,11 @@ func (l *Listener) announce(ctx context.Context, cfg Config) error {
 // refreshAddrs reads the machine's addresses and, when what is to be
 // announced has changed, pins the new addresses as the endpoint's direct
 // addresses, which makes the pkarr record anew, and hands them to m, when
-// there is mDNS. It returns the addresses and whether they changed.
+// there is mDNS. The interfaces that have the addresses it hands to m at
+// every reading, changed or not, before the addresses: an interface that
+// came is joined before it is announced on, and one that went hears the
+// goodbye of what was announced on it. It returns the addresses and
+// whether they changed.
 func (l *Listener) refreshAddrs(read func() ([]iface, error), local netip.AddrPort, m addrAnnouncer) ([]netip.AddrPort, bool) {
 	ifaces, err := read()
 	if err != nil {
@@ -115,6 +121,9 @@ func (l *Listener) refreshAddrs(read func() ([]iface, error), local netip.AddrPo
 	old := l.announced
 	l.announced, l.hidden = addrs, hidden
 	l.amu.Unlock()
+	if m != nil {
+		m.setInterfaces(announcingOn(ifaces, addrs))
+	}
 	if slices.Equal(old, addrs) {
 		return addrs, false
 	}
@@ -204,6 +213,7 @@ func isDockerBridge(name string) bool {
 // with interfaces the test makes up.
 type iface struct {
 	name  string
+	index int
 	flags net.Flags
 	addrs []net.Addr
 }
@@ -222,7 +232,7 @@ func readInterfaces() ([]iface, error) {
 		if err != nil {
 			return nil, fmt.Errorf("addresses of %s: %w", ifc.Name, err)
 		}
-		out = append(out, iface{name: ifc.Name, flags: ifc.Flags, addrs: addrs})
+		out = append(out, iface{name: ifc.Name, index: ifc.Index, flags: ifc.Flags, addrs: addrs})
 	}
 	return out, nil
 }
@@ -238,7 +248,7 @@ func isLAN(flags net.Flags) bool {
 
 // announcesOn reports whether the addresses of the interface name with
 // flags are announced: a LAN interface that is not one of Docker's
-// bridges. mDNS joins and sends on these interfaces alone.
+// bridges.
 func announcesOn(name string, flags net.Flags) bool {
 	return isLAN(flags) && !isDockerBridge(name)
 }
@@ -286,6 +296,41 @@ func announcedAddrs(ifaces []iface, local netip.AddrPort) []netip.AddrPort {
 			}
 			seen[ip] = true
 			out = append(out, netip.AddrPortFrom(ip, local.Port()))
+		}
+	}
+	return out
+}
+
+// announcingOn returns the interfaces mDNS joins the group and sends on:
+// those that have one of the announced addresses, in the order of
+// ifaces. An address that several interfaces have counts for the first
+// of them alone, as announcedAddrs announces it once: a node whose
+// network gives every pod's veth the same gateway address (kindnet does)
+// is joined on one of them and not on as many as it has pods. An
+// interface without an announced address, a veth with none or a link's
+// with a link-local one alone, is not among them: its link gets no
+// announcement, and the socket's group memberships, of which the kernel
+// allows a few (20 on Linux), are not spent on it.
+func announcingOn(ifaces []iface, announced []netip.AddrPort) []net.Interface {
+	want := make(map[netip.Addr]bool, len(announced))
+	for _, ap := range announced {
+		want[ap.Addr()] = true
+	}
+	var out []net.Interface
+	for _, ifc := range ifaces {
+		if !announcesOn(ifc.name, ifc.flags) {
+			continue
+		}
+		has := false
+		for _, ip := range ifaceIPs(ifc) {
+			if want[ip] {
+				// Counted for this interface, and for no later one.
+				delete(want, ip)
+				has = true
+			}
+		}
+		if has {
+			out = append(out, net.Interface{Index: ifc.index, Name: ifc.name, Flags: ifc.flags})
 		}
 	}
 	return out
