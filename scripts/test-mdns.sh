@@ -15,8 +15,9 @@
 # minutes the first time and is kept for the next.
 #
 # kosh needs an API server: the script makes a kind cluster of its own,
-# kosh-mdns-<random>, with a kubeconfig of its own, unless KUBECONFIG
-# names one. It removes what it built, started and made when it ends.
+# kosh-mdns-<random>, with a kubeconfig of its own, unless
+# KOSH_E2E_KUBECONFIG names one; the KUBECONFIG of the environment is not
+# used. It removes what it built, started and made when it ends.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -46,6 +47,7 @@ CLUSTER=kosh-mdns-$RANDOM_ID
 
 CREATED_CLUSTER=
 KOSH=
+BUILDING=      # a build of iroh-ssh is under way, in $CACHE/iroh-ssh-build
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { echo "== $*"; }
@@ -57,6 +59,7 @@ cleanup() {
     kill "$KOSH" 2>/dev/null
     wait "$KOSH" 2>/dev/null
   fi
+  [ -z "$BUILDING" ] || rm -rf "$CACHE/iroh-ssh-build"
   if [ "$status" != 0 ] && [ -s "$WORK/kosh.log" ]; then
     echo "== kosh's log, the test having failed"
     cat "$WORK/kosh.log"
@@ -74,6 +77,7 @@ iroh_ssh=$CACHE/iroh-ssh-$IROH_SSH_COMMIT/bin/iroh-ssh
 if [ ! -x "$iroh_ssh" ]; then
   echo "building it with Nix's cargo (a few minutes)"
   build=$CACHE/iroh-ssh-build
+  BUILDING=1
   rm -rf "$build"
   git clone --quiet "$IROH_SSH_REPO" "$build/src"
   git -C "$build/src" checkout --quiet "$IROH_SSH_COMMIT"
@@ -81,12 +85,14 @@ if [ ! -x "$iroh_ssh" ]; then
     nix shell --inputs-from "$FLAKE" nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc \
     --command cargo install --quiet --locked --path "$build/src" --root "$CACHE/iroh-ssh-$IROH_SSH_COMMIT"
   rm -rf "$build"
+  BUILDING=
 fi
 echo "ok   $iroh_ssh"
 
 # An API server for kosh to show.
-if [ -n "${KUBECONFIG:-}" ]; then
-  step "the cluster of $KUBECONFIG"
+if [ -n "${KOSH_E2E_KUBECONFIG:-}" ]; then
+  step "the cluster of $KOSH_E2E_KUBECONFIG"
+  export KUBECONFIG=$KOSH_E2E_KUBECONFIG
 else
   step "the kind cluster $CLUSTER"
   export KUBECONFIG=$WORK/kubeconfig
@@ -101,7 +107,8 @@ ssh-keygen -q -t ed25519 -N '' -C alice@kosh-mdns -f "$WORK/full"
 cp "$WORK/full.pub" "$WORK/authorized_keys"
 "$WORK/kosh" id --state-dir "$WORK/state" >"$WORK/id"
 ENDPOINT=$(sed -n 's/^endpoint ID *//p' "$WORK/id")
-[ -n "$ENDPOINT" ] || fail "kosh id printed no endpoint ID"
+sed -n 's/^host key *//p' "$WORK/id" >"$WORK/host_key.pub"
+[ -n "$ENDPOINT" ] && [ -s "$WORK/host_key.pub" ] || fail "kosh id printed no endpoint ID or host key"
 "$WORK/kosh" serve --ssh-listen "" --iroh-relay=false --iroh-mdns=true \
   --state-dir "$WORK/state" --authorized-keys "$WORK/authorized_keys" --kubeconfig "$KUBECONFIG" \
   2>"$WORK/kosh.log" &
@@ -119,6 +126,7 @@ grep 'mDNS' "$WORK/kosh.log" || true
 step "iroh-ssh, by mDNS"
 KOSH_E2E_MDNS=1 \
   KOSH_E2E_FULL_KEY=$WORK/full \
+  KOSH_E2E_HOST_KEY=$WORK/host_key.pub \
   KOSH_E2E_ENDPOINT=$ENDPOINT \
   KOSH_E2E_IROH_SSH=$iroh_ssh \
   KOSH_E2E_LOG=$WORK/kosh.log \

@@ -2,3 +2,6 @@ state:
   existingSecret: kosh-state
 iroh:
   enabled: false
+  # Set, so that the checks see they have no effect while iroh is off.
+  port: 4436
+  hostNetwork: true

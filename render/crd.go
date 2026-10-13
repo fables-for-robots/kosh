@@ -1,6 +1,6 @@
-// Follows k9s's internal/render/crd.go (Apache-2.0), except that NAME is
-// the definition's name, and that a definition that is not Established is
-// invalid.
+// Derived from k9s's internal/render/crd.go, Copyright Authors of K9s, Apache-2.0 (see LICENSES/Apache-2.0.txt); changed for kosh.
+// Unlike k9s's, NAME is the definition's name, and a definition that is
+// not Established is invalid.
 
 package render
 

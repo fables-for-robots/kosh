@@ -33,7 +33,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "kosh.serviceAccountName" . }}
-      {{- if .Values.iroh.hostNetwork }}
+      {{- if and .Values.iroh.enabled .Values.iroh.hostNetwork }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
@@ -58,19 +58,19 @@ spec:
             - --iroh={{ .Values.iroh.enabled }}
             - --iroh-relay={{ .Values.iroh.relay }}
             - --iroh-mdns={{ .Values.iroh.mdns }}
-            {{- if .Values.iroh.port }}
+            {{- if and .Values.iroh.enabled .Values.iroh.port }}
             - --iroh-bind=0.0.0.0:{{ .Values.iroh.port }}
             {{- end }}
             - --state-dir=/var/lib/kosh
             - --authorized-keys=/etc/kosh/authorized_keys
-          {{- if or .Values.ssh.enabled .Values.iroh.port }}
+          {{- if or .Values.ssh.enabled (and .Values.iroh.enabled .Values.iroh.port) }}
           ports:
             {{- if .Values.ssh.enabled }}
             - name: ssh
               containerPort: {{ .Values.ssh.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.iroh.port }}
+            {{- if and .Values.iroh.enabled .Values.iroh.port }}
             - name: iroh
               containerPort: {{ .Values.iroh.port }}
               protocol: UDP

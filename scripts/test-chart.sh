@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # Tests the Helm chart at charts/kosh: lint, render, schemas, and the
-# refusals. Run from the repository root. Needs helm, kubeconform and yq;
-# when they are not on the PATH the script runs itself under Nix.
+# refusals. Runs from any directory. Needs helm, kubeconform and yq; when
+# they are not on the PATH the script runs itself in the flake's bare shell.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 if ! command -v helm >/dev/null || ! command -v kubeconform >/dev/null || ! command -v yq >/dev/null; then
-  exec nix shell nixpkgs#kubernetes-helm nixpkgs#kubeconform nixpkgs#yq-go --command "$0" "$@"
+  if [ -n "${KOSH_CHART_IN_SHELL:-}" ]; then
+    echo "FAIL: helm, kubeconform and yq are not all in the development shell" >&2
+    exit 1
+  fi
+  # The flake: a copy of the tree that is not a git repository needs path:.
+  FLAKE=.
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || FLAKE=path:.
+  # Not "$0": it may be relative to the directory the script was called from.
+  KOSH_CHART_IN_SHELL=1 exec nix develop "$FLAKE#bare" --command scripts/test-chart.sh "$@"
 fi
 
 CHART=charts/kosh
@@ -26,6 +34,18 @@ render() {
   helm template kosh "$CHART" -f "$CI/$c-values.yaml" >"$OUT/$c.yaml" || fail "$c: helm template"
   kubeconform -strict -summary "$OUT/$c.yaml" || fail "$c: kubeconform"
   echo "ok   conforms"
+}
+
+# notes CASE: the text of NOTES.txt rendered with the values of CASE.
+# helm template leaves NOTES.txt out, so a copy of the chart gets a
+# ConfigMap that holds it.
+notes() {
+  if [ ! -d "$OUT/notes-chart" ]; then
+    cp -R "$CHART" "$OUT/notes-chart"
+    printf '%s\n' 'apiVersion: v1' 'kind: ConfigMap' 'metadata:' '  name: notes' 'data:' \
+      '  notes: {{ include "kosh/templates/NOTES.txt" . | quote }}' >"$OUT/notes-chart/templates/zz-notes.yaml"
+  fi
+  helm template kosh "$OUT/notes-chart" -f "$CI/$1-values.yaml" --show-only templates/zz-notes.yaml | yq .data.notes
 }
 
 # q CASE KIND EXPR: yq over the object of KIND in the rendered CASE.
@@ -79,6 +99,7 @@ eq secret Deployment ".spec.template.metadata.annotations" null "no checksum ann
 eq secret Deployment "$D.hostNetwork" null "no host network"
 eq secret Deployment "$C.args | join(\" \")" "serve --ssh-listen=:2222 --iroh=true --iroh-relay=true --iroh-mdns=true --state-dir=/var/lib/kosh --authorized-keys=/etc/kosh/authorized_keys" "arguments"
 eq secret ClusterRoleBinding .roleRef.name cluster-admin "binds cluster-admin"
+eq secret ClusterRoleBinding .metadata.name kosh-cluster-admin "the binding is named for cluster-admin"
 count secret PersistentVolumeClaim 0
 count secret ServiceAccount 1
 count secret ConfigMap 1
@@ -107,6 +128,11 @@ eq hostnetwork Deployment "$D.dnsPolicy" ClusterFirstWithHostNet "DNS policy"
 eq hostnetwork Deployment "$C.args[] | select(test(\"^--iroh-bind\"))" "--iroh-bind=0.0.0.0:4436" "iroh bind"
 eq hostnetwork Deployment "$C.ports[] | select(.name == \"iroh\") | .protocol" UDP "UDP container port"
 eq hostnetwork Deployment "$C.ports[] | select(.name == \"iroh\") | .containerPort" 4436 "UDP container port number"
+HOSTNET_NOTE="iroh.hostNetwork puts the pod on the node's network: SSH listens on port 2222 of every address of the node, whatever service.type is."
+[ "$(notes hostnetwork | grep -cF "$HOSTNET_NOTE")" = 1 ] || fail "hostnetwork: NOTES.txt does not say what the host network costs"
+echo "ok   the notes say what the host network costs"
+[ "$(notes secret | grep -c hostNetwork)" = 0 ] || fail "secret: NOTES.txt speaks of the host network without it"
+echo "ok   no word of the host network without it"
 
 # --- no-ssh
 render no-ssh
@@ -119,6 +145,13 @@ eq no-ssh Deployment "$C.ports" null "no container ports"
 # --- no-iroh
 render no-iroh
 eq no-iroh Deployment "$C.args[] | select(test(\"^--iroh=\"))" "--iroh=false" "iroh off"
+eq no-iroh Deployment "$C.args | map(select(test(\"^--iroh-bind\"))) | length" 0 "no iroh bind"
+eq no-iroh Deployment "$C.ports | map(select(.protocol == \"UDP\")) | length" 0 "no UDP container port"
+eq no-iroh Deployment "$C.ports | map(.name) | join(\",\")" ssh "the ssh port alone"
+eq no-iroh Deployment "$D.hostNetwork" null "no host network"
+eq no-iroh Deployment "$D.dnsPolicy" null "no DNS policy"
+[ "$(notes no-iroh | grep -c hostNetwork)" = 0 ] || fail "no-iroh: NOTES.txt speaks of the host network without iroh"
+echo "ok   no word of the host network without iroh"
 
 # --- keys
 render keys
@@ -131,6 +164,24 @@ eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("^read-
 # --- narrow-rbac
 render narrow-rbac
 eq narrow-rbac ClusterRoleBinding .roleRef.name view "binds view"
+eq narrow-rbac ClusterRoleBinding .metadata.name kosh-view "the binding is named for view"
+# A changed role is a new binding, which Helm makes and the old one it
+# removes: a binding's roleRef cannot be changed.
+[ "$(q secret ClusterRoleBinding .metadata.name)" != "$(q narrow-rbac ClusterRoleBinding .metadata.name)" ] ||
+  fail "narrow-rbac: the binding of view is named as that of cluster-admin"
+echo "ok   another role is another binding"
+
+# --- system-role
+render system-role
+eq system-role ClusterRoleBinding .roleRef.name system:aggregate-to-view "binds system:aggregate-to-view"
+eq system-role ClusterRoleBinding .metadata.name kosh-system:aggregate-to-view "the binding is named for system:aggregate-to-view"
+
+# --- bool-role: a role's name that YAML would read as a boolean
+render bool-role
+eq bool-role ClusterRoleBinding '.roleRef.name | tag' '!!str' "the role's name is a string"
+eq bool-role ClusterRoleBinding .roleRef.name true "binds true"
+eq bool-role ClusterRoleBinding '.metadata.name | tag' '!!str' "the binding's name is a string"
+eq bool-role ClusterRoleBinding .metadata.name kosh-true "the binding is named for true"
 
 # --- the refusals
 # refuses NAME MESSAGE ARGS...: helm template with ARGS must fail with MESSAGE on standard error.

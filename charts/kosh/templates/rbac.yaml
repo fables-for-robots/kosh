@@ -1,14 +1,19 @@
 {{- if .Values.rbac.create }}
+{{- /*
+The binding is named for its role: a binding's roleRef cannot be
+changed, so another role is another binding, which helm upgrade makes
+while it removes the old one.
+*/}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "kosh.fullname" . }}
+  name: {{ printf "%s-%s" (include "kosh.fullname" .) .Values.rbac.clusterRole | quote }}
   labels:
     {{- include "kosh.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ .Values.rbac.clusterRole }}
+  name: {{ .Values.rbac.clusterRole | quote }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "kosh.serviceAccountName" . }}

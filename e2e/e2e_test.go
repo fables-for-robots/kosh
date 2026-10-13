@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -682,6 +683,13 @@ func replicas(t *testing.T) string {
 	return kubectl(t, "--namespace", "default", "get", "deploy", "web", "-o", "jsonpath={.spec.replicas}")
 }
 
+// The keys of a scale to 3 replicas, once its dialog is open: the field
+// set to 3, then enter (to Cancel), right (to Scale), enter.
+var (
+	scaleTo3     = []string{keyBackspace, "3"}
+	scaleConfirm = []string{keyEnter, keyRight, keyEnter}
+)
+
 func TestSSHScales(t *testing.T) {
 	inCluster(t)
 	k := fullKey(t)
@@ -692,17 +700,19 @@ func TestSSHScales(t *testing.T) {
 	c.waitFor("Pods(default)")
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
+	// The hint a read-only key is not shown (TestReadOnlyKey).
+	c.waitUntil(wait, "the hint <s> Scale", func(lines []string) bool { return lineWith(lines, "<s> Scale") })
 	c.send("s")
 	c.waitFor("Scale deployments/default/web?", "Replicas")
-	c.send(keyBackspace, "3")
+	c.send(scaleTo3...)
 	c.waitUntil(wait, "the field holds 3", func(lines []string) bool {
 		return row(lines, "Replicas", "3") != "" || lineWith(lines, "Replicas", " 3 ")
 	})
-	c.send(keyEnter) // from the field to Cancel
+	c.send(scaleConfirm[0]) // from the field to Cancel
 	c.waitFor("[ Cancel ]")
-	c.send(keyRight)
+	c.send(scaleConfirm[1])
 	c.waitFor("[ Scale ]")
-	c.send(keyEnter)
+	c.send(scaleConfirm[2])
 
 	eventually(t, 10*time.Second, "the deployment web has 3 replicas", func() bool { return replicas(t) == "3" },
 		func() string { return "replicas: " + replicas(t) + "\nthe screen:\n" + c.scr.String() })
@@ -711,15 +721,20 @@ func TestSSHScales(t *testing.T) {
 	}, func() string { return "kosh's log:\n" + koshLog(t) })
 }
 
-// podExists reports whether the pod is there and not being deleted.
-func podExists(t *testing.T, name string) bool {
+// podUID returns the UID of the pod when it is there and not being
+// deleted, and "" otherwise.
+func podUID(t *testing.T, name string) string {
 	t.Helper()
 	out, err := run("kubectl", "--namespace", "default", "get", "pod", name, "--ignore-not-found",
-		"-o", "jsonpath={.metadata.name} {.metadata.deletionTimestamp}")
+		"-o", "jsonpath={.metadata.uid} {.metadata.deletionTimestamp}")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.TrimSpace(out) == name
+	f := strings.Fields(out)
+	if len(f) != 1 {
+		return ""
+	}
+	return f[0]
 }
 
 func TestSSHKillAsksFirst(t *testing.T) {
@@ -730,15 +745,25 @@ func TestSSHKillAsksFirst(t *testing.T) {
 	c.waitRow("web")
 	c.send(keyEnter)
 	pod := c.firstPodOfWeb()
+	uid := podUID(t, pod)
+	if uid == "" {
+		t.Fatalf("the pod %s is not there, or is being deleted", pod)
+	}
 	question := "Kill pods/default/" + pod + "?"
+	killed := func() []string { return logLines(t, "action", "action", "kill", "object", "pods/default/"+pod) }
 
 	// The focus is on Cancel: enter at once kills nothing.
 	c.send(keyCtrlK)
 	c.waitFor(question, "[ Cancel ]")
 	c.send(keyEnter)
 	c.waitUntil(wait, "the dialog is gone", func(lines []string) bool { return !lineWith(lines, question) })
-	if !podExists(t, pod) {
-		t.Fatalf("the pod %s is gone after Cancel", pod)
+	// Nothing is to be waited for: a kill would have happened by now.
+	time.Sleep(2 * time.Second)
+	if got := podUID(t, pod); got != uid {
+		t.Fatalf("after Cancel the pod %s (UID %s) is gone or being deleted; UID now %q", pod, uid, got)
+	}
+	if lines := killed(); len(lines) > 0 {
+		t.Fatalf("after Cancel kosh's log has a kill: %s", lines[0])
 	}
 
 	c.send(keyCtrlK)
@@ -746,12 +771,28 @@ func TestSSHKillAsksFirst(t *testing.T) {
 	c.send(keyRight)
 	c.waitFor("[ Kill ]")
 	c.send(keyEnter)
-	eventually(t, wait, "the pod "+pod+" is deleted", func() bool { return !podExists(t, pod) },
+	eventually(t, wait, "the pod "+pod+" is deleted", func() bool { return podUID(t, pod) == "" },
 		func() string { return "the screen:\n" + c.scr.String() })
+	eventually(t, wait, "kosh's log has the kill", func() bool { return len(killed()) > 0 },
+		func() string { return "kosh's log:\n" + koshLog(t) })
 }
 
 // secretValue is the value of the Secret hidden.
 const secretValue = "kosh-e2e-secret-value"
+
+// secretForms are the forms a leak of the Secret's value would take: as
+// it is, as x shows it, and in base64, as the YAML of the Secret has it.
+var secretForms = []string{secretValue, base64.StdEncoding.EncodeToString([]byte(secretValue))}
+
+// noSecret fails the test when any of secretForms was ever on c's screen,
+// or in what kosh sent it with the escape sequences taken out, since c's
+// screen began watching for them.
+func noSecret(t *testing.T, c *term, when string) {
+	t.Helper()
+	if seen := c.scr.seen(); len(seen) > 0 {
+		t.Fatalf("%s: the Secret's value reached the terminal: %s", when, strings.Join(seen, "\n"))
+	}
+}
 
 func TestReadOnlyKey(t *testing.T) {
 	inCluster(t)
@@ -760,17 +801,9 @@ func TestReadOnlyKey(t *testing.T) {
 	c.waitUntil(wait, "the key's name with [read-only] in the header", func(lines []string) bool {
 		return lineWith(lines, "Key:", k.name+" [read-only]")
 	})
-	// noSecret checks, at every step, that the Secret's value is not on
-	// the screen, and was never sent to it.
-	noSecret := func(when string) {
-		t.Helper()
-		if strings.Contains(c.scr.String(), secretValue) {
-			t.Fatalf("%s: the screen shows the Secret's value:\n%s", when, c.scr)
-		}
-		if strings.Contains(c.scr.raw(), secretValue) {
-			t.Fatalf("%s: kosh sent the Secret's value to a read-only key", when)
-		}
-	}
+	// From here on, every write to the terminal is looked at for the
+	// Secret's value in each of its forms.
+	c.scr.watch(secretForms...)
 
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
@@ -778,9 +811,12 @@ func TestReadOnlyKey(t *testing.T) {
 		t.Errorf("a read-only key is offered <s> Scale:\n%s", c.scr)
 	}
 	before := replicas(t)
+	// What TestSSHScales types to scale web to 3.
 	c.send("s")
-	// Nothing is to be waited for: what s would open would be there by
-	// now.
+	c.send(scaleTo3...)
+	c.send(scaleConfirm...)
+	// Nothing is to be waited for: what s would open or do would be there
+	// by now.
 	time.Sleep(2 * time.Second)
 	if lineWith(c.scr.lines(), "Replicas") || lineWith(c.scr.lines(), "Scale deployments/") {
 		t.Errorf("s opened something for a read-only key:\n%s", c.scr)
@@ -788,25 +824,31 @@ func TestReadOnlyKey(t *testing.T) {
 	if after := replicas(t); after != before {
 		t.Errorf("the replicas of web went from %s to %s", before, after)
 	}
+	if lines := logLines(t, "action", "key", k.name, "action", "scale"); len(lines) > 0 {
+		t.Errorf("kosh's log has a scale of the read-only key: %s", lines[0])
+	}
 
-	c.send(":secrets" + keyEnter)
+	// The keys above may have gone into web's pods: name the namespace.
+	c.send(":secrets default" + keyEnter)
 	c.waitFor("Secrets(default)")
 	c.waitRow("hidden")
-	noSecret("the table of secrets")
+	noSecret(t, &c.term, "the table of secrets")
 	for _, key := range []string{"y", "d", "x"} {
 		c.send(key)
 		c.waitUntil(wait, key+" on a Secret is refused, and the table stays", func(lines []string) bool {
 			return lineWith(lines, "this key is read-only") && lineWith(lines, "Secrets(default)") && row(lines, "hidden") != ""
 		})
-		noSecret(key + " on the Secret")
+		noSecret(t, &c.term, key+" on the Secret")
 		// The flash goes after 5 seconds; the next key's own is then
 		// to be seen.
 		c.waitUntil(wait, "the flash is gone", func(lines []string) bool { return !lineWith(lines, "this key is read-only") })
 		if row(c.scr.lines(), "hidden") == "" {
 			t.Fatalf("after %s the table of secrets is gone:\n%s", key, c.scr)
 		}
-		noSecret("after " + key)
+		noSecret(t, &c.term, "after "+key)
 	}
+
+	noSecret(t, &c.term, "at the end")
 
 	eventually(t, wait, "kosh's log has a refused line", func() bool {
 		return len(logLines(t, "refused", "key", k.name)) > 0
@@ -947,11 +989,24 @@ func irohSSH(t *testing.T, k key) *ptySession {
 	if cfg.noNetwork {
 		t.Skip("KOSH_E2E_NO_NETWORK=1: iroh-ssh reaches kosh through number0's DNS and a relay")
 	}
+	return startPTY(t, irohSSHCommand(t, k), 120, 40)
+}
+
+// irohSSHCommand is the real iroh-ssh to kosh's endpoint ID as k, with
+// kosh's host key checked: iroh-ssh hands ssh the endpoint ID as the
+// host's name, so a known_hosts line of the endpoint ID and the host key
+// is what ssh checks the key against. Its home is a temporary directory.
+func irohSSHCommand(t *testing.T, k key) *exec.Cmd {
+	t.Helper()
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(known, []byte(knownHostsLine(cfg.endpoint, hostKey(t))+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(cfg.irohSSH, "-i", k.file,
-		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes",
-		"kosh@"+cfg.endpoint)
+		"-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+known, "-o", "GlobalKnownHostsFile=/dev/null",
+		"-o", "IdentitiesOnly=yes", "kosh@"+cfg.endpoint)
 	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
-	return startPTY(t, cmd, 120, 40)
+	return cmd
 }
 
 // overIroh waits for the screen of an iroh-ssh session, through the
@@ -1011,7 +1066,20 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	r.waitFor("Pods(default)", ro.name+" [read-only]")
 
 	setKeys(t, full.line)
-	t.Cleanup(func() { setKeys(t, full.line, "read-only "+ro.line) })
+	t.Cleanup(func() {
+		// Back as it was, and waited for, so that a test after this one
+		// does not meet the kubelet's delay.
+		setKeys(t, full.line, "read-only "+ro.line)
+		var err error
+		eventually(t, 150*time.Second, "the read-only key is accepted again", func() bool {
+			var c *goSession
+			if c, err = dialSSH(t, ro, 120, 40); err == nil {
+				_ = c.client.Close()
+				return true
+			}
+			return false
+		}, func() string { return fmt.Sprintf("the last attempt: %v", err) })
+	})
 	changed := time.Now()
 
 	// The kubelet updates a mounted ConfigMap in its own time.
@@ -1033,8 +1101,11 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	f.waitFor("Namespaces(all)")
 	f.waitRow("kosh")
 
-	if _, err := dialSSH(t, ro, 120, 40); err == nil {
+	if c, err := dialSSH(t, ro, 120, 40); err == nil {
+		_ = c.client.Close()
 		t.Error("the read-only key is still accepted for a new connection")
+	} else if !strings.Contains(err.Error(), "unable to authenticate") {
+		t.Errorf("a new connection of the read-only key: %v, want a failed handshake", err)
 	}
 }
 
@@ -1044,13 +1115,9 @@ func TestIrohSSHFindsKoshByMDNS(t *testing.T) {
 	if !cfg.mdns {
 		t.Skip("KOSH_E2E_MDNS is not 1: scripts/test-mdns.sh runs this test")
 	}
-	need(t, "KOSH_E2E_FULL_KEY", "KOSH_E2E_ENDPOINT", "KOSH_E2E_IROH_SSH", "KOSH_E2E_LOG")
+	need(t, "KOSH_E2E_FULL_KEY", "KOSH_E2E_HOST_KEY", "KOSH_E2E_ENDPOINT", "KOSH_E2E_IROH_SSH", "KOSH_E2E_LOG")
 	k := fullKey(t)
-	cmd := exec.Command(cfg.irohSSH, "-i", k.file,
-		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes",
-		"kosh@"+cfg.endpoint)
-	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
-	p := startPTY(t, cmd, 120, 40)
+	p := startPTY(t, irohSSHCommand(t, k), 120, 40)
 	overIroh(t, p, "the pods, found by mDNS", func(lines []string) bool {
 		return lineWith(lines, "Pods(default)") && lineWith(lines, "Key:", k.name)
 	})

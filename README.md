@@ -86,6 +86,17 @@ kubectl --namespace kosh logs deploy/kosh | grep 'kosh is serving'
 
 ## Connect
 
+`ssh` checks kosh's host key as it checks any other's. Put the `host key`
+line `kosh id` printed into `~/.ssh/known_hosts`, once under the name of
+each way in: `[localhost]:2222` for the port-forward below, and the
+endpoint ID for `iroh-ssh`, which hands `ssh` the endpoint ID as the
+host's name:
+
+```
+[localhost]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+df698fcfd50f40b4d9dd9b30bbb74c740e649d594a796cb2e6f79302a53f0ad5 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+```
+
 **With `ssh`.** The Service is inside the cluster; a port-forward is
 enough for a first look:
 
@@ -96,8 +107,7 @@ ssh -t -p 2222 localhost
 
 `--set service.type=LoadBalancer` exposes it through a load balancer
 (`service.loadBalancerSourceRanges` says who may reach it), and `ssh -t
-<its address>` connects. `ssh` checks kosh's host key as it checks any
-other: the `host key` line of `kosh id` is what goes in `known_hosts`.
+<its address>` connects; its `known_hosts` line names that address.
 
 **With `iroh-ssh`**, by the endpoint ID alone:
 
@@ -147,20 +157,15 @@ read-only ssh-ed25519 AAAAC3Nza... bob@laptop
 ## What a key can do
 
 A full key can do whatever kosh's ServiceAccount can, and by default that
-is bound to `cluster-admin`: a full key is a cluster administrator. To
-make it less, bind a narrower ClusterRole when you install:
+is bound to `cluster-admin`: a full key is a cluster administrator. The
+ClusterRole it is bound to is `rbac.clusterRole`; to make it less, name a
+narrower one:
 
 ```sh
-helm install kosh ./charts/kosh --namespace kosh \
-  --set image.tag=VERSION \
-  --set state.existingSecret=kosh-state \
-  --set-file authorizedKeys=authorized_keys \
-  --set rbac.clusterRole=view
+helm upgrade kosh ./charts/kosh --namespace kosh --reuse-values --set rbac.clusterRole=view
 ```
 
-Kubernetes does not let a binding's role change, so `helm upgrade` cannot
-change `rbac.clusterRole` of an installed release. Where the
-ServiceAccount lacks a right, kosh shows the API's refusal.
+Where the ServiceAccount lacks a right, kosh shows the API's refusal.
 Kubernetes' audit log names kosh's ServiceAccount for everything kosh
 does; kosh's own log names the key, with a line for every action:
 
@@ -208,7 +213,7 @@ asks first.
 | `state.existingSecret` | unset | a Secret with `iroh.key` and `ssh_host_ed25519_key`, made by `kosh id` |
 | `state.persistence.enabled`, `.size`, `.storageClass` | `false`, `16Mi`, the default class | a PersistentVolumeClaim instead, on which kosh makes its keys at first start |
 | `rbac.create`, `rbac.clusterRole` | `true`, `cluster-admin` | the ClusterRole the ServiceAccount is bound to |
-| `serviceAccount.create`, `serviceAccount.name` | `true`, the release's name | |
+| `serviceAccount.create`, `serviceAccount.name` | `true`, the release's full name | |
 | `resources`, `nodeSelector`, `tolerations`, `affinity`, `podAnnotations`, `podLabels` | none | |
 
 The chart refuses to install without state (`state.existingSecret` or
@@ -220,6 +225,16 @@ The chart refuses to install without state (`state.existingSecret` or
 - A shell in a pod, attach, copying files.
 - Port-forward.
 - Metrics: the CPU and memory columns.
+
+## Known issues
+
+- **"Discovery produced no results" in the first minutes.** A connection
+  made with `iroh-ssh` before kosh has published where it is (in the first
+  minute or so after kosh starts) can fail with `Discovery produced no
+  results`, and go on failing for as long as your DNS resolver caches the
+  record it did not find, up to several minutes. Wait until the cache
+  forgets, or point your machine at another DNS resolver, one that has not
+  asked for the record yet.
 
 ## Development
 

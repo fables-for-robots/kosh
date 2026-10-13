@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"reflect"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/duration"
 
 	"github.com/fables-for-robots/kosh/render"
 )
@@ -275,6 +279,218 @@ func TestListPath(t *testing.T) {
 	} {
 		if got := listPath(tc.r, tc.namespace); got != tc.want {
 			t.Errorf("%v in %q: %s, want %s", tc.r.GVR, tc.namespace, got, tc.want)
+		}
+	}
+}
+
+// agedRow is a row of the API server's table whose object is the partial
+// metadata of namespace/name, created at created.
+func agedRow(t *testing.T, namespace, name string, created time.Time, cells ...any) metav1.TableRow {
+	t.Helper()
+	raw, err := json.Marshal(&metav1.PartialObjectMetadata{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "meta.k8s.io/v1", Kind: "PartialObjectMetadata"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, CreationTimestamp: metav1.NewTime(created)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metav1.TableRow{Cells: cells, Object: runtime.RawExtension{Raw: raw}}
+}
+
+// readTable returns the first table w shows with n rows.
+func readTable(t *testing.T, w Watch, now time.Time, n int) Table {
+	t.Helper()
+	var tab Table
+	eventually(t, "the first read", func() bool {
+		tab = w.Table(now)
+		return len(tab.Rows) == n
+	})
+	return tab
+}
+
+func TestGenericAgeSortsByCreation(t *testing.T) {
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	// The creation times humanise to the cells' texts, but are not what
+	// the texts say exactly: the keys must come from the times.
+	created := map[string]time.Time{
+		"old":    now.Add(-(10*24 + 3) * time.Hour),
+		"middle": now.Add(-(2*24*time.Hour + 40*time.Minute)),
+		"young":  now.Add(-(5*time.Minute + 7*time.Second)),
+	}
+	texts := map[string]string{"old": "10d", "middle": "2d", "young": "5m"}
+	for _, tc := range []struct{ name, typ string }{
+		{"Age", "string"},
+		{"Age", "date"},
+		{"AGE", "string"},
+		{"age", "date"},
+	} {
+		t.Run(tc.name+" "+tc.typ, func(t *testing.T) {
+			e, f := genericEnv(t, Options{})
+			f.set(&metav1.Table{
+				ColumnDefinitions: []metav1.TableColumnDefinition{
+					{Name: "Name", Type: "string"},
+					{Name: tc.name, Type: tc.typ},
+				},
+				Rows: []metav1.TableRow{
+					agedRow(t, "ns", "middle", created["middle"], "middle", texts["middle"]),
+					agedRow(t, "ns", "old", created["old"], "old", texts["old"]),
+					agedRow(t, "ns", "young", created["young"], "young", texts["young"]),
+					// A server that ignores includeObject: the key comes from the text.
+					tableRow(t, "", "", nil, "bare", "3h"),
+				},
+			}, nil)
+			w := watchOf(t, e.session(t), Query{Resource: e.resource(t, "example.com", "widgets")})
+			tab := readTable(t, w, now, 4)
+			if want := (render.Column{Name: "AGE", Numeric: true}); tab.Columns[2] != want {
+				t.Errorf("the Age column %+v, want %+v", tab.Columns[2], want)
+			}
+			byName := map[string]render.Row{}
+			for _, r := range tab.Rows {
+				byName[r.Cells[1]] = r
+			}
+			for name, ts := range created {
+				r := byName[name]
+				if r.Cells[2] != texts[name] {
+					t.Errorf("%s: text %q, want %q as the server sent it", name, r.Cells[2], texts[name])
+				}
+				if want := now.Sub(ts).Seconds(); r.Order[2] != want {
+					t.Errorf("%s: key %v, want %v, the seconds since its creation", name, r.Order[2], want)
+				}
+			}
+			// As the typed renderers' AGE: the youngest has the smallest key.
+			rows := append([]render.Row(nil), tab.Rows...)
+			sort.SliceStable(rows, func(i, j int) bool { return rows[i].Order[2] < rows[j].Order[2] })
+			var order []string
+			for _, r := range rows {
+				order = append(order, r.Cells[1])
+			}
+			if want := "young,bare,middle,old"; strings.Join(order, ",") != want {
+				t.Errorf("sorted by the keys: %v, want %s", order, want)
+			}
+			if bare := byName["bare"]; bare.Cells[2] != "3h" || bare.Order[2] != 3*3600 {
+				t.Errorf("a row without metadata: cell %q, key %v, want 3h and %v", bare.Cells[2], bare.Order[2], 3*3600)
+			}
+		})
+	}
+}
+
+func TestGenericDurationCells(t *testing.T) {
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	e, f := genericEnv(t, Options{})
+	long := strings.Repeat("9", 100000) + "s"
+	f.set(&metav1.Table{
+		ColumnDefinitions: []metav1.TableColumnDefinition{
+			{Name: "Name", Type: "string"},
+			{Name: "Last Seen", Type: "string"},
+			{Name: "Size", Type: "string"},
+			{Name: "Since", Type: "date"},
+			{Name: "Odd", Type: "string"},
+		},
+		Rows: []metav1.TableRow{
+			tableRow(t, "ns", "a", nil, "a", "2m30s", "3d", "120m", true),
+			tableRow(t, "ns", "b", nil, "b", "<none>", "big", now.Add(-time.Hour).Format(time.RFC3339), []any{1.0, "x"}),
+			tableRow(t, "ns", "c", nil, "c", "4d", "5m", nil, map[string]any{"k": nil}),
+			tableRow(t, "ns", "d", nil, "d", "2y120d", "", "soon", long),
+			// Fewer cells than columns.
+			tableRow(t, "ns", "e", nil, "e"),
+		},
+	}, nil)
+	w := watchOf(t, e.session(t), Query{Resource: e.resource(t, "example.com", "widgets")})
+	tab := readTable(t, w, now, 5)
+	numeric := map[string]bool{}
+	for _, c := range tab.Columns {
+		numeric[c.Name] = c.Numeric
+	}
+	// LAST SEEN holds durations and nothing else; SIZE holds text too.
+	if want := map[string]bool{"NAMESPACE": false, "NAME": false, "LAST SEEN": true, "SIZE": false, "SINCE": true, "ODD": false}; !reflect.DeepEqual(numeric, want) {
+		t.Errorf("numeric columns %v, want %v", numeric, want)
+	}
+	byName := map[string]render.Row{}
+	for _, r := range tab.Rows {
+		byName[r.Cells[1]] = r
+	}
+	day := 24 * time.Hour
+	for _, tc := range []struct {
+		row, text string
+		col       int
+		key       time.Duration
+	}{
+		{"a", "2m30s", 2, 2*time.Minute + 30*time.Second},
+		{"b", "<none>", 2, 0},
+		{"c", "4d", 2, 4 * day},
+		{"d", "2y120d", 2, (2*365 + 120) * day},
+		{"e", "", 2, 0},
+		{"a", "3d", 3, 3 * day},
+		{"b", "big", 3, 0},
+		{"c", "5m", 3, 5 * time.Minute},
+		{"a", "120m", 4, 120 * time.Minute},
+		{"b", "60m", 4, time.Hour},
+		{"c", "", 4, 0},
+		{"d", "soon", 4, 0},
+		{"a", "true", 5, 0},
+		{"d", long, 5, 0},
+	} {
+		r := byName[tc.row]
+		if r.Cells[tc.col] != tc.text || r.Order[tc.col] != tc.key.Seconds() {
+			t.Errorf("%s, column %s: %.20q with key %v, want %.20q with key %v",
+				tc.row, tab.Columns[tc.col].Name, r.Cells[tc.col], r.Order[tc.col], tc.text, tc.key.Seconds())
+		}
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	day := 24 * time.Hour
+	year := 365 * day
+	for _, tc := range []struct {
+		s    string
+		want time.Duration
+	}{
+		{"0s", 0},
+		{"5s", 5 * time.Second},
+		{"119s", 119 * time.Second},
+		{"5m", 5 * time.Minute},
+		{"2m30s", 2*time.Minute + 30*time.Second},
+		{"120m", 120 * time.Minute},
+		{"3h", 3 * time.Hour},
+		{"3h20m", 3*time.Hour + 20*time.Minute},
+		{"47h", 47 * time.Hour},
+		{"4d", 4 * day},
+		{"3d2h", 3*day + 2*time.Hour},
+		{"400d", 400 * day},
+		{"2y", 2 * year},
+		{"2y120d", 2*year + 120*day},
+		{"12y", 12 * year},
+		{"292y", 292 * year},
+		{"9223372036s", 9223372036 * time.Second},
+	} {
+		if got, ok := parseHumanDuration(tc.s); !ok || got != tc.want {
+			t.Errorf("%q: %v, %v, want %v", tc.s, got, ok, tc.want)
+		}
+	}
+	for _, s := range []string{
+		"m5", "5", "5 m", "5mm", "", "<none>", "n/a", "1e3s", "-5m", "+5m",
+		" 5m", "5m ", "5M", "s", "5x", "2s3m", "3h2s", "5m5m", "1d2h3m", "2m60s", "1.5h",
+		"0x10s", "\x005s", "99999999999999999999s", "300y", "9223372037s", "00000000005s",
+	} {
+		if got, ok := parseHumanDuration(s); ok {
+			t.Errorf("%q is a duration: %v", s, got)
+		}
+	}
+	// What the humaniser prints parses to a value it prints the same.
+	rnd := rand.New(rand.NewPCG(1, 2))
+	for i := 0; i < 200; i++ {
+		// Spread over the magnitudes: seconds to centuries.
+		d := time.Duration(rnd.Int64N(int64(1) << (rnd.IntN(32) + 30)))
+		for _, human := range []func(time.Duration) string{duration.HumanDuration, duration.ShortHumanDuration} {
+			text := human(d)
+			got, ok := parseHumanDuration(text)
+			if !ok {
+				t.Errorf("%v printed as %q does not parse", d, text)
+				continue
+			}
+			if again := human(got); again != text {
+				t.Errorf("%v printed as %q parses to %v, printed as %q", d, text, got, again)
+			}
 		}
 	}
 }
