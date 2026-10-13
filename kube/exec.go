@@ -7,9 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -41,6 +41,13 @@ const (
 // command, and when it ends, with how. Nothing of what passes on the
 // terminal is logged. A call that the checks refuse is logged once, as
 // the action's failure.
+//
+// When ctx or the session ends, the stream is closed at once, and Exec
+// returns as soon as a write to opts.Stdout that is under way has
+// returned: it waits for that write, so that nothing of the command's
+// output reaches the terminal after Exec returned. The Stdout a caller
+// gives must therefore fail such a write when the terminal is taken
+// away from it (an SSH channel does when its session ends).
 func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
 	ctx, release, err := s.begin(ctx, actExec, pod)
 	if err != nil {
@@ -53,7 +60,7 @@ func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (Ex
 		return ExecResult{}, err
 	}
 	s.logAction(ctx, actExec, pod, nil, slog.String("phase", "start"), container,
-		slog.Any("command", logWords(opts.Command, execMaxLogged)))
+		slog.String("command", logCommand(opts.Command, execMaxLogged)))
 	began := time.Now()
 	res, err := s.exec(ctx, pod, opts)
 	attrs := []slog.Attr{slog.String("phase", "end"), container,
@@ -87,19 +94,27 @@ func execLogged(err error) []slog.Attr {
 	return []slog.Attr{slog.String("error", loggableError(actExec, err).Error())}
 }
 
-// logWords returns words as the log holds them: each cleaned by
-// logText, and all of them cut to max bytes together.
-func logWords(words []string, max int) []string {
-	out := make([]string, 0, len(words))
-	for _, w := range words {
-		if max <= 0 {
+// logCommand returns the command as the log holds it: each word
+// cleaned by logText and quoted as Go quotes a string, the words joined
+// by one space, so that they stay apart whatever they hold:
+// "sh" "-c" "a b". What is longer than max bytes is cut after a whole
+// character and ends in logCut, within max.
+func logCommand(words []string, max int) string {
+	var b strings.Builder
+	for i, w := range words {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strconv.Quote(logText(w, len(w))))
+		if b.Len() > max {
 			break
 		}
-		w = logText(w, max)
-		out = append(out, w)
-		max -= len(w)
 	}
-	return out
+	s := b.String()
+	if len(s) > max {
+		s = cutText(s, max-len(logCut)) + logCut
+	}
+	return s
 }
 
 // logText returns s as the log holds it: without control characters,
@@ -146,22 +161,69 @@ func (s *session) checkExec(pod ObjectRef, opts ExecOptions) error {
 // exec runs the command on the pod's exec stream until it ends or ctx
 // does, and says how it ended.
 func (s *session) exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
-	in := &execInput{r: opts.Stdin}
-	out := &execOutput{w: opts.Stdout}
+	term := newExecTerm(ctx, opts)
 	stream := remotecommand.StreamOptions{
-		Stdout:            out,
-		Tty:               true,
-		TerminalSizeQueue: execSizes(ctx, opts),
+		Stdout: term.out,
+		Tty:    true,
 	}
 	if opts.Stdin != nil {
-		stream.Stdin = in
+		stream.Stdin = term.in
+	}
+	if term.sizes != nil {
+		// Not a nil *execSizeQueue in the interface: client-go would ask
+		// it.
+		stream.TerminalSizeQueue = term.sizes
 	}
 	err := s.stream(ctx, pod, opts.Container, opts.Command, stream)
-	// What the stream still runs after this neither reads the terminal
-	// anew nor writes to it.
-	in.letGo()
-	out.letGo()
-	return execOutcome(ctx, err, out.written())
+	term.letGo()
+	return execOutcome(ctx, err, term.out.written())
+}
+
+// execTerm is the terminal as the stream is given it: the caller's
+// input, output and sizes, each behind a guard that Exec closes before
+// it returns.
+//
+// What the stream still runs after that must hold nothing of the
+// session. It usually ends soon: client-go's heartbeat at its next
+// beat, its stdin copier with the caller's reader. But client-go
+// v0.37.1 has a race that leaves the stream's goroutines blocked for
+// good. In remotecommand's WebSocket executor (websocket.go), when the
+// context ends between the upgrade and the moment the read loop has set
+// its first read deadline (microseconds, as the stream opens), the
+// executor has returned and closed the connection, readDemuxLoop fails
+// to set the deadline on it and returns without closeAllStreamReaders,
+// and the error stream's reader, the stdout copier, the stdin waiter and
+// the stream's own goroutine wait on their pipes forever: four
+// goroutines, their pipes and a buffer of 32 KiB, for each time it
+// happens. It wants a fix upstream. Until then, letGo drops what the
+// guards hold of the session (its reader, its writer, its size), so
+// that what stays is client-go's memory only.
+type execTerm struct {
+	in    *execInput
+	out   *execOutput
+	sizes *execSizeQueue // nil without a Size
+}
+
+// execTermMade, when set, is given each execTerm Exec makes. Tests set
+// it.
+var execTermMade func(*execTerm)
+
+func newExecTerm(ctx context.Context, opts ExecOptions) *execTerm {
+	term := &execTerm{in: &execInput{r: opts.Stdin}, out: &execOutput{w: opts.Stdout}, sizes: execSizes(ctx, opts)}
+	if execTermMade != nil {
+		execTermMade(term)
+	}
+	return term
+}
+
+// letGo ends the stream's hold on the terminal: no read of it begins
+// after this, no write reaches it, no size is asked; and drops it.
+func (t *execTerm) letGo() {
+	t.in.letGo()
+	t.out.letGo()
+	if t.sizes != nil {
+		t.sizes.letGo()
+	}
 }
 
 // stream asks the API for the exec subresource of the pod, with the
@@ -251,8 +313,9 @@ func cutText(s string, n int) string {
 // execSizes is the terminal's sizes as the stream asks for them: the
 // size now, and then the size each time opts.Resized has a value, until
 // ctx is done. A size of zero or less in either direction is not sent.
-// Without opts.Size there is none.
-func execSizes(ctx context.Context, opts ExecOptions) remotecommand.TerminalSizeQueue {
+// A closed Resized means the size never changes again. Without
+// opts.Size there is none: nil.
+func execSizes(ctx context.Context, opts ExecOptions) *execSizeQueue {
 	if opts.Size == nil {
 		return nil
 	}
@@ -261,31 +324,57 @@ func execSizes(ctx context.Context, opts ExecOptions) remotecommand.TerminalSize
 
 type execSizeQueue struct {
 	ctx     context.Context
-	size    func() (width, height int)
 	resized <-chan struct{} // nil: the size never changes
 	asked   bool            // the size was asked once
+
+	mu   sync.Mutex
+	size func() (width, height int) // nil once Exec let go
 }
 
-// Next returns the next size to send, or nil when ctx is done. The
-// stream calls it from one goroutine.
+// Next returns the next size to send, or nil when ctx is done or Exec
+// let go of the terminal. The stream calls it from one goroutine.
 func (q *execSizeQueue) Next() *remotecommand.TerminalSize {
 	for {
+		if q.ctx.Err() != nil {
+			return nil
+		}
 		if q.asked {
 			select {
 			case <-q.ctx.Done():
 				return nil
-			case <-q.resized:
+			case _, ok := <-q.resized:
+				if !ok {
+					q.resized = nil
+					continue
+				}
 			}
 		}
 		q.asked = true
-		if q.ctx.Err() != nil {
+		if w, h, ok := q.ask(); !ok {
 			return nil
-		}
-		w, h := q.size()
-		if w > 0 && h > 0 {
+		} else if w > 0 && h > 0 {
 			return &remotecommand.TerminalSize{Width: uint16(min(w, math.MaxUint16)), Height: uint16(min(h, math.MaxUint16))}
 		}
 	}
+}
+
+// ask returns the terminal's size now; false once Exec let go of it.
+func (q *execSizeQueue) ask() (w, h int, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.size == nil || q.ctx.Err() != nil {
+		return 0, 0, false
+	}
+	w, h = q.size()
+	return w, h, true
+}
+
+// letGo drops the terminal's size: no call of it begins after this, and
+// one under way has returned.
+func (q *execSizeQueue) letGo() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.size = nil
 }
 
 // execOutput is the writer the stream is given: it passes the command's
@@ -317,12 +406,13 @@ func (o *execOutput) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// letGo ends the writes to the terminal: it waits for one that is under
-// way.
+// letGo ends the writes to the terminal, and drops it: it waits for one
+// that is under way.
 func (o *execOutput) letGo() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.closed = true
+	o.w = nil
 }
 
 // written returns how many bytes of output passed.
@@ -336,15 +426,23 @@ func (o *execOutput) written() int64 {
 // until Exec lets the terminal go. A read that is under way then is the
 // terminal's to end (ExecOptions.Stdin); no read begins after it.
 type execInput struct {
-	r      io.Reader
-	closed atomic.Bool
+	mu sync.Mutex
+	r  io.Reader // nil once Exec let go
 }
 
 func (i *execInput) Read(p []byte) (int, error) {
-	if i.closed.Load() {
+	i.mu.Lock()
+	r := i.r
+	i.mu.Unlock()
+	if r == nil {
 		return 0, io.EOF
 	}
-	return i.r.Read(p)
+	return r.Read(p)
 }
 
-func (i *execInput) letGo() { i.closed.Store(true) }
+// letGo drops the terminal's input: no read of it begins after this.
+func (i *execInput) letGo() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.r = nil
+}

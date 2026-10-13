@@ -314,6 +314,67 @@ func TestExecRequest(t *testing.T) {
 		t.Errorf("protocols %q, want v5.channel.k8s.io first", protocols)
 	}
 
+	t.Run("words that look like parameters", func(t *testing.T) {
+		got := make(chan *http.Request, 1)
+		f := execEnv(t, func(w http.ResponseWriter, r *http.Request) {
+			got <- r.Clone(context.Background())
+			execSucceeds(t)(w, r)
+		})
+		words := []string{"container=other", "a&container=other&stdin=false", "100%", "%2F", "a\nb", "a\x00b", "#x", "?tty=false"}
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), ExecOptions{Container: "web", Command: words}); err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		q := (<-got).URL.Query()
+		want := map[string][]string{
+			"container": {"web"},
+			"command":   words,
+			"stdin":     {"true"},
+			"stdout":    {"true"},
+			"tty":       {"true"},
+		}
+		if len(q) != len(want) {
+			t.Errorf("parameters %q", q)
+		}
+		for k, v := range want {
+			if !slices.Equal(q[k], v) {
+				t.Errorf("%s %q, want %q", k, q[k], v)
+			}
+		}
+	})
+
+	t.Run("hostile pod names", func(t *testing.T) {
+		for _, name := range []string{"web?container=other&stdin=false", "web#x", "a b", "web\nx", "web/exec", "web%2Fexec", "..", "."} {
+			got := make(chan *http.Request, 1)
+			f := execEnv(t, func(w http.ResponseWriter, r *http.Request) {
+				got <- r.Clone(context.Background())
+				execSucceeds(t)(w, r)
+			})
+			_, err := execRun(t, context.Background(), f.s, f.pod(name), ExecOptions{Container: "web", Command: []string{"sh"}})
+			if err != nil {
+				// Refused by the reference's check: nothing was sent.
+				if n := f.requests.Load(); n != 0 {
+					t.Errorf("%q: refused (%v) after %d requests", name, err, n)
+				}
+				t.Logf("%q is refused: %v", name, err)
+				continue
+			}
+			r := <-got
+			if want := "/api/v1/namespaces/default/pods/" + name + "/exec"; r.URL.Path != want {
+				t.Errorf("%q: path %q, want %q", name, r.URL.Path, want)
+			}
+			q := r.URL.Query()
+			for k, v := range map[string]string{"container": "web", "stdin": "true", "stdout": "true", "tty": "true", "command": "sh"} {
+				if !slices.Equal(q[k], []string{v}) {
+					t.Errorf("%q: %s %q", name, k, q[k])
+				}
+			}
+			if len(q) != 5 {
+				t.Errorf("%q: parameters %q", name, q)
+			}
+			t.Logf("%q reaches the API as %s", name, r.URL.EscapedPath())
+		}
+	})
+
 	t.Run("no container", func(t *testing.T) {
 		got := make(chan *http.Request, 1)
 		f := execEnv(t, func(w http.ResponseWriter, r *http.Request) {
@@ -563,6 +624,37 @@ func TestExecSizes(t *testing.T) {
 		}})
 		if s := receive(t, "a size", next(q)); s == nil || *s != (remotecommand.TerminalSize{Width: 81, Height: 25}) {
 			t.Errorf("size %v, want 81x25", s)
+		}
+	})
+
+	t.Run("a closed Resized means the size never changes again", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		asked := make(chan struct{}, 8)
+		resized := make(chan struct{})
+		close(resized)
+		q := execSizes(ctx, ExecOptions{Resized: resized, Size: func() (int, int) {
+			asked <- struct{}{}
+			return 80, 24
+		}})
+		if s := receive(t, "the first size", next(q)); s == nil {
+			t.Fatal("no first size")
+		}
+		second := next(q)
+		// A queue that took the closed channel for a change would ask
+		// at once; one that waits does nothing, which is seen by
+		// waiting a while.
+		select {
+		case s := <-second:
+			t.Fatalf("a second size %v", s)
+		case <-time.After(200 * time.Millisecond):
+		}
+		cancel()
+		if s := receive(t, "the queue ends", second); s != nil {
+			t.Errorf("after the end %v", s)
+		}
+		if len(asked) != 1 {
+			t.Errorf("Size was asked %d times, want once", len(asked))
 		}
 	})
 
@@ -894,6 +986,9 @@ func TestExecTerminalIsLetGoWhenExecReturns(t *testing.T) {
 			t.Fatal(err)
 		}
 		o.letGo()
+		if o.w != nil {
+			t.Error("the writer still holds the terminal's output")
+		}
 		if _, err := o.Write([]byte("cd")); err == nil {
 			t.Error("a write after Exec returned was taken")
 		}
@@ -920,8 +1015,63 @@ func TestExecTerminalIsLetGoWhenExecReturns(t *testing.T) {
 			t.Fatalf("Read %d, %v", n, err)
 		}
 		in.letGo()
+		if in.r != nil {
+			t.Error("the reader still holds the terminal's input")
+		}
 		if n, err := in.Read(b); n != 0 || err != io.EOF {
 			t.Errorf("a read after Exec returned: %d, %v", n, err)
+		}
+	})
+	t.Run("sizes", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		asked := 0
+		resized := make(chan struct{}, 1)
+		q := execSizes(ctx, ExecOptions{Size: func() (int, int) { asked++; return 80, 24 }, Resized: resized})
+		if s := q.Next(); s == nil {
+			t.Fatal("no first size")
+		}
+		// Exec lets go of the terminal and then ends the context.
+		q.letGo()
+		cancel()
+		if q.size != nil {
+			t.Error("the queue still holds the terminal's size")
+		}
+		resized <- struct{}{}
+		if s := q.Next(); s != nil {
+			t.Errorf("a size after Exec returned: %v", s)
+		}
+		if asked != 1 {
+			t.Errorf("Size was asked %d times, want once", asked)
+		}
+		if len(resized) != 1 {
+			t.Error("a change of size was taken after Exec returned")
+		}
+	})
+	t.Run("all of it, by Exec", func(t *testing.T) {
+		f := execEnv(t, execSucceeds(t))
+		term := newExecTerminal(t, 80, 24)
+		opts := term.options("sh")
+		var given *execTerm
+		execTermMade = func(term *execTerm) { given = term }
+		t.Cleanup(func() { execTermMade = nil })
+		// given is read after Exec returned, which execRun waits for.
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), opts); err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		if given == nil {
+			t.Fatal("Exec made no terminal")
+		}
+		if n, err := given.out.Write([]byte("late")); n != 0 || err == nil {
+			t.Errorf("a write after Exec returned: %d, %v", n, err)
+		}
+		if got := term.out.String(); got != "" {
+			t.Errorf("the terminal got %q", got)
+		}
+		if n, err := given.in.Read(make([]byte, 4)); n != 0 || err != io.EOF {
+			t.Errorf("a read after Exec returned: %d, %v", n, err)
+		}
+		if given.out.w != nil || given.in.r != nil || given.sizes.size != nil {
+			t.Error("the stream's terminal still holds the session's")
 		}
 	})
 }
@@ -958,17 +1108,16 @@ func execRecords(t *testing.T, f *execFixture) (start, end auditRecord) {
 }
 
 // command returns the command of a start record.
-func (r auditRecord) command(t *testing.T) []string {
+func (r auditRecord) command(t *testing.T) string {
 	t.Helper()
 	v, ok := r.Attrs["command"]
 	if !ok {
 		t.Fatalf("no command in %+v", r)
 	}
-	words, ok := v.Any().([]string)
-	if !ok {
-		t.Fatalf("command %v is a %T", v, v.Any())
+	if v.Kind() != slog.KindString {
+		t.Fatalf("command %v is a %v", v, v.Kind())
 	}
-	return words
+	return v.String()
 }
 
 // wantAttrs fails the test unless r has each of want, and none of
@@ -1026,8 +1175,8 @@ func TestExecLog(t *testing.T) {
 			t.Fatalf("Exec: %+v, %v", out.res, out.err)
 		}
 		start, end := execRecords(t, f)
-		if c := start.command(t); !slices.Equal(c, []string{"sh", "-c", "exec sh"}) {
-			t.Errorf("command %q", c)
+		if c := start.command(t); c != `"sh" "-c" "exec sh"` {
+			t.Errorf("command %s", c)
 		}
 		wantAttrs(t, start, nil, "duration", "started", "status", "error", "ended")
 		wantAttrs(t, end, map[string]string{"started": "true", "status": "0"}, "command", "error", "ended")
@@ -1117,15 +1266,79 @@ func TestExecLog(t *testing.T) {
 		}
 		start, _ := execRecords(t, f)
 		c := start.command(t)
-		if len(c) != 4 || c[0] != "sh" || c[1] != "-c" || c[2] != "echo [31mred2J\ufffd" {
-			t.Fatalf("command %q", c)
+		if want := "\"sh\" \"-c\" \"echo [31mred2J\ufffd\" \"xxx"; !strings.HasPrefix(c, want) {
+			t.Errorf("command %s, want it to begin with %s", c, want)
 		}
-		total := 0
-		for _, w := range c {
-			total += len(w)
+		if len(c) != 1024 || !strings.HasSuffix(c, "xx…") || !utf8.ValidString(c) {
+			t.Errorf("a command of %d bytes that ends in %q, want 1024 that end in the mark", len(c), c[max(0, len(c)-8):])
 		}
-		if total != 1024 || c[3] != long[:1024-len(c[0])-len(c[1])-len(c[2])] {
-			t.Errorf("the command's words are %d bytes, want 1024: %q", total, c)
+	})
+}
+
+// execTextLog makes f log through kosh's own handler, slog's text
+// handler, into the returned buffer, which is read after Exec returned.
+func execTextLog(f *execFixture) *bytes.Buffer {
+	var b bytes.Buffer
+	f.c.log = slog.New(slog.NewTextHandler(&b, nil))
+	return &b
+}
+
+// startLine returns the start line of the one Exec in a text log.
+func startLine(t *testing.T, log string) string {
+	t.Helper()
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, "phase=start") {
+			return line
+		}
+	}
+	t.Fatalf("no start line in %q", log)
+	return ""
+}
+
+func TestExecLogKeepsTheWordsApart(t *testing.T) {
+	run := func(t *testing.T, command ...string) string {
+		t.Helper()
+		f := execEnv(t, execSucceeds(t))
+		log := execTextLog(f)
+		term := newExecTerminal(t, 80, 24)
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options(command...)); err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		return startLine(t, log.String())
+	}
+	command := func(t *testing.T, line string) string {
+		t.Helper()
+		i := strings.Index(line, " command=")
+		if i < 0 {
+			t.Fatalf("no command in %q", line)
+		}
+		return line[i+len(" command="):]
+	}
+
+	t.Run("words with a space are not words split at it", func(t *testing.T) {
+		one, two := run(t, "sh", "-c", "a b"), run(t, "sh", "-c", "a", "b")
+		if command(t, one) == command(t, two) {
+			t.Errorf("both are logged as %s", command(t, one))
+		}
+		if c := command(t, one); c != `"\"sh\" \"-c\" \"a b\""` {
+			t.Errorf("command=%s", c)
+		}
+	})
+
+	t.Run("a word of a quote, a space, an equals sign and a line feed is one word", func(t *testing.T) {
+		line := run(t, "sh", `x="a b"`+"\n"+`c=d`)
+		if c := command(t, line); c != `"\"sh\" \"x=\\\"a b\\\"c=d\""` {
+			t.Errorf("command=%s", c)
+		}
+		if strings.Count(line, "\n") != 0 {
+			t.Errorf("the line is broken: %q", line)
+		}
+	})
+
+	t.Run("a command of 4 KiB ends in the mark", func(t *testing.T) {
+		c := command(t, run(t, "sh", "-c", strings.Repeat("x", 4096)))
+		if !strings.HasSuffix(c, `xx…"`) {
+			t.Errorf("command=…%s", c[max(0, len(c)-16):])
 		}
 	})
 }
