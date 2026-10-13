@@ -3,6 +3,7 @@
 package render
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -59,7 +60,25 @@ func (e *ruleEntry) label() string {
 	if len(e.names) == 0 {
 		return e.resource
 	}
-	return e.resource + "[" + strings.Join(e.names, ",") + "]"
+	shown := make([]string, len(e.names))
+	for i, n := range e.names {
+		shown[i] = n
+		if n == "" {
+			shown[i] = `""`
+		}
+	}
+	return e.resource + "[" + strings.Join(shown, ",") + "]"
+}
+
+// ruleNamesKey tells one set of names from any other, and no names from
+// the one empty name: the count, then each name quoted.
+func ruleNamesKey(names []string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d", len(names))
+	for _, n := range names {
+		fmt.Fprintf(&sb, " %q", n)
+	}
+	return sb.String()
 }
 
 // key is the Name of the row: the NAME cell, followed by "." and the
@@ -90,7 +109,7 @@ func RuleRows(rules []rbacv1.PolicyRule) []Row {
 	var entries []*ruleEntry
 	index := map[[3]string]*ruleEntry{}
 	add := func(resource, group string, names, verbs []string) {
-		key := [3]string{resource, group, strings.Join(names, "\x00")}
+		key := [3]string{resource, group, ruleNamesKey(names)}
 		e, ok := index[key]
 		if !ok {
 			e = &ruleEntry{resource: resource, group: group, names: names}

@@ -230,3 +230,33 @@ func TestRuleRowsNonResourceURLName(t *testing.T) {
 		t.Errorf("rows = %v, want one named /healthz", rows)
 	}
 }
+
+func TestRuleRowsEmptyNameIsALimit(t *testing.T) {
+	limited := rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{""}, Verbs: []string{"delete"}}
+	unlimited := rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}
+	for name, rules := range map[string][]rbacv1.PolicyRule{
+		"limited first":   {limited, unlimited},
+		"unlimited first": {unlimited, limited},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rows := RuleRows(rules)
+			if len(rows) != 2 {
+				t.Fatalf("%d rows, want 2: %v", len(rows), rows)
+			}
+			ruleWantRow(t, rows[0], "secrets", "core", ruleMarks("get"), "")
+			ruleWantRow(t, rows[1], `secrets[""]`, "core", ruleMarks("delete"), "")
+		})
+	}
+}
+
+func TestRuleRowsEmptyAndANameIsASetOfItsOwn(t *testing.T) {
+	rows := RuleRows([]rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"a", ""}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"a"}, Verbs: []string{"delete"}},
+	})
+	if len(rows) != 2 {
+		t.Fatalf("%d rows, want 2: %v", len(rows), rows)
+	}
+	ruleWantRow(t, rows[0], `secrets["",a]`, "core", ruleMarks("get"), "")
+	ruleWantRow(t, rows[1], "secrets[a]", "core", ruleMarks("delete"), "")
+}
