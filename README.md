@@ -235,6 +235,14 @@ The chart refuses to install without state (`state.existingSecret` or
   record it did not find, up to several minutes. Wait until the cache
   forgets, or point your machine at another DNS resolver, one that has not
   asked for the record yet.
+- **A direct connection from an `iroh-ssh` built on iroh 1.x is cut.**
+  The iroh library kosh uses can misread a QUIC key update on a connection
+  that uses several network paths, as a client on iroh 1.x does, and close
+  the connection: `ssh` then says `Connection closed by UNKNOWN port 65535`.
+  kosh no longer starts a key update early in a connection, which was the
+  frequent case; one that the client starts, or a later regular one in a
+  very long session, can in principle still cut a direct connection.
+  Connect again.
 
 ## Development
 
