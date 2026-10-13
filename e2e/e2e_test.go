@@ -934,6 +934,53 @@ func TestVanishedClientEndsItsSession(t *testing.T) {
 		func() string { return fmt.Sprintf("%d logs are read", logStreams(t)) })
 }
 
+// irohSSH runs the real iroh-ssh to kosh's endpoint ID as k, on a
+// terminal of 120 by 40, with a home of its own.
+func irohSSH(t *testing.T, k key) *ptySession {
+	t.Helper()
+	if cfg.noNetwork {
+		t.Skip("KOSH_E2E_NO_NETWORK=1: iroh-ssh reaches kosh through number0's DNS and a relay")
+	}
+	cmd := exec.Command(cfg.irohSSH, "-i", k.file,
+		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes",
+		"kosh@"+cfg.endpoint)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
+	return startPTY(t, cmd, 120, 40)
+}
+
+// overIroh waits for the screen of an iroh-ssh session, through the
+// relays: 60 seconds, and kosh's log beside the screen when it fails.
+func overIroh(t *testing.T, p *ptySession, what string, cond func(lines []string) bool) {
+	t.Helper()
+	eventually(t, 60*time.Second, "iroh-ssh: "+what, func() bool { return cond(p.scr.lines()) },
+		func() string { return "the screen:\n" + p.scr.String() + "\n\nkosh's log:\n" + koshLog(t) })
+}
+
+func TestIrohSSH(t *testing.T) {
+	inCluster(t)
+	p := irohSSH(t, fullKey(t))
+	overIroh(t, p, "the pods, and marker", func(lines []string) bool {
+		return lineWith(lines, "Pods(default)") && row(lines, "marker") != ""
+	})
+	p.send(":q" + keyEnter)
+	if status := p.exitedWith(wait); status != 0 {
+		t.Errorf("iroh-ssh exited with status %d after :q; the screen:\n%s", status, p.scr)
+	}
+}
+
+func TestIrohSSHReadOnly(t *testing.T) {
+	inCluster(t)
+	k := readOnlyKey(t)
+	p := irohSSH(t, k)
+	overIroh(t, p, "the read-only key in the header", func(lines []string) bool {
+		return lineWith(lines, "Pods(default)") && lineWith(lines, "Key:", k.name+" [read-only]")
+	})
+	p.send(":q" + keyEnter)
+	if status := p.exitedWith(wait); status != 0 {
+		t.Errorf("iroh-ssh exited with status %d after :q; the screen:\n%s", status, p.scr)
+	}
+}
+
 // setKeys installs the chart again with the key list of lines, keeping
 // every other value.
 func setKeys(t *testing.T, lines ...string) {
