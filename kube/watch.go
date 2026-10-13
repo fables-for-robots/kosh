@@ -12,11 +12,14 @@ import (
 // Watch opens the table of q: of Containers and Rules from watchPseudo,
 // of a typed resource from its kind's cache, and of any other resource
 // from the API server's table. Every watch ends when the session's
-// context is done.
+// context is done. q is checked first, as checkQuery says: nothing is
+// opened or sent for a query that fails.
 func (s *session) Watch(q Query) (Watch, error) {
+	if err := s.c.checkQuery(q); err != nil {
+		return nil, err
+	}
 	switch {
-	case q.Resource.Is(Containers.GVR.Group, Containers.GVR.Resource),
-		q.Resource.Is(Rules.GVR.Group, Rules.GVR.Resource):
+	case isPseudo(q.Resource):
 		return s.watchPseudo(q)
 	case q.Resource.Typed:
 		return s.watchTyped(q)
@@ -25,6 +28,32 @@ func (s *session) Watch(q Query) (Watch, error) {
 	default:
 		return s.watchTable(q)
 	}
+}
+
+// checkQuery refuses a query before anything is opened or sent: a
+// resource that checkResource refuses, Containers and Rules apart; a
+// namespace that checkNamespace refuses (wrapping ErrInvalidNamespace),
+// a namespace for a resource that is not namespaced among them; and an
+// Of that checkRef refuses.
+func (c *Cluster) checkQuery(q Query) error {
+	if !isPseudo(q.Resource) {
+		if err := c.checkResource(q.Resource); err != nil {
+			return err
+		}
+	}
+	if err := checkNamespace(q.Resource, q.Namespace); err != nil {
+		return err
+	}
+	if q.Of != nil {
+		return c.checkRef(*q.Of)
+	}
+	return nil
+}
+
+// isPseudo reports whether r is Containers or Rules, which are no
+// resource of the API.
+func isPseudo(r Resource) bool {
+	return r.Is(Containers.GVR.Group, Containers.GVR.Resource) || r.Is(Rules.GVR.Group, Rules.GVR.Resource)
 }
 
 // typedWatch is the table of a typed resource: the rows of the objects

@@ -273,8 +273,8 @@ func TestListPath(t *testing.T) {
 		{widgets, "ns", "/apis/example.com/v1/namespaces/ns/widgets"},
 		{nodes, "ns", "/api/v1/nodes"},
 	} {
-		if got := listPath(tc.r, tc.namespace); got != tc.want {
-			t.Errorf("%v in %q: %s, want %s", tc.r.GVR, tc.namespace, got, tc.want)
+		if got, err := listPath(tc.r, tc.namespace); err != nil || got != tc.want {
+			t.Errorf("%v in %q: %s, %v; want %s", tc.r.GVR, tc.namespace, got, err, tc.want)
 		}
 	}
 }

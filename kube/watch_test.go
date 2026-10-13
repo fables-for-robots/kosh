@@ -135,11 +135,20 @@ func TestWatchFiltersByNamespace(t *testing.T) {
 	rowsWhen(t, watchOf(t, s, Query{Resource: pods}), "one/a", "one/b", "two/c")
 }
 
-func TestWatchIgnoresTheNamespaceOfAClusterResource(t *testing.T) {
+// A namespace for a resource that has none is refused; a resource that
+// says it has none when discovery found one is no resource of the
+// cluster.
+func TestWatchRefusesTheNamespaceOfAClusterResource(t *testing.T) {
 	e := newEnv(t, envConfig{}, pod("one", "a", nil))
+	s := e.session(t)
+	if _, err := s.Watch(Query{Resource: e.resource(t, "", "nodes"), Namespace: "two"}); !errors.Is(err, ErrInvalidNamespace) {
+		t.Errorf("nodes in two: got %v, want ErrInvalidNamespace", err)
+	}
 	pods := e.resource(t, "", "pods")
-	pods.Namespaced = false // as a resource that has none would be
-	rowsWhen(t, watchOf(t, e.session(t), Query{Resource: pods, Namespace: "two"}), "one/a")
+	pods.Namespaced = false
+	if _, err := s.Watch(Query{Resource: pods, Namespace: "two"}); !errors.Is(err, ErrUnknownResource) {
+		t.Errorf("pods made cluster-wide: got %v, want ErrUnknownResource", err)
+	}
 }
 
 func TestWatchListErrorIsInTheTable(t *testing.T) {

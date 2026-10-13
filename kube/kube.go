@@ -31,6 +31,11 @@ var (
 	// ErrUnknownResource is what Resolve returns for a name that no
 	// resource of the cluster answers to.
 	ErrUnknownResource = errors.New("no such resource")
+	// ErrInvalidNamespace is what a Query or an ObjectRef gets whose
+	// namespace is not the name a namespace can have, or that names a
+	// namespace for a resource that has none, before anything is sent to
+	// the API.
+	ErrInvalidNamespace = errors.New("no such namespace")
 	// ErrNoOwner is what Owner returns for an object that has no owner.
 	ErrNoOwner = errors.New("no owner")
 	// ErrNoRelation is what Watch returns for a Query whose Of names an
@@ -111,7 +116,8 @@ func (r ObjectRef) String() string {
 type Query struct {
 	Resource Resource
 	// Namespace limits the rows to one namespace. Empty is all of them.
-	// It is not looked at for a resource that is not namespaced.
+	// One that is not a namespace's name, or one given for a resource
+	// that is not namespaced, is ErrInvalidNamespace.
 	Namespace string
 	// Of limits the rows to those that belong to one object:
 	//
