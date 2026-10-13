@@ -3,9 +3,14 @@ package tui
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
@@ -226,5 +231,209 @@ func TestLogCloseClosesTheStream(t *testing.T) {
 	hs.press("q")
 	if !s.Closed() {
 		t.Error("q left the stream open")
+	}
+}
+
+// logClipboard returns what the last tea.SetClipboard that reached v
+// set, and whether one did.
+func logClipboard(v *testView) (string, bool) {
+	for i := len(v.msgs) - 1; i >= 0; i-- {
+		m := v.msgs[i]
+		if fmt.Sprintf("%T", m) == fmt.Sprintf("%T", tea.SetClipboard("")()) {
+			return reflect.ValueOf(m).String(), true
+		}
+	}
+	return "", false
+}
+
+func TestLogTimes(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	s.Send(
+		kube.LogLine{Pod: "web-1", Container: "app", Time: t0.Add(1500 * time.Millisecond), Text: "with a time"},
+		kube.LogLine{Pod: "web-1", Container: "app", Text: "without a time"},
+	)
+	hs.await("two lines", func() bool { return logHas(v, "without a time") })
+	if body := logBody(hs); strings.Join(body, "\n") != "with a time\nwithout a time" {
+		t.Errorf("the times are shown at first: %q", body)
+	}
+	hs.press("t")
+	if body := logBody(hs); strings.Join(body, "\n") != "2026-10-13T12:00:01Z with a time\nwithout a time" {
+		t.Errorf("after t the body is %q", body)
+	}
+	hs.press("t")
+	if body := logBody(hs); strings.Join(body, "\n") != "with a time\nwithout a time" {
+		t.Errorf("t again shows %q", body)
+	}
+}
+
+func TestLogWrap(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	var long strings.Builder
+	for i := range 300 {
+		long.WriteByte(byte('a' + i%26))
+	}
+	s.Send(kube.LogLine{Pod: "web-1", Container: "app", Time: t0, Text: long.String()}, kube.LogLine{Pod: "web-1", Container: "app", Text: "short"})
+	hs.await("the lines", func() bool { return logHas(v, "short") })
+	body := logBody(hs)
+	if len(body) != 2 || !strings.HasSuffix(body[0], "…") || ansi.StringWidth(body[0]) != 98 {
+		t.Errorf("the long line is not cut at the width: %q", body)
+	}
+	hs.press("w")
+	body = logBody(hs)
+	if len(body) != 5 || strings.Join(body[:4], "") != long.String() || body[4] != "short" {
+		t.Errorf("after w the body is %q", body)
+	}
+	hs.press("t")
+	body = logBody(hs)
+	if len(body) != 5 || strings.Join(body[:4], "") != "2026-10-13T12:00:00Z "+long.String() {
+		t.Errorf("wrapped with times the body is %q", body)
+	}
+	// No drawn line is wider than the view, whatever its width.
+	for _, w := range []int{1, 2, 7, 20, 98} {
+		for _, wrap := range []bool{false, true} {
+			v.wrap = wrap
+			for i, l := range strings.Split(v.View(w, 20), "\n") {
+				if ansi.StringWidth(l) > w {
+					t.Errorf("wrap %v: line %d is %d cells wide in a view of %d", wrap, i, ansi.StringWidth(l), w)
+				}
+			}
+		}
+	}
+}
+
+func TestLogsOfAWorkload(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, kubetest.Ref("deployments", "default", "web"), kube.LogOptions{})
+	s.Send(
+		kube.LogLine{Pod: "web-1", Container: "app", Text: "one"},
+		kube.LogLine{Pod: "web-2", Container: "app", Text: "two"},
+		kube.LogLine{Pod: "web-1", Container: "app", Text: "three"},
+	)
+	hs.await("three lines", func() bool { return logHas(v, "three") })
+	if body := logBody(hs); strings.Join(body, "\n") != "web-1/app one\nweb-2/app two\nweb-1/app three" {
+		t.Errorf("the body is %q", body)
+	}
+	one, two := logPalette[logColorOf("web-1/app")], logPalette[logColorOf("web-2/app")]
+	if sgr(one) == sgr(two) {
+		t.Fatalf("web-1/app and web-2/app have the same colour")
+	}
+	for _, c := range []struct {
+		text, prefix string
+		style        lipgloss.Style
+	}{{"one", "web-1/app", one}, {"two", "web-2/app", two}, {"three", "web-1/app", one}} {
+		if l := hs.drawnLine(c.text); !strings.Contains(l, c.style.Render(c.prefix)+" "+c.text) {
+			t.Errorf("the prefix of %q is not in the colour of its pod: %q", c.text, l)
+		}
+	}
+	// A log of one container has no prefixes.
+	w, s1 := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	s1.Send(logTexts(1, 1)...)
+	hs.await("a line", func() bool { return logHas(w, "line 0001") })
+	if body := logBody(hs); strings.Join(body, "\n") != "line 0001" {
+		t.Errorf("the log of one container is %q", body)
+	}
+}
+
+func TestLogMarkAndClear(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	s.Send(logTexts(1, 2)...)
+	hs.await("two lines", func() bool { return logHas(v, "line 0002") })
+	hs.clock.advance(90 * time.Second)
+	hs.press("m")
+	body := logBody(hs)
+	if len(body) != 3 || !strings.HasPrefix(body[2], "──") || !strings.Contains(body[2], " 2026-10-13T12:01:30Z ") || ansi.StringWidth(body[2]) != 98 {
+		t.Errorf("after m the body is %q", body)
+	}
+	s.Send(logTexts(3, 1)...)
+	hs.await("the third line", func() bool { return logHas(v, "line 0003") })
+	if body := logBody(hs); len(body) != 4 || body[3] != "line 0003" {
+		t.Errorf("the line after the mark: %q", body)
+	}
+	hs.press("C")
+	if body := logBody(hs); len(body) != 0 {
+		t.Errorf("after C the body is %q", body)
+	}
+	s.Send(logTexts(4, 1)...)
+	hs.await("the fourth line", func() bool { return logHas(v, "line 0004") })
+	if body := logBody(hs); strings.Join(body, "\n") != "line 0004" {
+		t.Errorf("after C and a line the body is %q", body)
+	}
+}
+
+func TestLogCopy(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	below := &testView{name: "below"}
+	hs.send(pushViewMsg{below})
+	v, s := logOpenIn(t, hs, sess, kubetest.Ref("deployments", "default", "web"), kube.LogOptions{})
+	s.Send(
+		kube.LogLine{Pod: "web-1", Container: "app", Time: t0, Text: "one"},
+		kube.LogLine{Pod: "web-2", Container: "app", Time: t0.Add(time.Second), Text: strings.Repeat("long ", 40)},
+	)
+	hs.await("two lines", func() bool { return len(v.lines) == 2 })
+	hs.press("t", "c")
+	got, ok := logClipboard(below)
+	want := "web-1/app 2026-10-13T12:00:00Z one\nweb-2/app 2026-10-13T12:00:01Z " + strings.Repeat("long ", 40)
+	if !ok || got != want {
+		t.Errorf("c copied %q (%v), want %q", got, ok, want)
+	}
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("the copy has styles: %q", got)
+	}
+	hs.wantFrame("copied 2 lines")
+}
+
+func TestLogFullscreen(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	s.Send(logTexts(1, 40)...)
+	hs.await("40 lines", func() bool { return logHas(v, "line 0040") })
+	hs.press("f")
+	lines := hs.lines()
+	if len(lines) != 30 || strings.TrimSpace(lines[0]) != "line 0011" || strings.TrimSpace(lines[29]) != "line 0040" {
+		t.Errorf("full screen is %q", lines)
+	}
+	hs.notFrame("┌", "<logs>")
+	hs.press("f")
+	hs.wantFrame("┌", "<logs>")
+}
+
+func TestLogLinesAreCleaned(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	below := &testView{name: "below"}
+	hs.send(pushViewMsg{below})
+	v, s := logOpenIn(t, hs, sess, kubetest.Ref("deployments", "default", "web"), kube.LogOptions{})
+	s.Send(
+		kube.LogLine{Pod: "web-1\x1b[2J", Container: "app", Text: "a\x1b]0;x\x07b"},
+		kube.LogLine{Pod: "web-2", Container: "app\x00", Text: "c\x1b[2Jd"},
+		kube.LogLine{Pod: "web-2", Container: "app", Text: "e\rf"},
+		kube.LogLine{Pod: "web-2", Container: "app", Text: "g\x00h"},
+	)
+	hs.await("four lines", func() bool { return len(v.lines) == 4 })
+	s.End(errors.New("broke \x1b[31mred\x1b]0;title\x07"))
+	hs.awaitFrame("— the log broke: broke red —")
+	hs.press("c")
+	copied, _ := logClipboard(below)
+	for what, text := range map[string]string{"the frame": hs.drawn(), "the copy": copied} {
+		for _, bad := range []string{"\x1b]", "\x1b[2J", "\x1b[31m", "\r", "\x00", "\x07"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s holds %q: %q", what, bad, text)
+			}
+		}
+	}
+	for _, want := range []string{"web-1/app ab", "web-2/app␀ cd", "web-2/app e␍f", "web-2/app g␀h", "— the log broke: broke red —"} {
+		if !strings.Contains(copied, want) {
+			t.Errorf("the copy does not hold %q: %q", want, copied)
+		}
+		hs.wantFrame(want)
 	}
 }

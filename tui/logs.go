@@ -3,11 +3,14 @@ package tui
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/kube"
 )
@@ -32,27 +35,57 @@ const (
 	logText logKind = iota
 	// logNote is a line the view adds: the end of the log, an error.
 	logNote
+	// logMark is a rule across the view, with the time it was drawn.
+	logMark
 )
 
 // logLine is a line of a log view, cleaned when it came.
 type logLine struct {
-	kind logKind
-	src  string // "pod/container"
-	at   time.Time
-	text string
-	err  bool // a note that is an error
+	kind  logKind
+	src   string // "pod/container"
+	color int    // of src, in logPalette
+	at    time.Time
+	text  string
+	err   bool // a note that is an error
 }
+
+// logPalette are the colours of the pods and containers of a log, as
+// k9s's: teal, green, purple, lime, dodgerblue, yellow, fuchsia, aqua.
+var logPalette = []lipgloss.Style{
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#008080")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#008000")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#800080")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#1E90FF")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#FF00FF")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")),
+}
+
+// The styles of a log's own lines and of its times.
+var (
+	logStyleTime = lipgloss.NewStyle().Foreground(colorGray)
+	logStyleMark = lipgloss.NewStyle().Foreground(colorOrange)
+)
+
+// logColorOf returns the colour of a pod and container, "pod/container",
+// as an index of logPalette: the same for the same names.
+func logColorOf(src string) int {
+	h := fnv.New32a()
+	h.Write([]byte(src))
+	return int(h.Sum32() % uint32(len(logPalette)))
+}
+
+// logTimeFormat is how a line's time is shown.
+const logTimeFormat = time.RFC3339
 
 // logPrepare cleans a batch of lines of the log. It is the one place
 // where text of a log is cleaned: once, when it comes.
 func logPrepare(batch []kube.LogLine) []logLine {
 	out := make([]logLine, len(batch))
 	for i, l := range batch {
-		out[i] = logLine{
-			src:  cleanLine(l.Pod) + "/" + cleanLine(l.Container),
-			at:   l.Time,
-			text: cleanLine(l.Text),
-		}
+		src := cleanLine(l.Pod) + "/" + cleanLine(l.Container)
+		out[i] = logLine{src: src, color: logColorOf(src), at: l.Time, text: cleanLine(l.Text)}
 	}
 	return out
 }
@@ -130,8 +163,14 @@ type logView struct {
 
 	lines []logLine
 	shown []int // the lines shown, as indexes of lines
+	// first is the pod and container the first line came from; multi
+	// is set once a line came from another one, and then each line shows
+	// where it is from.
+	first string
+	multi bool
 
-	auto bool
+	auto, wrap, times, full bool
+
 	top  int // the first line shown, as an index of shown, while auto is off
 	w, h int // of the last drawing
 }
@@ -277,6 +316,13 @@ func (v *logView) add(lines []logLine) {
 	for _, l := range lines {
 		v.lines = append(v.lines, l)
 		v.shown = append(v.shown, len(v.lines)-1)
+		if l.kind == logText {
+			if v.first == "" {
+				v.first = l.src
+			} else if l.src != v.first {
+				v.multi = true
+			}
+		}
 	}
 	n := len(v.lines) - kube.LogBufferLines
 	if n <= 0 {
@@ -315,10 +361,37 @@ func (v *logView) key(k tea.KeyPressMsg) tea.Cmd {
 		v.auto, v.top = false, 0
 	case "G", "end":
 		v.top = v.endTop()
+	case "w":
+		v.wrap = !v.wrap
+	case "t":
+		v.times = !v.times
+	case "f":
+		v.full = !v.full
+	case "m":
+		v.add([]logLine{{kind: logMark, at: v.e.now()}})
+	case "C":
+		v.clear()
+	case "c":
+		return v.copy()
 	case "esc", "q":
 		return popView()
 	}
 	return nil
+}
+
+// clear empties the buffer.
+func (v *logView) clear() {
+	v.lines, v.shown, v.top = nil, nil, 0
+}
+
+// copy gives the clipboard the lines shown, as they are drawn but
+// whole and without styles, and says how many.
+func (v *logView) copy() tea.Cmd {
+	out := make([]string, len(v.shown))
+	for i, j := range v.shown {
+		out[i], _ = v.text(&v.lines[j], v.w)
+	}
+	return tea.Batch(tea.SetClipboard(strings.Join(out, "\n")), flash(fmt.Sprintf("copied %d lines", len(out))))
 }
 
 // scroll moves the view by d lines. Up turns autoscroll off.
@@ -351,19 +424,111 @@ func (v *logView) endTop() int {
 	return 0
 }
 
-// rowCount is how many rows the shown line i takes.
-func (v *logView) rowCount(i int) int { return 1 }
+// logSpan is a part of a line that is drawn in a style: the bytes
+// from to to.
+type logSpan struct {
+	from, to int
+	style    lipgloss.Style
+}
 
-// rows draws the shown line i in rows of w cells.
-func (v *logView) rows(i, w int) []string {
-	l := &v.lines[v.shown[i]]
-	switch {
-	case l.kind == logNote && l.err:
-		return []string{styleError.Render(fit(l.text, w))}
-	case l.kind == logNote:
-		return []string{styleDim.Render(fit(l.text, w))}
+// text returns the line as it is drawn w cells wide, without styles,
+// and the parts of it that have a style, in their order.
+func (v *logView) text(l *logLine, w int) (string, []logSpan) {
+	switch l.kind {
+	case logMark:
+		s := logRule(l.at, w)
+		return s, []logSpan{{0, len(s), logStyleMark}}
+	case logNote:
+		style := styleDim
+		if l.err {
+			style = styleError
+		}
+		return l.text, []logSpan{{0, len(l.text), style}}
 	}
-	return []string{fit(l.text, w)}
+	var b strings.Builder
+	var spans []logSpan
+	if v.multi {
+		spans = append(spans, logSpan{0, len(l.src), logPalette[l.color]})
+		b.WriteString(l.src + " ")
+	}
+	if v.times && !l.at.IsZero() {
+		ts := l.at.UTC().Format(logTimeFormat)
+		spans = append(spans, logSpan{b.Len(), b.Len() + len(ts), logStyleTime})
+		b.WriteString(ts + " ")
+	}
+	b.WriteString(l.text)
+	return b.String(), spans
+}
+
+// logRule is the line of a mark made at t, w cells wide.
+func logRule(t time.Time, w int) string {
+	label := "── " + t.UTC().Format(logTimeFormat) + " "
+	return label + strings.Repeat("─", max(w-ansi.StringWidth(label), 2))
+}
+
+// logPaint draws the bytes from a to b of s, with the styles of spans.
+func logPaint(s string, spans []logSpan, a, b int) string {
+	var out strings.Builder
+	at := a
+	for _, sp := range spans {
+		from, to := max(sp.from, at), min(sp.to, b)
+		if from >= to {
+			continue
+		}
+		out.WriteString(s[at:from])
+		out.WriteString(sp.style.Render(s[from:to]))
+		at = to
+	}
+	out.WriteString(s[at:b])
+	return out.String()
+}
+
+// logBreaks returns where the rows of s begin when it is wrapped at w
+// cells: 0 first.
+func logBreaks(s string, w int) []int {
+	starts := []int{0}
+	col := 0
+	for i := 0; i < len(s); {
+		g, gw := ansi.FirstGraphemeCluster(s[i:], ansi.GraphemeWidth)
+		if len(g) == 0 {
+			break
+		}
+		if col > 0 && col+gw > w {
+			starts = append(starts, i)
+			col = 0
+		}
+		col += gw
+		i += len(g)
+	}
+	return starts
+}
+
+// rowCount is how many rows the shown line i takes.
+func (v *logView) rowCount(i int) int {
+	if !v.wrap || v.w <= 0 {
+		return 1
+	}
+	s, _ := v.text(&v.lines[v.shown[i]], v.w)
+	return len(logBreaks(s, v.w))
+}
+
+// rows draws the shown line i in rows of w cells: one, cut at the
+// width, or as many as it takes when wrapped.
+func (v *logView) rows(i, w int) []string {
+	s, spans := v.text(&v.lines[v.shown[i]], w)
+	if !v.wrap {
+		return []string{fit(logPaint(s, spans, 0, len(s)), w)}
+	}
+	starts := logBreaks(s, w)
+	out := make([]string, len(starts))
+	for j, a := range starts {
+		b := len(s)
+		if j+1 < len(starts) {
+			b = starts[j+1]
+		}
+		out[j] = fit(logPaint(s, spans, a, b), w)
+	}
+	return out
 }
 
 // View draws the end of the log while autoscroll is on, and the lines
@@ -425,8 +590,18 @@ func (v *logView) Crumb() string { return "logs" }
 
 // Hints are the keys of the view.
 func (v *logView) Hints() []hint {
-	return []hint{{"s", "Autoscroll"}}
+	return []hint{
+		{"s", "Autoscroll"},
+		{"w", "Wrap"},
+		{"t", "Times"},
+		{"f", "Full Screen"},
+		{"m", "Mark"},
+		{"shift-c", "Clear"},
+		{"c", "Copy"},
+	}
 }
 
-func (v *logView) Capturing() bool  { return false }
-func (v *logView) Fullscreen() bool { return false }
+func (v *logView) Capturing() bool { return false }
+
+// Fullscreen is true after f.
+func (v *logView) Fullscreen() bool { return v.full }
