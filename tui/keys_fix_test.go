@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 
 	tea "charm.land/bubbletea/v2"
@@ -196,5 +197,48 @@ func TestHelpMovesSideways(t *testing.T) {
 	for range 6 {
 		hs.press("left")
 	}
-	hs.wantFrame("<j/down>")
+	hs.wantFrame("<j/down>", "<left/right> More Columns")
+
+	// Where every column fits, there is nothing to move, and no hint of
+	// it.
+	hs = newHarness(t, sess, 120, 40)
+	hs.press("?")
+	before := hs.frame()
+	hs.notFrame("More Columns")
+	hs.press("right")
+	if hs.frame() != before {
+		t.Errorf("right moved a help that fits:\n%s", hs.frame())
+	}
+}
+
+// ctrl+r reads again with r on, and right after the view came back on
+// top, and r goes on reading after it.
+func TestTextViewReadsAgainAfterItWasCovered(t *testing.T) {
+	sess := newSession()
+	ref := kubetest.Ref("pods", "default", "web-1")
+	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
+	sess.YAMLs[ref.String()] = "phase: Pending\n"
+	hs := newHarness(t, sess, 100, 30)
+	hs.press("y")
+	v := textTop(hs)
+	v.every = 20 * time.Millisecond * slowdown
+	hs.press("r")
+	hs.press("?") // the help covers the view
+	if _, ok := hs.root().top().(*helpView); !ok {
+		t.Fatalf("the top is a %T", hs.root().top())
+	}
+	hs.press("?") // and is gone
+	if textTop(hs) != v {
+		t.Fatal("the YAML view is not on top again")
+	}
+	n := len(sess.Called("YAML"))
+	sess.YAMLs[ref.String()] = "phase: Running\n"
+	hs.press("ctrl+r")
+	hs.awaitFrame("phase: Running")
+	if got := len(sess.Called("YAML")); got <= n {
+		t.Errorf("ctrl+r did not read: %d readings before, %d after", n, got)
+	}
+	// r still reads by itself.
+	sess.YAMLs[ref.String()] = "phase: Succeeded\n"
+	hs.awaitFrame("phase: Succeeded")
 }

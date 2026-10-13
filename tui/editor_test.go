@@ -289,7 +289,12 @@ func TestEditorRefusesWhatItCannotHold(t *testing.T) {
 	sess.YAMLs[editorRef.String()] = strings.Repeat("a: b\n", editorMaxLines+1)
 	hs := editorStart(t, sess, false)
 	hs.press("e")
-	hs.wantFrame("more lines than the editor holds")
+	// The flash names the limits, and kubectl.
+	for _, want := range []string{fmt.Sprintf("%d lines", editorMaxLines), fmt.Sprintf("%d KiB", editorMaxBytes>>10), "kubectl"} {
+		if !strings.Contains(hs.root().flash.text, want) {
+			t.Errorf("the flash %q does not say %q", hs.root().flash.text, want)
+		}
+	}
 	if !editorClosed(hs) {
 		t.Error("an editor opened")
 	}
@@ -299,7 +304,7 @@ func TestEditorRefusesWhatItCannotHold(t *testing.T) {
 	sess.YAMLs[editorRef.String()] = "a: " + strings.Repeat("b", editorMaxBytes) + "\n"
 	hs = editorStart(t, sess, false)
 	hs.press("e")
-	hs.wantFrame("more bytes")
+	hs.wantFrame("kubectl")
 	if !editorClosed(hs) {
 		t.Error("an editor opened for a YAML of more bytes than it holds")
 	}

@@ -12,8 +12,9 @@ type helpView struct {
 	sections []helpSection
 	// first is the first column drawn, which left and right move when
 	// the columns do not all fit; cols is how many there were when the
-	// view was last drawn.
+	// view was last drawn, and cut whether they did not all fit then.
 	first, cols int
+	cut         bool
 }
 
 // helpSection is a heading and its keys.
@@ -55,9 +56,13 @@ func (v *helpView) Update(msg tea.Msg) (view, tea.Cmd) {
 		case "esc", "q":
 			return v, popView()
 		case "left":
-			v.first = max(v.first-1, 0)
+			if v.cut {
+				v.first = max(v.first-1, 0)
+			}
 		case "right":
-			v.first = max(min(v.first+1, v.cols-1), 0)
+			if v.cut {
+				v.first = max(min(v.first+1, v.cols-1), 0)
+			}
 		}
 	}
 	return v, nil
@@ -94,7 +99,18 @@ func (v *helpView) View(w, h int) string {
 		}
 	}
 	v.cols = len(cols)
+	total := 0
+	for i, c := range cols {
+		if i > 0 {
+			total += len(headerGap)
+		}
+		total += c.width
+	}
+	v.cut = total > w
 	v.first = max(min(v.first, len(cols)-1), 0)
+	if !v.cut {
+		v.first = 0
+	}
 	if len(cols) > 0 {
 		cols = cols[v.first:]
 	}
@@ -137,7 +153,13 @@ func helpLines(hints []hint, keyW int) []string {
 
 func (v *helpView) Title() string { return "Help" }
 func (v *helpView) Crumb() string { return "help" }
+
+// Hints are esc, and left and right while a column is cut at the width
+// the help was last drawn in.
 func (v *helpView) Hints() []hint {
+	if !v.cut {
+		return []hint{{"esc", "Back"}}
+	}
 	return []hint{{"esc", "Back"}, {"left/right", "More Columns"}}
 }
 func (v *helpView) Capturing() bool  { return false }

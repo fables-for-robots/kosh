@@ -74,10 +74,12 @@ const editorTextMaxRows = 9999
 // editorTextTooLong is the flash of input the editor refuses.
 const editorTextTooLong = "the text is too long to edit here"
 
-// The flashes of a YAML the editor will not open.
+// The flashes of a YAML the editor will not open. editorTextCannotHold
+// names editorMaxLines and editorMaxBytes, which
+// TestEditorRefusesWhatItCannotHold keeps it in step with.
 const (
 	editorTextCannotKeep = "this object holds characters the editor cannot keep (a tab or a control character outside a quoted string): edit it with kubectl"
-	editorTextCannotHold = "this object's YAML has more lines than the editor holds, more bytes, or characters it cannot hold: edit it with kubectl"
+	editorTextCannotHold = "this object's YAML is larger than the editor opens (1000 lines, 48 KiB) or has characters it cannot hold: edit it with kubectl"
 )
 
 // editorOpen reads the YAML of the first row in a command and opens the
@@ -171,7 +173,7 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		}
 		v.saving = false
 		if msg.err != nil {
-			v.why = clean(msg.err.Error())
+			v.why = errorText(msg.err.Error())
 			return v, nil
 		}
 		return v, tea.Sequence(popView(), flash("Updated "+v.ref.String()), refresh())

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -241,4 +242,39 @@ func TestWrapText(t *testing.T) {
 	if got := wrapText("one two three", 0, 0); got != nil {
 		t.Errorf("at width 0: %q", got)
 	}
+}
+
+// An error's text is cut to errorMaxBytes before it is cleaned and
+// wrapped, in the flash, the editor and a table, so that a huge message
+// costs a bounded amount at every reading.
+func TestHugeErrorIsCut(t *testing.T) {
+	huge := strings.Repeat("denied by the webhook ", 1<<16) // 1.4 MB
+	bounded := func(where, s string) {
+		t.Helper()
+		if len(s) > errorMaxBytes+len("…") || !strings.HasSuffix(s, "…") {
+			t.Errorf("%s keeps %d bytes, ending %q", where, len(s), s[max(len(s)-10, 0):])
+		}
+	}
+	bounded("errorText", errorText(huge))
+	if got := errorText("short\x1b[2J"); got != "short" {
+		t.Errorf("a short error is %q", got)
+	}
+	// A cut in a character of several bytes keeps the text UTF-8.
+	if got := errorText(strings.Repeat("é", errorMaxBytes)); !utf8.ValidString(got) {
+		t.Error("a cut in a character leaves bytes that are not UTF-8")
+	}
+
+	bounded("the table", prepare(kube.Table{Err: errors.New(huge)}).err)
+
+	hs := newHarness(t, newSession(), 80, 24)
+	hs.send(flashMsg{text: huge, err: true})
+	bounded("the flash", hs.root().flash.text)
+
+	sess := newSession()
+	sess.Errs["Update"] = errors.New(huge)
+	hs = editorStart(t, sess, true)
+	hs.typeText("x")
+	hs.press("ctrl+s")
+	hs.awaitFrame("denied by the webhook")
+	bounded("the editor", editorShown(hs).why)
 }

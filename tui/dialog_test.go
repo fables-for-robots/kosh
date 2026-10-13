@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -281,6 +282,18 @@ type dialogCase struct {
 
 func (c dialogCase) open(t *testing.T, w, h int) (*harness, *kubetest.Session) {
 	t.Helper()
+	hs, sess := c.table(t, w, h)
+	hs.press(c.key)
+	if dialogOpen(hs) == nil {
+		t.Fatalf("%s did not open a dialog at %dx%d:\n%s", c.key, w, h, hs.frame())
+	}
+	return hs, sess
+}
+
+// table opens the table of the case in a harness of w by h, with its
+// rows marked when there are several, and does not press the key.
+func (c dialogCase) table(t *testing.T, w, h int) (*harness, *kubetest.Session) {
+	t.Helper()
 	sess := newSession()
 	var names []string
 	for i := range c.rows {
@@ -302,23 +315,36 @@ func (c dialogCase) open(t *testing.T, w, h int) (*harness, *kubetest.Session) {
 	if c.rows > 1 {
 		hs.press("space", "G", "ctrl+space")
 	}
-	hs.press(c.key)
-	if dialogOpen(hs) == nil {
-		t.Fatalf("%s did not open a dialog at %dx%d:\n%s", c.key, w, h, hs.frame())
-	}
 	return hs, sess
 }
 
-func TestDialogShowsItsButtons(t *testing.T) {
-	cases := []dialogCase{
-		{"delete 1", "pods", 1, "ctrl+d", []string{"Cancel", "Delete"}},
-		{"delete 12", "pods", 12, "ctrl+d", []string{"Cancel", "Delete"}},
-		{"delete 60", "pods", 60, "ctrl+d", []string{"Cancel", "Delete"}},
-		{"kill", "pods", 1, "ctrl+k", []string{"Cancel", "Kill"}},
-		{"scale", "deployments", 1, "s", []string{"Cancel", "Scale"}},
-		{"drain 1", "nodes", 1, "r", []string{"Cancel", "Drain"}},
-		{"drain 8", "nodes", 8, "r", []string{"Cancel", "Drain"}},
+// dialogCases are the dialogs of the actions the tests open at every
+// size.
+var dialogCases = []dialogCase{
+	{"delete 1", "pods", 1, "ctrl+d", []string{"Cancel", "Delete"}},
+	{"delete 12", "pods", 12, "ctrl+d", []string{"Cancel", "Delete"}},
+	{"delete 60", "pods", 60, "ctrl+d", []string{"Cancel", "Delete"}},
+	{"kill", "pods", 1, "ctrl+k", []string{"Cancel", "Kill"}},
+	{"scale", "deployments", 1, "s", []string{"Cancel", "Scale"}},
+	{"drain 1", "nodes", 1, "r", []string{"Cancel", "Drain"}},
+	{"drain 8", "nodes", 8, "r", []string{"Cancel", "Drain"}},
+}
+
+// dialogFocusDrawn reports whether what has the focus in the dialog is
+// drawn so: a field with its mark, a button in brackets and the cursor's
+// style.
+func dialogFocusDrawn(hs *harness) bool {
+	hs.t.Helper()
+	d := dialogOpen(hs)
+	focused := dialogFocused(hs)
+	if d.focus < len(d.fields) {
+		return hs.line("▸ "+focused) != ""
 	}
+	return strings.Contains(hs.drawnLine("[ "+focused+" ]"), sgr(styleCursor))
+}
+
+func TestDialogShowsItsButtons(t *testing.T) {
+	cases := dialogCases
 	for _, size := range [][2]int{{80, 24}, {100, 30}, {120, 40}} {
 		for _, c := range cases {
 			t.Run(fmt.Sprintf("%s at %dx%d", c.name, size[0], size[1]), func(t *testing.T) {
@@ -326,13 +352,8 @@ func TestDialogShowsItsButtons(t *testing.T) {
 				// frame checks that no line is wider and the frame not
 				// taller than the screen.
 				hs.wantFrame(c.buttons...)
-				focused := dialogFocused(hs)
-				if d := dialogOpen(hs); d.focus < len(d.fields) {
-					if hs.line("▸ "+focused) == "" {
-						t.Errorf("the field %s has the focus and is not drawn so:\n%s", focused, hs.frame())
-					}
-				} else if !strings.Contains(hs.drawnLine("[ "+focused+" ]"), sgr(styleCursor)) {
-					t.Errorf("the button %s has the focus and is not drawn so:\n%s", focused, hs.frame())
+				if !dialogFocusDrawn(hs) {
+					t.Errorf("%s has the focus and is not drawn so:\n%s", dialogFocused(hs), hs.frame())
 				}
 				// The safe button is seen when the focus is on it.
 				dialogFocusOn(hs, "Cancel")
@@ -371,8 +392,14 @@ func TestDialogOnATinyScreen(t *testing.T) {
 	if hs.root().dlg != nil {
 		t.Fatal("ctrl+d opened a dialog on a screen of 8 lines")
 	}
-	// Larger, the screen shows the flash.
+	// Larger, the screen shows the flash: an error, which waits for a
+	// key after its time.
 	hs.send(tea.WindowSizeMsg{Width: 80, Height: 24})
+	hs.wantFrame(dialogTextTooSmall)
+	if !strings.Contains(hs.drawnLine(dialogTextTooSmall), sgr(styleError)) {
+		t.Error("the flash of a window too small is not an error")
+	}
+	hs.clock.advance(flashFor + time.Second)
 	hs.wantFrame(dialogTextTooSmall)
 	if got := sess.Called("Delete"); len(got) != 0 {
 		t.Errorf("Delete was called: %v", got)
@@ -411,19 +438,43 @@ func TestDialogNotOpenedFreesTheKeys(t *testing.T) {
 	}
 }
 
-// Every frame with a dialog, at every height, is as high as the screen
-// and shows the buttons once the dialog is open.
+// Every dialog of an action, opened at every height from 60 to 1, is
+// either refused, with the flash, or open with every button and the
+// focus drawn, in a frame of the screen's height.
 func TestDialogAtEveryHeight(t *testing.T) {
-	c := dialogCase{"drain 8", "nodes", 8, "r", nil}
-	hs, _ := c.open(t, 80, 40)
-	for h := 40; h >= 0; h-- {
-		hs.send(tea.WindowSizeMsg{Width: 80, Height: h})
-		f := hs.frame()
-		if h >= minHeight && hs.root().dlg != nil && !strings.Contains(f, "Drain  ") {
-			t.Errorf("at 80x%d the open dialog does not show its buttons:\n%s", h, f)
-		}
-		if n := len(strings.Split(f, "\n")); h > 0 && n != h && h >= minHeight {
-			t.Errorf("at 80x%d the frame has %d lines", h, n)
+	for _, c := range dialogCases {
+		hs, sess := c.table(t, 80, 60)
+		for h := 60; h >= 1; h-- {
+			hs.send(closeDialogMsg{})
+			hs.send(tea.WindowSizeMsg{Width: 80, Height: h})
+			hs.press(c.key)
+			lines := hs.lines()
+			if dialogOpen(hs) == nil {
+				if h >= minHeight && !strings.Contains(hs.frame(), dialogTextTooSmall) {
+					t.Errorf("%s at 80x%d: no dialog and no flash that says why:\n%s", c.name, h, hs.frame())
+				}
+				if h < minHeight && len(lines) != 1 {
+					t.Errorf("%s at 80x%d: the frame has %d lines", c.name, h, len(lines))
+				}
+				if actionBusy(sess) {
+					t.Errorf("%s at 80x%d: the keys of actions are held by a dialog that was not opened", c.name, h)
+				}
+				continue
+			}
+			if h < minHeight {
+				t.Errorf("%s at 80x%d: a dialog opened on a screen too small for the frame", c.name, h)
+			}
+			if len(lines) != h {
+				t.Errorf("%s at 80x%d: the frame has %d lines", c.name, h, len(lines))
+			}
+			for _, b := range c.buttons {
+				if !strings.Contains(hs.line("Cancel"), b) {
+					t.Errorf("%s at 80x%d: the button %s is not drawn:\n%s", c.name, h, b, hs.frame())
+				}
+			}
+			if !dialogFocusDrawn(hs) {
+				t.Errorf("%s at 80x%d: %s has the focus and is not drawn so:\n%s", c.name, h, dialogFocused(hs), hs.frame())
+			}
 		}
 	}
 }

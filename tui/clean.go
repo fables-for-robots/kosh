@@ -236,3 +236,22 @@ func (c *wrapped) get(text string, w, most int) []string {
 	}
 	return c.lines
 }
+
+// errorMaxBytes is how much of an error's text is kept: a webhook may
+// word a message of any length.
+const errorMaxBytes = 64 << 10
+
+// errorText is the text of an error as the UI keeps it to wrap and draw:
+// its first errorMaxBytes bytes, with "…" when there were more, cleaned.
+// The flash, the editor and a table each keep an error's text so, and
+// so cost a bounded amount at each reading.
+func errorText(s string) string {
+	if len(s) > errorMaxBytes {
+		i := errorMaxBytes
+		for i > 0 && !utf8.RuneStart(s[i]) {
+			i--
+		}
+		s = s[:i] + "…"
+	}
+	return clean(s)
+}

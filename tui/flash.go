@@ -39,7 +39,7 @@ func (f *flashLine) show(msg flashMsg, now time.Time) tea.Cmd {
 	f.seq++
 	f.err = msg.err
 	if f.err {
-		f.text = clean(msg.text)
+		f.text = errorText(msg.text)
 	} else {
 		f.text = cleanLine(msg.text)
 	}

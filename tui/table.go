@@ -75,7 +75,7 @@ func prepare(t kube.Table) ttable {
 		out.cols[i] = c
 	}
 	if t.Err != nil {
-		out.err = clean(t.Err.Error())
+		out.err = errorText(t.Err.Error())
 		return out
 	}
 	out.rows = make([]trow, len(t.Rows))
@@ -238,7 +238,7 @@ func (v *tableView) openWatch() tea.Cmd {
 	return func() tea.Msg {
 		w, err := open()
 		if err != nil {
-			return tableReadMsg{id: id, gen: gen, err: clean(err.Error())}
+			return tableReadMsg{id: id, gen: gen, err: errorText(err.Error())}
 		}
 		if !box.set(w) {
 			w.Close()

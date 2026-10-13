@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -68,7 +69,7 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Closed, as Cancel would: nothing is done.
 			r.dlg.Drop()
 			r.dlg = nil
-			cmd = tea.Batch(cmd, flash(dialogTextTooSmall))
+			cmd = tea.Batch(cmd, flashErr(errors.New(dialogTextTooSmall)))
 		}
 		return r, cmd
 	case tea.KeyPressMsg:
@@ -89,7 +90,7 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openDialogMsg:
 		if !r.dialogFits(msg.d) {
 			msg.d.Drop()
-			return r, flash(dialogTextTooSmall)
+			return r, flashErr(errors.New(dialogTextTooSmall))
 		}
 		r.dlg = msg.d
 		return r, msg.d.Init()
@@ -219,6 +220,20 @@ func (r *root) render() string {
 		r.overlayDialog(lines)
 		return strings.Join(lines, "\n")
 	}
+	bodyTop := 0
+	if !r.noHeader {
+		bodyTop += headerHeight
+	}
+	if r.prompt.open() {
+		bodyTop++
+	}
+	// The lines of an error in the flash are taken from the body, which
+	// keeps its frame and a line inside it.
+	fl := r.flash.lines(r.w, min(flashMaxLines, r.h-bodyTop-1-3), r.e.now())
+	bodyH := r.h - bodyTop - 1 - len(fl)
+	// The body is drawn before the header, whose hints may depend on how
+	// the view was drawn (the help's on whether a column is cut).
+	body := r.body(bodyH)
 	var lines []string
 	if !r.noHeader {
 		lines = append(lines, r.header()...)
@@ -226,12 +241,7 @@ func (r *root) render() string {
 	if r.prompt.open() {
 		lines = append(lines, r.prompt.line(r.w))
 	}
-	bodyTop := len(lines)
-	// The lines of an error in the flash are taken from the body, which
-	// keeps its frame and a line inside it.
-	fl := r.flash.lines(r.w, min(flashMaxLines, r.h-bodyTop-1-3), r.e.now())
-	bodyH := r.h - bodyTop - 1 - len(fl)
-	lines = append(lines, r.body(bodyH)...)
+	lines = append(lines, body...)
 	lines = append(lines, r.crumbs())
 	lines = append(lines, fl...)
 	r.overlayDialog(lines)
@@ -250,7 +260,7 @@ func (r *root) body(h int) []string {
 	} else {
 		var text []string
 		if r.startErr != nil {
-			for _, l := range wrapText(r.startErr.Error(), iw, ih) {
+			for _, l := range wrapText(errorText(r.startErr.Error()), iw, ih) {
 				text = append(text, styleError.Render(fit(l, iw)))
 			}
 		}
