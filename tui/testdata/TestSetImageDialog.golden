@@ -7,8 +7,6 @@ kosh:    v0.1.0                       <shift-o> Sort Column   <shift-j> Owner   
 ┌──────────────────────────────────── Deployments(default)[1] ─────────────────────────────────────┐
 │NAME↑  AGE                                                                                        │
 │web     1h                                                                                        │
-│                                                                                                  │
-│                                                                                                  │
 │                 ╭──────────────────────────────────────────────────────────────╮                 │
 │                 │                                                              │                 │
 │                 │ Set the images of deployments/default/web?                   │                 │
@@ -20,6 +18,8 @@ kosh:    v0.1.0                       <shift-o> Sort Column   <shift-j> Owner   
 │                 │                       Cancel      Set                        │                 │
 │                 │                                                              │                 │
 │                 ╰──────────────────────────────────────────────────────────────╯                 │
+│                                                                                                  │
+│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

@@ -612,9 +612,11 @@ func (d *testDialog) Update(msg tea.Msg) (dialog, tea.Cmd) {
 	}
 	return d, nil
 }
-func (d *testDialog) View(width int) string {
+func (d *testDialog) View(width, height int) string {
 	return "╔══════════╗\n║ a dialog ║\n╚══════════╝"
 }
+func (d *testDialog) Fits(width, height int) bool { return height >= 3 }
+func (d *testDialog) Drop()                       {}
 
 // testMsg is a message of the tests that no part knows.
 type testMsg struct{ n int }

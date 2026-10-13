@@ -1,10 +1,15 @@
 package tui
 
 import (
+	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/fables-for-robots/kosh/kube/kubetest"
 )
 
 // dialogKey returns the key press of name, for the names the harness
@@ -261,4 +266,164 @@ func TestDialogFitsTheWindow(t *testing.T) {
 	long := strings.Repeat("x", 200)
 	hs.send(openDialogMsg{dialogForm("Do "+long+"?", []string{long, long}, []*formField{formTextField("Name "+long, long)}, formButton{label: "Go"})})
 	hs.frame() // checks every line's width and the number of lines
+}
+
+// dialogCase opens a dialog of an action in a fresh harness of w by h,
+// with marked rows when there are several, and returns the harness and
+// the labels of the dialog's buttons.
+type dialogCase struct {
+	name    string
+	plural  string
+	rows    int
+	key     string
+	buttons []string
+}
+
+func (c dialogCase) open(t *testing.T, w, h int) (*harness, *kubetest.Session) {
+	t.Helper()
+	sess := newSession()
+	var names []string
+	for i := range c.rows {
+		names = append(names, fmt.Sprintf("x-%02d", i))
+	}
+	if c.plural == "pods" {
+		sess.SetTable(query("pods", "default"), podsNamed(names...))
+	}
+	hs := newHarness(t, sess, w, h)
+	switch c.plural {
+	case "deployments":
+		for _, n := range names {
+			sess.ReplicasOf["deployments/default/"+n] = 2
+		}
+		actionOpen(hs, sess, "deployments", simpleTable(names...))
+	case "nodes":
+		actionOpen(hs, sess, "nodes", clusterTable(names...))
+	}
+	if c.rows > 1 {
+		hs.press("space", "G", "ctrl+space")
+	}
+	hs.press(c.key)
+	if dialogOpen(hs) == nil {
+		t.Fatalf("%s did not open a dialog at %dx%d:\n%s", c.key, w, h, hs.frame())
+	}
+	return hs, sess
+}
+
+func TestDialogShowsItsButtons(t *testing.T) {
+	cases := []dialogCase{
+		{"delete 1", "pods", 1, "ctrl+d", []string{"Cancel", "Delete"}},
+		{"delete 12", "pods", 12, "ctrl+d", []string{"Cancel", "Delete"}},
+		{"delete 60", "pods", 60, "ctrl+d", []string{"Cancel", "Delete"}},
+		{"kill", "pods", 1, "ctrl+k", []string{"Cancel", "Kill"}},
+		{"scale", "deployments", 1, "s", []string{"Cancel", "Scale"}},
+		{"drain 1", "nodes", 1, "r", []string{"Cancel", "Drain"}},
+		{"drain 8", "nodes", 8, "r", []string{"Cancel", "Drain"}},
+	}
+	for _, size := range [][2]int{{80, 24}, {100, 30}, {120, 40}} {
+		for _, c := range cases {
+			t.Run(fmt.Sprintf("%s at %dx%d", c.name, size[0], size[1]), func(t *testing.T) {
+				hs, _ := c.open(t, size[0], size[1])
+				// frame checks that no line is wider and the frame not
+				// taller than the screen.
+				hs.wantFrame(c.buttons...)
+				focused := dialogFocused(hs)
+				if d := dialogOpen(hs); d.focus < len(d.fields) {
+					if hs.line("▸ "+focused) == "" {
+						t.Errorf("the field %s has the focus and is not drawn so:\n%s", focused, hs.frame())
+					}
+				} else if !strings.Contains(hs.drawnLine("[ "+focused+" ]"), sgr(styleCursor)) {
+					t.Errorf("the button %s has the focus and is not drawn so:\n%s", focused, hs.frame())
+				}
+				// The safe button is seen when the focus is on it.
+				dialogFocusOn(hs, "Cancel")
+				if !strings.Contains(hs.drawnLine("[ Cancel ]"), sgr(styleCursor)) {
+					t.Errorf("Cancel has the focus and is not drawn so:\n%s", hs.frame())
+				}
+				if size[0] != 80 || c.rows < 12 {
+					return
+				}
+				f := hs.frame()
+				m := regexp.MustCompile(`… and (\d+) more`).FindStringSubmatch(f)
+				if m == nil {
+					t.Fatalf("the dialog does not say how many more there are:\n%s", f)
+				}
+				more, _ := strconv.Atoi(m[1])
+				shown := strings.Count(f, "default/x-")
+				if shown+more != c.rows {
+					t.Errorf("%d names are shown and %d more counted, of %d marked:\n%s", shown, more, c.rows, f)
+				}
+			})
+		}
+	}
+}
+
+// The delete dialog of 12 marked pods at the standard size.
+func TestDialogDeleteOf12At80x24(t *testing.T) {
+	hs, _ := dialogCase{"delete 12", "pods", 12, "ctrl+d", nil}.open(t, 80, 24)
+	hs.golden()
+}
+
+func TestDialogOnATinyScreen(t *testing.T) {
+	sess := newSession()
+	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
+	hs := newHarness(t, sess, 80, 8)
+	hs.press("ctrl+d")
+	if hs.root().dlg != nil {
+		t.Fatal("ctrl+d opened a dialog on a screen of 8 lines")
+	}
+	// Larger, the screen shows the flash.
+	hs.send(tea.WindowSizeMsg{Width: 80, Height: 24})
+	hs.wantFrame(dialogTextTooSmall)
+	if got := sess.Called("Delete"); len(got) != 0 {
+		t.Errorf("Delete was called: %v", got)
+	}
+
+	// A dialog that no longer fits when the window is made smaller is
+	// closed, and nothing is done.
+	hs.press("ctrl+d")
+	if hs.root().dlg == nil {
+		t.Fatal("ctrl+d opened nothing at 80x24")
+	}
+	hs.send(tea.WindowSizeMsg{Width: 80, Height: 8})
+	if hs.root().dlg != nil {
+		t.Error("the dialog stays open on a screen of 8 lines")
+	}
+	hs.send(tea.WindowSizeMsg{Width: 80, Height: 24})
+	hs.wantFrame(dialogTextTooSmall)
+	if got := sess.Called("Delete"); len(got) != 0 {
+		t.Errorf("Delete was called: %v", got)
+	}
+}
+
+// A dialog that is not opened frees the keys of actions its read held.
+func TestDialogNotOpenedFreesTheKeys(t *testing.T) {
+	sess := newSession()
+	sess.ReplicasOf["deployments/default/web"] = 3
+	hs := newHarness(t, sess, 100, 30)
+	actionOpen(hs, sess, "deployments", simpleTable("web"))
+	hs.send(tea.WindowSizeMsg{Width: 80, Height: 8})
+	hs.press("s")
+	if hs.root().dlg != nil {
+		t.Fatal("s opened a dialog on a screen of 8 lines")
+	}
+	if actionBusy(sess) {
+		t.Error("the keys of actions are held after the dialog was not opened")
+	}
+}
+
+// Every frame with a dialog, at every height, is as high as the screen
+// and shows the buttons once the dialog is open.
+func TestDialogAtEveryHeight(t *testing.T) {
+	c := dialogCase{"drain 8", "nodes", 8, "r", nil}
+	hs, _ := c.open(t, 80, 40)
+	for h := 40; h >= 0; h-- {
+		hs.send(tea.WindowSizeMsg{Width: 80, Height: h})
+		f := hs.frame()
+		if h >= minHeight && hs.root().dlg != nil && !strings.Contains(f, "Drain  ") {
+			t.Errorf("at 80x%d the open dialog does not show its buttons:\n%s", h, f)
+		}
+		if n := len(strings.Split(f, "\n")); h > 0 && n != h && h >= minHeight {
+			t.Errorf("at 80x%d the frame has %d lines", h, n)
+		}
+	}
 }
