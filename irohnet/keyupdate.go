@@ -5,7 +5,7 @@ import (
 	_ "unsafe" // for go:linkname
 )
 
-// The first QUIC key update of a connection, put off.
+// kosh no longer starts a QUIC key update early in a connection.
 //
 // What it works around. go-iroh v0.3.0's QUIC (internal/qng, quic-go's
 // code with multipath added) updates a connection's keys for the first
@@ -26,13 +26,30 @@ import (
 //
 // How it was measured. iroh-ssh at 82e9971 (iroh 1.3.0) against an SSH
 // server over this package on one Linux machine, direct, found by mDNS:
-// the measurements are in the report of the fix
-// (.superpowers/sdd/2026-10-13-kosh-stage-1/fix-c-report.md).
+// the measurements are in the reports of the fix
+// (.superpowers/sdd/2026-10-13-kosh-stage-1/fix-c-report.md and
+// fix-i-report.md).
 //
-// What is set. The first update waits for as many packets as every later
-// one: no key update is disabled. The limits that need one are those of
-// RFC 9001 section 6.6: 2^23 packets under one key for AES-GCM (which is
-// 83 times firstKeyUpdateInterval), more for ChaCha20-Poly1305.
+// What is set. The first update that this side starts waits for as many
+// packets as every later one: no key update is disabled. The limits that
+// need one are those of RFC 9001 section 6.6: 2^23 packets under one key
+// for AES-GCM (which is 83 times firstKeyUpdateInterval), more for
+// ChaCha20-Poly1305.
+//
+// What is not covered. The peer starts key updates too, and an iroh 1.x
+// client starts its first one early: after a random 10 to 999 packets it
+// has sent (noq-proto 1.3.0, connection/packet_crypto.rs,
+// key_phase_size). go-iroh handles an update the peer started with the
+// same bookkeeping, one number for all paths, so the same false
+// KEY_UPDATE_ERROR is possible after it. It needs more to go wrong: the
+// packet that brings the peer's update is itself in the new phase, and
+// so is what the peer sends after it, and the first of those that
+// arrives ends the window; only a packet of the old phase that arrives
+// late, after this side has sent in the new phase on a path with low
+// numbers, and that acknowledges higher numbers of another path, is
+// misread. And the regular updates, this side's every 100,000 packets,
+// go through the same check. Neither was seen to fail; neither is
+// excluded.
 //
 // When to remove. When go-iroh keeps the check per path, or lets the
 // interval be configured: this file and its test go then.
@@ -49,8 +66,9 @@ import (
 // has a hyphen.)
 
 // firstKeyUpdateInterval is how many packets a connection sends or
-// receives before its keys are updated for the first time: as many as
-// between later updates (go-iroh's protocol.KeyUpdateInterval).
+// receives before this side updates its keys for the first time: as
+// many as between its later updates (go-iroh's
+// protocol.KeyUpdateInterval). The peer may update them sooner.
 const firstKeyUpdateInterval = 100_000
 
 // qngFirstKeyUpdateIntervalDefault is what go-iroh v0.3.0 sets
