@@ -83,6 +83,12 @@ type Listener struct {
 	// closed yet, handed out or on their way to Accept.
 	conns map[*conn]struct{}
 
+	// amu guards what is announced: the addresses, and the addresses of
+	// the machine that the pkarr record leaves out.
+	amu       sync.Mutex
+	announced []netip.AddrPort
+	hidden    map[netip.Addr]bool
+
 	closeOnce sync.Once
 	closeErr  error
 }

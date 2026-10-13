@@ -107,8 +107,8 @@ func TestPublishableAddrs(t *testing.T) {
 }
 
 // TestAnnounced binds the endpoint as kosh serve does, with the relays,
-// number0's DNS and mDNS, and reads in the log that the relay answered
-// and that mDNS announces. It needs the internet and a network with
+// number0's DNS and mDNS, and reads in the log that the relay answered,
+// that mDNS announces, and what the pkarr record holds. It needs the internet and a network with
 // multicast, so it runs only when KOSH_NETWORK_TESTS=1.
 func TestAnnounced(t *testing.T) {
 	if os.Getenv("KOSH_NETWORK_TESTS") != "1" {
@@ -122,10 +122,13 @@ func TestAnnounced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Log(logs.String())
+	waitFor(t, "the pkarr record", func() bool {
+		return strings.Contains(logs.String(), "publishing the endpoint's pkarr record")
+	})
 	if err := l.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+	t.Log(logs.String())
 	for _, want := range []string{"the relay answered", "mDNS announces", "._irohv1._udp.local."} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("the log does not say %q", want)
