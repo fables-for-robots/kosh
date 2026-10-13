@@ -63,6 +63,11 @@ type Session struct {
 	// or changed, kosh shutting down. done is told ErrTerminalBusy, and
 	// run is not called, when a command has the terminal already; it is
 	// told ErrSessionEnded when the session ended before run began.
+	//
+	// The program has the terminal back no sooner than 10 ms after run
+	// was called, however soon run returns. A panic in run ends the
+	// session as a crash of its program does: the client is told
+	// MsgCrashed, and done is not called.
 	Exec func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
 }
 
@@ -71,11 +76,22 @@ type Terminal struct {
 	// In is what the client sends, from the hand-over on, the first
 	// byte included. It ends with io.EOF when the command's turn ends:
 	// nothing of what the client sends after that is lost to a reader
-	// that is still in Read.
+	// that is still in Read. It ends so, too, when the session ends
+	// during the turn, which is when run's context is done.
 	In io.Reader
 	// Out is the client's terminal, byte for byte: the translation of
 	// line feeds that the program's own output gets is not applied. A
-	// write after the turn fails with io.ErrClosedPipe.
+	// write after the turn, or after the session's end during it, fails
+	// with io.ErrClosedPipe.
+	//
+	// A write that waits because the client is not reading cannot be
+	// ended from here: it returns when the client reads again or closes
+	// the channel, or when the connection is closed, which at the
+	// session's end is after the end's timeout at the latest, and it
+	// fails then with the channel's error. So run must not wait for a
+	// write before it returns on its context. The turn itself waits for
+	// such a write when run has returned, so that nothing of the
+	// command's is written after it.
 	Out io.Writer
 	// Size returns the window's size now, in cells.
 	Size func() (width, height int)
@@ -147,6 +163,9 @@ type Server struct {
 	// its program and say why. Then its connection is closed: a client
 	// that does not read cannot keep a session kosh has ended.
 	endTimeout time.Duration
+	// minTurn is how long a command's turn with a session's terminal
+	// lasts at least: minTurn, but for a test.
+	minTurn time.Duration
 
 	handshakes atomic.Int64 // connections in the handshake, over every listener
 
@@ -194,6 +213,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		endTimeout: 2 * time.Second,
+		minTurn:    minTurn,
 		listeners:  map[net.Listener]string{},
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},

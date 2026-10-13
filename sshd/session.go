@@ -88,6 +88,10 @@ type session struct {
 	// cancelCommand ends the context of the command that has the
 	// terminal; it is nil when none has.
 	cancelCommand context.CancelFunc
+	// waits is what a turn that is not over waits for: waitsForCommand,
+	// waitsForWrite, or "" when no turn is under way or nothing is
+	// waited for.
+	waits string
 
 	// in is what the client sends, for whoever has the terminal. It is
 	// read from the channel from the moment the program starts.
@@ -96,6 +100,11 @@ type session struct {
 	win *window
 	// raw writes to the session channel what it is given: ss does not.
 	raw io.Writer
+	// out is the program's output, which is ss, with its writes counted.
+	out *countingWriter
+	// screenTimer looks, after a command's turn, whether the program
+	// writes again: see watchScreen. It is nil before the first turn.
+	screenTimer *time.Timer
 }
 
 // run gives the session its program, and ends it when the program ends.
@@ -104,7 +113,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	defer cancel()
 	// The session ends when the client closes its channel, even if the
 	// connection stays: nothing would end the program then.
-	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput()}
+	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput(), out: &countingWriter{w: ss}}
 	win := s.windowOf(ss)
 	sess.win, sess.raw = win, rawWriter(ss)
 	go func() {
@@ -112,6 +121,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 		case <-win.closed:
 			sess.channelClosed.Store(true)
 			cancel()
+			sess.channelGone()
 		case <-ctx.Done():
 		}
 	}()
@@ -142,6 +152,8 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			tea.WithInput(programInput{sess.in}),
 			// In place of the filter among MakeOptions.
 			tea.WithFilter(sess.filter),
+			// In place of the output among them, which is ss.
+			tea.WithOutput(sess.out),
 		)
 		p := tea.NewProgram(m, opts...)
 		if started = sess.start(p); started {
@@ -154,8 +166,8 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 
 			go win.forward(ctx, p)
 			_, err := p.Run()
-			// Bubble Tea leaves its reader in Read: it ends here, and
-			// the pump with the channel.
+			// A reader that Bubble Tea left in Read is told the end, and
+			// gets nothing of what waits; the pump ends with the channel.
 			sess.in.close()
 			// Taken now: a channel that closes after the program ended
 			// by itself is not why it ended.
@@ -224,16 +236,11 @@ func (sess *session) end(msg string) bool {
 	}
 	sess.reason = msg
 	sess.stopped.Store(true)
-	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() {
-		what := "session did not end in time: its connection is closed"
-		if sess.commandRuns() {
-			what = "session did not end in time, the command that has its terminal did not return: its connection is closed"
-		}
-		sess.srv.log.Warn(what,
-			"transport", sess.conn.transport, "remote", sess.conn.remote,
-			"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "reason", msg)
-		_ = sess.conn.Close()
-	})
+	if sess.timer != nil {
+		// channelGone's: this one is as good, and finish stops one.
+		sess.timer.Stop()
+	}
+	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() { sess.cutOff(msg) })
 	if sess.cancelCommand != nil {
 		// The program takes nothing, Quit neither, until the command
 		// that has the terminal has returned.
@@ -245,6 +252,44 @@ func (sess *session) end(msg string) bool {
 		go p.Quit()
 	}
 	return true
+}
+
+// What a turn waits for, in the log.
+const (
+	waitsForCommand = "the command that has its terminal did not return"
+	waitsForWrite   = "the client did not take what its command wrote"
+)
+
+// cutOff closes the connection of a session that was to end, for reason,
+// and has not: because its client does not read what the program or a
+// command writes, or because its command does not return. The log says
+// which.
+func (sess *session) cutOff(reason string) {
+	what := "session did not end in time: its connection is closed"
+	sess.mu.Lock()
+	if sess.waits != "" {
+		what = "session did not end in time, " + sess.waits + ": its connection is closed"
+	}
+	sess.mu.Unlock()
+	sess.srv.log.Warn(what,
+		"transport", sess.conn.transport, "remote", sess.conn.remote,
+		"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "reason", reason)
+	_ = sess.conn.Close()
+}
+
+// channelGone is called when the client has closed the session channel
+// and the session's context is done. A program ends with its context; a
+// command that has the terminal is to return on its own, and when it
+// does not, nothing else would end the session of a client that keeps
+// its connection: the connection is closed after srv.endTimeout, as it
+// is when kosh ends a session.
+func (sess *session) channelGone() {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.cancelCommand == nil || sess.timer != nil || sess.finished {
+		return
+	}
+	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() { sess.cutOff(reasonChannelClosed) })
 }
 
 // over reports whether the session has ended or is being ended: by the
@@ -269,24 +314,17 @@ func (sess *session) beginCommand(cancel context.CancelFunc) bool {
 	if sess.overLocked() {
 		return false
 	}
-	sess.cancelCommand = cancel
+	sess.cancelCommand, sess.waits = cancel, waitsForCommand
 	return true
 }
 
-// endCommand is called when the command that has the terminal has
-// returned.
-func (sess *session) endCommand() {
+// commandWaits is called when the command that has the terminal has
+// returned, with what its turn waits for now: waitsForWrite, and then
+// "" when the turn waits for nothing more.
+func (sess *session) commandWaits(what string) {
 	sess.mu.Lock()
-	sess.cancelCommand = nil
+	sess.cancelCommand, sess.waits = nil, what
 	sess.mu.Unlock()
-}
-
-// commandRuns reports whether a command has the terminal and has not
-// returned.
-func (sess *session) commandRuns() bool {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	return sess.cancelCommand != nil
 }
 
 // finish marks the session as exited, and stops the timer of end. An end
@@ -299,6 +337,9 @@ func (sess *session) finish() {
 	sess.finished = true
 	if sess.timer != nil {
 		sess.timer.Stop()
+	}
+	if sess.screenTimer != nil {
+		sess.screenTimer.Stop()
 	}
 }
 
