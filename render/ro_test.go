@@ -22,10 +22,10 @@ func TestRolesRows(t *testing.T) {
 		{
 			name: "complete",
 			obj: &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{
-				Namespace: "prod", Name: "reader", CreationTimestamp: ago(2 * time.Hour),
+				Namespace: "prod", Name: "reader", CreationTimestamp: ago(5 * time.Hour),
 				Labels: map[string]string{"a": "b"},
 			}},
-			want: map[string]string{"NAMESPACE": "prod", "NAME": "reader", "LABELS": "a=b", "VALID": "", "AGE": "2h"},
+			want: map[string]string{"NAMESPACE": "prod", "NAME": "reader", "LABELS": "a=b", "VALID": "", "AGE": "5h"},
 		},
 		{
 			name: "metadata only",
