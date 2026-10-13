@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	ucli "github.com/urfave/cli/v2"
@@ -14,6 +15,12 @@ var Version = "dev"
 // Its Run returns the error of a command and does not exit: main prints
 // it and exits.
 func App() *ucli.App {
+	return newApp(serve)
+}
+
+// newApp is App with the function that kosh serve runs, which tests
+// replace to see the options it is given.
+func newApp(runServe func(context.Context, serveOptions) error) *ucli.App {
 	return &ucli.App{
 		Name:    "kosh",
 		Usage:   "a terminal UI for the cluster it runs in, served over SSH and iroh",
@@ -22,6 +29,7 @@ func App() *ucli.App {
 		// printed here and the process ended.
 		ExitErrHandler: func(*ucli.Context, error) {},
 		Commands: []*ucli.Command{
+			serveCommand(runServe),
 			idCommand(),
 			{
 				Name:  "version",
