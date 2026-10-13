@@ -31,7 +31,9 @@ func clean(s string) string {
 	b.Grow(len(s))
 	// col is the width of the line in b up to measured; what was written
 	// after measured is measured at the next tab, so that every byte is
-	// measured once.
+	// measured once. A tab's last space is left to be measured with what
+	// follows it, because a mark after a tab (U+FE0F, a combining accent)
+	// joins that space as the terminal draws it.
 	col, measured := 0, 0
 	i := 0
 	for i < len(s) {
@@ -54,8 +56,7 @@ func clean(s string) string {
 			col += ansi.StringWidth(b.String()[measured:])
 			n := tabWidth - col%tabWidth
 			b.WriteString(strings.Repeat(" ", n))
-			col += n
-			measured = b.Len()
+			col, measured = col+n-1, b.Len()-1
 			i += size
 		case r < 0x20:
 			b.WriteRune(0x2400 + r)

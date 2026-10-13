@@ -166,6 +166,16 @@ func TestCleanAndFitAreLinear(t *testing.T) {
 	if got := clean(strings.Repeat("名\t", 1000)); got != strings.Repeat("名      ", 1000) {
 		t.Errorf("tabs after a wide character are not stops of 8: %q", got[:40])
 	}
+	// A mark that joins the character before it is measured with it, a
+	// tab's last space too: the stops are where the whole line, measured
+	// as the terminal does, puts them.
+	for _, in := range []string{"\t\ufe0f\tx", "\t\u0301\tx", "a\t\u200d\tb\tx", "\t\ufe0f\u0301\t\tx", "名\t\ufe0fe\u0301\tx"} {
+		out := clean(in)
+		at := strings.LastIndex(out, "x")
+		if w := ansi.StringWidth(out[:at]); w%tabWidth != 0 {
+			t.Errorf("clean(%q) = %q puts x at column %d, not at a tab stop", in, out, w)
+		}
+	}
 	for _, tt := range []struct{ in, want string }{
 		{"abcdefgh\tx", "abcdefgh        x"},
 		{"abc\x1b[31m\tx", "abc     x"},
