@@ -3,10 +3,12 @@ package kube
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
@@ -59,6 +61,9 @@ type Cluster struct {
 	// informers convert what the API sends into: render.Zero.
 	zeroOf func(schema.GroupVersionResource) (runtime.Object, bool)
 	tables tableLister // nil without cfg, until a test sets its fake
+	// openLog opens the log of one container of a pod: the typed
+	// client's GetLogs(…).Stream. Tests give streams of their own.
+	openLog func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
 
 	// ctx is done when Close is called; everything the Cluster runs
 	// ends with it, and wg waits for it to have ended.
@@ -124,6 +129,9 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 		opts:   opts,
 		disc:   disc,
 		zeroOf: render.Zero,
+		openLog: func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
+			return typed.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
+		},
 		ctx:    ctx,
 		cancel: cancel,
 		caches: map[schema.GroupVersionResource]*kindCache{},
