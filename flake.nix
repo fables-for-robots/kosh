@@ -70,7 +70,8 @@
             evalGo = if evalPkgs != null then go evalPkgs else null;
           };
 
-          # The one program, without cgo.
+          # The one program. Without cgo it is linked statically on Linux,
+          # and runs in an image that has no libc.
           #
           # gonixgo asks `go list` while Nix evaluates which packages
           # cmd/kosh is made of, without build tags: cli/pin.go, which is
@@ -84,7 +85,52 @@
               [ "-X github.com/fables-for-robots/kosh/cli.Version=${version}" ];
             meta.license = pkgs.lib.licenses.lgpl3Only;
           };
-        in { default = kosh; });
+        in {
+          default = kosh;
+        } // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # The image the chart runs:
+          #   nix build .#image && docker load < result
+          #
+          # kosh, the certificates it reaches the relays and number0's DNS
+          # with over HTTPS, and the user it runs as; no shell and no
+          # other program. The program and the certificates are copied to
+          # where an image has them, which works because both are files
+          # that need no other.
+          #
+          # Nothing is in its /nix/store: left to itself Nix puts there
+          # what the copies name, and the Go of nixpkgs writes into every
+          # program where it would look for the time zones, the MIME types
+          # and the names of protocols and ports when the machine has none
+          # (tzdata, mailcap, iana-etc). kosh needs none of them, so the
+          # image is made without store paths.
+          image = pkgs.dockerTools.buildLayeredImage {
+            name = "ghcr.io/fables-for-robots/kosh";
+            tag = "nix";
+            includeStorePaths = false;
+            extraCommands = ''
+              mkdir -p bin etc/ssl/certs
+              mkdir -m 1777 tmp
+
+              # Where the chart mounts the state and the key list.
+              mkdir -p var/lib/kosh etc/kosh
+
+              cp ${kosh}/bin/kosh bin/kosh
+
+              cp ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-certificates.crt
+              chmod 0444 etc/ssl/certs/ca-certificates.crt
+
+              # The user kosh runs as, which the chart's securityContext
+              # names by its number.
+              echo 'kosh:x:65532:65532:kosh:/:/sbin/nologin' > etc/passwd
+              echo 'kosh:x:65532:' > etc/group
+            '';
+            config = {
+              Entrypoint = [ "/bin/kosh" ];
+              User = "65532:65532";
+              Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" ];
+            };
+          };
+        });
 
       # The shell carries the built program, so entering it (or direnv
       # reloading it after a source change, see .envrc) rebuilds it. It
