@@ -136,3 +136,24 @@ func TestYAMLOfASecretIsRefusedReadOnly(t *testing.T) {
 		t.Errorf("full: the YAML holds %q, want the Secret's data", got.Data)
 	}
 }
+
+func TestDescribeOfASecretIsRefusedReadOnly(t *testing.T) {
+	e := newEnv(t, envConfig{}, readSecret())
+	ref := ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "token"}
+
+	ro := readSessionOf(t, e, readOnlyGrant)
+	if _, err := ro.Describe(context.Background(), ref); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("read-only: got %v, want ErrReadOnly", err)
+	}
+	if aa := readActionsOn(e, "secrets"); len(aa) != 0 {
+		t.Errorf("read-only: the Secret was read: %v", aa)
+	}
+
+	// Without a config, a full grant gets as far as the describer, which
+	// says that it needs one; TestEnvDescribeSecretShowsNoValue describes
+	// a Secret for real.
+	_, err := e.session(t).Describe(context.Background(), ref)
+	if err == nil || errors.Is(err, ErrReadOnly) || !strings.Contains(err.Error(), "connection") {
+		t.Errorf("full, without a config: got %v, want the error that describe needs a connection", err)
+	}
+}
