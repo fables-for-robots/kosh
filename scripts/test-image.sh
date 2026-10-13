@@ -2,18 +2,19 @@
 # Tests the image that `nix build .#image` makes, once it is loaded into
 # Docker: that it is kosh, runs as kosh's user on a read-only root, and
 # holds no shell and nothing in /nix/store. Stops at the first check that
-# does not hold.
+# does not hold. With VERSION, kosh version has to print exactly that.
 #
 #   nix build .#image --option allow-unsafe-native-code-during-evaluation true
 #   docker load < result
-#   scripts/test-image.sh ghcr.io/fables-for-robots/kosh:nix
+#   scripts/test-image.sh ghcr.io/fables-for-robots/kosh:nix [VERSION]
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-  echo "usage: $0 IMAGE" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "usage: $0 IMAGE [VERSION]" >&2
   exit 2
 fi
 IMAGE=$1
+WANT_VERSION=${2:-}
 
 OUT=$(mktemp -d)
 CONTAINER=
@@ -31,6 +32,9 @@ docker run --rm "$IMAGE" version >"$OUT/version" 2>"$OUT/version.err" ||
   { cat "$OUT/version.err" >&2; fail "version: kosh version failed"; }
 [ "$(grep -c . "$OUT/version")" = 1 ] ||
   fail "version: want one line, got: $(cat "$OUT/version")"
+if [ -n "$WANT_VERSION" ] && [ "$(cat "$OUT/version")" != "$WANT_VERSION" ]; then
+  fail "version: kosh version printed '$(cat "$OUT/version")', want '$WANT_VERSION'"
+fi
 echo "ok   version $(cat "$OUT/version")"
 
 # 9. The user the image runs as is 65532, the one the chart's
@@ -72,7 +76,7 @@ echo "== refusal"
 if docker run --rm "$IMAGE" serve --ssh-listen "" --iroh=false >"$OUT/serve" 2>"$OUT/serve.err"; then
   fail "refusal: kosh serve with both transports off exited 0"
 fi
-grep -qi "transport" "$OUT/serve.err" ||
+grep -qF "both transports are off" "$OUT/serve.err" ||
   { cat "$OUT/serve" "$OUT/serve.err" >&2; fail "refusal: kosh serve did not say that both transports are off"; }
 echo "ok   refused: $(head -1 "$OUT/serve.err")"
 
