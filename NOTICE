@@ -1,0 +1,12 @@
+kosh is free software under the GNU Lesser General Public License,
+version 3 only. See LICENSE and COPYING.
+
+kosh's terminal UI behaves like k9s (https://github.com/derailed/k9s),
+and the columns of its tables, what their cells hold and what makes a
+row an error follow k9s's. Files of kosh whose logic follows a file of
+k9s closely say so at their top. k9s is
+
+    Copyright Authors of K9s
+
+and licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).

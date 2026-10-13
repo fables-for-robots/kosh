@@ -1,0 +1,13 @@
+# nix build
+/result
+/result-*
+
+# direnv
+/.direnv/
+
+# go build and go test -c
+/kosh
+*.test
+
+# the API server and etcd that tests start, fetched by scripts/envtest-assets.sh
+/.cache/
