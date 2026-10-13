@@ -1,0 +1,132 @@
+{{- include "kosh.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kosh.fullname" . }}
+  labels:
+    {{- include "kosh.labels" . | nindent 4 }}
+spec:
+  # One replica and Recreate, and neither is a value: two kosh with one key
+  # evict each other at the relay.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kosh.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      # No checksum of the ConfigMap here: a changed key list must not
+      # restart kosh, which follows the file.
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "kosh.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kosh.serviceAccountName" . }}
+      {{- if .Values.iroh.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kosh
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            {{- if .Values.ssh.enabled }}
+            - --ssh-listen=:{{ .Values.ssh.port }}
+            {{- else }}
+            - --ssh-listen=
+            {{- end }}
+            - --iroh={{ .Values.iroh.enabled }}
+            - --iroh-relay={{ .Values.iroh.relay }}
+            - --iroh-mdns={{ .Values.iroh.mdns }}
+            {{- if .Values.iroh.port }}
+            - --iroh-bind=0.0.0.0:{{ .Values.iroh.port }}
+            {{- end }}
+            - --state-dir=/var/lib/kosh
+            - --authorized-keys=/etc/kosh/authorized_keys
+          {{- if or .Values.ssh.enabled .Values.iroh.port }}
+          ports:
+            {{- if .Values.ssh.enabled }}
+            - name: ssh
+              containerPort: {{ .Values.ssh.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.iroh.port }}
+            - name: iroh
+              containerPort: {{ .Values.iroh.port }}
+              protocol: UDP
+            {{- end }}
+          {{- end }}
+          {{- if .Values.ssh.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: ssh
+          livenessProbe:
+            tcpSocket:
+              port: ssh
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # The whole volume, not a subPath: a subPath never sees the
+            # ConfigMap change.
+            - name: keys
+              mountPath: /etc/kosh
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/kosh
+              {{- if .Values.state.existingSecret }}
+              readOnly: true
+              {{- end }}
+      volumes:
+        - name: keys
+          configMap:
+            name: {{ include "kosh.fullname" . }}
+        - name: state
+          {{- if .Values.state.existingSecret }}
+          secret:
+            secretName: {{ .Values.state.existingSecret }}
+            defaultMode: 0440
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "kosh.fullname" . }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

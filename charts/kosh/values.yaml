@@ -1,0 +1,77 @@
+image:
+  # The image to run.
+  repository: ghcr.io/fables-for-robots/kosh
+  # The image tag; empty means the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Secrets for pulling the image, as a list of {name: ...}.
+imagePullSecrets: []
+
+# The key list: the text of an OpenSSH authorized_keys file, one key to a
+# line. A key with the option `read-only` is read-only; any other option
+# rejects the line. Changing it does not restart kosh, which follows the file.
+authorizedKeys: ""
+
+ssh:
+  # SSH over TCP. Without it there is no Service.
+  enabled: true
+  # The port in the container.
+  port: 2222
+
+service:
+  # ClusterIP keeps SSH inside the cluster. LoadBalancer exposes it through a
+  # load balancer; NodePort works too.
+  type: ClusterIP
+  # The Service's port.
+  port: 22
+  # Annotations of the Service, for the load balancer of the cloud at hand.
+  annotations: {}
+  # Who may reach the load balancer (LoadBalancer only).
+  loadBalancerSourceRanges: []
+  # Local keeps the client's address, which is then what kosh logs
+  # (LoadBalancer and NodePort only).
+  externalTrafficPolicy: Cluster
+
+iroh:
+  # SSH over iroh. It needs outgoing traffic only.
+  enabled: true
+  # Use the default relays and the pkarr record that makes kosh reachable.
+  relay: true
+  # Announce on the local network by mDNS.
+  mdns: true
+  # Run the pod on the host's network, for mDNS and direct connections.
+  hostNetwork: false
+  # A fixed UDP port for the endpoint; null lets the system pick.
+  port: null
+
+state:
+  # A Secret holding the two files of kosh's state, iroh.key and
+  # ssh_host_ed25519_key (made by `kosh id`), mounted read-only.
+  # Set this or state.persistence.enabled, and not both.
+  existingSecret: ""
+  persistence:
+    # A PersistentVolumeClaim instead, on which kosh makes its keys at first start.
+    enabled: false
+    size: 16Mi
+    # Empty means the cluster's default storage class.
+    storageClass: ""
+
+rbac:
+  # Bind the ServiceAccount to a ClusterRole.
+  create: true
+  # The ClusterRole. A full key of kosh can do whatever this role can;
+  # cluster-admin says that plainly.
+  clusterRole: cluster-admin
+
+serviceAccount:
+  create: true
+  # Empty means the release's full name.
+  name: ""
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}

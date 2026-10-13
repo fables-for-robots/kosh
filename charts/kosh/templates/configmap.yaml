@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kosh.fullname" . }}
+  labels:
+    {{- include "kosh.labels" . | nindent 4 }}
+data:
+  authorized_keys: {{ .Values.authorizedKeys | quote }}
