@@ -1,0 +1,227 @@
+package kube
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/fables-for-robots/kosh/render"
+)
+
+func TestContainersOfAPod(t *testing.T) {
+	p := readPodWith("default", "web", nil, "app", "sidecar")
+	p.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "init:1"}}
+	// What the API sends has whole seconds.
+	p.CreationTimestamp = metav1.NewTime(p.CreationTimestamp.Truncate(time.Second))
+	e := newEnv(t, envConfig{opts: Options{IdleStop: 10 * time.Millisecond}}, p, readDeployment("default", "web", "web"))
+	s := e.session(t)
+	of := ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}
+	w := watchOf(t, s, Query{Resource: Containers, Of: &of})
+
+	tab := rowsWhen(t, w, "default/init", "default/app", "default/sidecar")
+	now := time.Now()
+	tab = w.Table(now)
+	if want := render.ContainerRows(p, now); !reflect.DeepEqual(tab.Rows, want) {
+		t.Errorf("rows\n%+v\nwant render.ContainerRows\n%+v", tab.Rows, want)
+	}
+	if !reflect.DeepEqual(tab.Columns, render.ContainerColumns()) || tab.Namespaced || tab.Stale || tab.Err != nil {
+		t.Errorf("table: columns %v, namespaced %v, stale %v, err %v", tab.Columns, tab.Namespaced, tab.Stale, tab.Err)
+	}
+
+	drain(w.Changed())
+	changed := p.DeepCopy()
+	changed.Spec.Containers = append(changed.Spec.Containers, corev1.Container{Name: "debug", Image: "busybox"})
+	pods := e.dyn.Resource(of.Resource.GVR).Namespace("default")
+	if _, err := pods.Update(context.Background(), toUnstructured(t, changed), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitChanged(t, w)
+	rowsWhen(t, w, "default/init", "default/app", "default/sidecar", "default/debug")
+
+	drain(w.Changed())
+	if err := pods.Delete(context.Background(), "web", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitChanged(t, w)
+	eventually(t, "no rows for a pod that is gone", func() bool {
+		tab := w.Table(time.Now())
+		return len(tab.Rows) == 0 && tab.Err == nil
+	})
+
+	for _, bad := range []*ObjectRef{
+		nil,
+		{Resource: e.resource(t, "apps", "deployments"), Namespace: "default", Name: "web"},
+	} {
+		if _, err := s.Watch(Query{Resource: Containers, Of: bad}); !errors.Is(err, ErrNoRelation) {
+			t.Errorf("Of %v: got %v, want ErrNoRelation", bad, err)
+		}
+	}
+
+	w.Close()
+	w.Close()
+	eventually(t, "the pods' cache is idle and stopped", func() bool { return !e.c.running(render.Pods) })
+}
+
+func TestContainersFollowTheCacheStatus(t *testing.T) {
+	e := newEnv(t, envConfig{before: func(e *env) {
+		e.dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+			return true, nil, errors.New("pods are forbidden")
+		})
+	}})
+	of := ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}
+	w := watchOf(t, e.session(t), Query{Resource: Containers, Of: &of})
+	eventually(t, "the list's error", func() bool {
+		tab := w.Table(time.Now())
+		return tab.Err != nil && len(tab.Rows) == 0
+	})
+}
+
+var (
+	readRoleBindings        = Resource{GVR: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}, Kind: "RoleBinding", Namespaced: true}
+	readClusterRoleBindings = Resource{GVR: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}, Kind: "ClusterRoleBinding"}
+)
+
+func readRole(namespace, name string, rules ...rbacv1.PolicyRule) *rbacv1.Role {
+	return &rbacv1.Role{ObjectMeta: objMeta(namespace, name), Rules: rules}
+}
+
+func readRule(group, resource string, verbs ...string) rbacv1.PolicyRule {
+	return rbacv1.PolicyRule{APIGroups: []string{group}, Resources: []string{resource}, Verbs: verbs}
+}
+
+// readRulesWhen waits until the table's rows are those of rules.
+func readRulesWhen(t *testing.T, w Watch, rules ...rbacv1.PolicyRule) Table {
+	t.Helper()
+	want := render.RuleRows(rules)
+	var tab Table
+	eventually(t, "the rows of the rules", func() bool {
+		tab = w.Table(time.Now())
+		return reflect.DeepEqual(tab.Rows, want)
+	})
+	return tab
+}
+
+func TestRulesOfARole(t *testing.T) {
+	podsRule := readRule("", "pods", "get", "list")
+	nsPodsRule := readRule("", "pods", "get", "list", "watch", "delete")
+	allRule := readRule("*", "*", "*")
+	e := newEnv(t, envConfig{},
+		readRole("default", "reader", podsRule),
+		readRole("other", "reader", nsPodsRule),
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "reader"}, Rules: []rbacv1.PolicyRule{allRule}},
+		&rbacv1.RoleBinding{ObjectMeta: objMeta("other", "to-role"),
+			RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "reader"}},
+		&rbacv1.RoleBinding{ObjectMeta: objMeta("default", "to-clusterrole"),
+			RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "reader"}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "crb"},
+			RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "reader"}},
+	)
+	s := e.session(t)
+	for _, tc := range []struct {
+		name string
+		of   ObjectRef
+		want rbacv1.PolicyRule
+	}{
+		{"a role", ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "roles"), Namespace: "default", Name: "reader"}, podsRule},
+		{"a clusterrole", ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "clusterroles"), Name: "reader"}, allRule},
+		{"a rolebinding to a role, of its namespace", ObjectRef{Resource: readRoleBindings, Namespace: "other", Name: "to-role"}, nsPodsRule},
+		{"a rolebinding to a clusterrole", ObjectRef{Resource: readRoleBindings, Namespace: "default", Name: "to-clusterrole"}, allRule},
+		{"a clusterrolebinding", ObjectRef{Resource: readClusterRoleBindings, Name: "crb"}, allRule},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := watchOf(t, s, Query{Resource: Rules, Of: &tc.of})
+			tab := readRulesWhen(t, w, tc.want)
+			if len(tab.Rows) == 0 || !reflect.DeepEqual(tab.Columns, render.RuleColumns()) || tab.Namespaced || tab.Stale || tab.Err != nil {
+				t.Errorf("table: %d rows, columns %v, namespaced %v, stale %v, err %v", len(tab.Rows), tab.Columns, tab.Namespaced, tab.Stale, tab.Err)
+			}
+		})
+	}
+}
+
+func TestRulesFollowAChange(t *testing.T) {
+	first := readRule("", "pods", "get")
+	e := newEnv(t, envConfig{opts: Options{TablePoll: 10 * time.Millisecond}}, readRole("default", "reader", first))
+	of := ObjectRef{Resource: e.resource(t, "rbac.authorization.k8s.io", "roles"), Namespace: "default", Name: "reader"}
+	w := watchOf(t, e.session(t), Query{Resource: Rules, Of: &of})
+	readRulesWhen(t, w, first)
+
+	drain(w.Changed())
+	added := readRule("apps", "deployments", "get", "list")
+	if _, err := e.typed.RbacV1().Roles("default").Update(context.Background(), readRole("default", "reader", first, added), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitChanged(t, w)
+	if got, want := w.Table(time.Now()).Rows, render.RuleRows([]rbacv1.PolicyRule{first, added}); !reflect.DeepEqual(got, want) {
+		t.Errorf("after Changed: %+v, want %+v", got, want)
+	}
+}
+
+func TestRulesErrors(t *testing.T) {
+	var fail atomic.Bool
+	var reads atomic.Int32
+	e := newEnv(t, envConfig{opts: Options{TablePoll: 10 * time.Millisecond}, before: func(e *env) {
+		e.typed.PrependReactor("get", "roles", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+			reads.Add(1)
+			if fail.Load() {
+				return true, nil, errors.New("the API is down")
+			}
+			return false, nil, nil
+		})
+	}}, readRole("default", "reader", readRule("", "pods", "get")), pod("default", "web", nil))
+	s := e.session(t)
+	roles := e.resource(t, "rbac.authorization.k8s.io", "roles")
+
+	t.Run("the role is not there", func(t *testing.T) {
+		of := ObjectRef{Resource: roles, Namespace: "default", Name: "missing"}
+		w := watchOf(t, s, Query{Resource: Rules, Of: &of})
+		eventually(t, "Err", func() bool {
+			tab := w.Table(time.Now())
+			return tab.Err != nil && len(tab.Rows) == 0
+		})
+	})
+
+	t.Run("not a role", func(t *testing.T) {
+		for _, bad := range []*ObjectRef{nil, {Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}} {
+			if _, err := s.Watch(Query{Resource: Rules, Of: bad}); !errors.Is(err, ErrNoRelation) {
+				t.Errorf("Of %v: got %v, want ErrNoRelation", bad, err)
+			}
+		}
+	})
+
+	t.Run("a read that fails later", func(t *testing.T) {
+		of := ObjectRef{Resource: roles, Namespace: "default", Name: "reader"}
+		w := watchOf(t, s, Query{Resource: Rules, Of: &of})
+		readRulesWhen(t, w, readRule("", "pods", "get"))
+		fail.Store(true)
+		defer fail.Store(false)
+		eventually(t, "stale, with the rows kept", func() bool {
+			tab := w.Table(time.Now())
+			return tab.Stale && tab.Err == nil && len(tab.Rows) > 0
+		})
+		fail.Store(false)
+		eventually(t, "fresh again", func() bool { return !w.Table(time.Now()).Stale })
+	})
+
+	t.Run("after Close", func(t *testing.T) {
+		of := ObjectRef{Resource: roles, Namespace: "default", Name: "reader"}
+		w := watchOf(t, s, Query{Resource: Rules, Of: &of})
+		readRulesWhen(t, w, readRule("", "pods", "get"))
+		w.Close()
+		w.Close()
+		n := reads.Load()
+		time.Sleep(50 * time.Millisecond) // five polls
+		if got := reads.Load(); got != n {
+			t.Errorf("%d reads after Close", got-n)
+		}
+	})
+}
