@@ -132,4 +132,22 @@ eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("^read-
 render narrow-rbac
 eq narrow-rbac ClusterRoleBinding .roleRef.name view "binds view"
 
+# --- the refusals
+# refuses NAME MESSAGE ARGS...: helm template with ARGS must fail with MESSAGE on standard error.
+refuses() {
+  local name=$1 msg=$2
+  shift 2
+  echo "== refusal $name"
+  if helm template kosh "$CHART" "$@" >"$OUT/refusal.out" 2>"$OUT/refusal.err"; then
+    fail "$name: helm template succeeded, want a refusal"
+  fi
+  grep -qF -- "$msg" "$OUT/refusal.err" || { cat "$OUT/refusal.err" >&2; fail "$name: standard error lacks '$msg'"; }
+  echo "ok   refused with '$msg'"
+}
+
+refuses no-state "kosh needs its state: set state.existingSecret or state.persistence.enabled, or its endpoint ID and host key change at every start"
+refuses both-states "not both" --set state.existingSecret=kosh-state --set state.persistence.enabled=true
+refuses no-transport "set ssh.enabled or iroh.enabled" -f "$CI/secret-values.yaml" --set ssh.enabled=false --set iroh.enabled=false
+refuses no-discovery "set iroh.relay or iroh.mdns" -f "$CI/secret-values.yaml" --set iroh.relay=false --set iroh.mdns=false
+
 echo "all checks passed"
