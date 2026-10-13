@@ -1,3 +1,5 @@
+// Derived from k9s's internal/config/templates/stock-skin.yaml, Copyright Authors of K9s, Apache-2.0 (see LICENSES/Apache-2.0.txt); changed for kosh.
+
 package tui
 
 import (

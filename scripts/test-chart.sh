@@ -148,6 +148,10 @@ eq no-iroh Deployment "$C.args[] | select(test(\"^--iroh=\"))" "--iroh=false" "i
 eq no-iroh Deployment "$C.args | map(select(test(\"^--iroh-bind\"))) | length" 0 "no iroh bind"
 eq no-iroh Deployment "$C.ports | map(select(.protocol == \"UDP\")) | length" 0 "no UDP container port"
 eq no-iroh Deployment "$C.ports | map(.name) | join(\",\")" ssh "the ssh port alone"
+eq no-iroh Deployment "$D.hostNetwork" null "no host network"
+eq no-iroh Deployment "$D.dnsPolicy" null "no DNS policy"
+[ "$(notes no-iroh | grep -c hostNetwork)" = 0 ] || fail "no-iroh: NOTES.txt speaks of the host network without iroh"
+echo "ok   no word of the host network without iroh"
 
 # --- keys
 render keys

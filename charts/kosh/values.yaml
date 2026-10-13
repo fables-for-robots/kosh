@@ -42,7 +42,9 @@ iroh:
   mdns: true
   # Run the pod on the host's network, for mDNS and direct connections.
   # The pod is then in the node's network: SSH's port (ssh.port) listens on
-  # every address of the node, whatever service.type is.
+  # every address of the node, whatever service.type is. It is also outside
+  # every NetworkPolicy, and can reach what listens on the node's loopback.
+  # It applies only with iroh.enabled.
   hostNetwork: false
   # A fixed UDP port for the endpoint; null lets the system pick.
   port: null

@@ -8,6 +8,7 @@ so at their top, name that file, and say that they were changed for
 kosh. k9s is
 
     Copyright Authors of K9s
+    Copyright © 2019, Imhotep Software LLC <fernand@imhotep.io> and other contributors.
 
 and licensed under the Apache License, Version 2.0, whose text is in
 LICENSES/Apache-2.0.txt (also http://www.apache.org/licenses/LICENSE-2.0).

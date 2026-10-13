@@ -33,7 +33,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "kosh.serviceAccountName" . }}
-      {{- if .Values.iroh.hostNetwork }}
+      {{- if and .Values.iroh.enabled .Values.iroh.hostNetwork }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
