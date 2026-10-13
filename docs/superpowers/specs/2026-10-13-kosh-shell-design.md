@@ -63,9 +63,11 @@ section (§5, §11, §13), it is a section of that document.
 5. **When it does not start.** The dialog comes back, with the text as
    the user left it and the reason under it, wrapped: the container
    runtime's own words (`exec: "sh": executable file not found in
-   $PATH`), the API's refusal (`pods "web" is forbidden: User … cannot
-   create resource "pods/exec"`), or that the container is not running.
-   That is the moment the Command field is for.
+   $PATH`), or that the container is not running. That is the moment
+   the Command field is for. What the API itself refuses (`pods "web"
+   is forbidden: User … cannot create resource "pods/exec"`) is said in
+   the flash, as every action's refusal is: another command would not
+   help.
 6. **When kosh or the key goes.** A shell's connection ends when its
    session does (§5 below): the key leaves the list, the client goes
    away, kosh stops. The user sees what a session sees then (`kosh:
