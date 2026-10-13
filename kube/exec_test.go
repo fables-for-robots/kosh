@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1047,19 +1048,18 @@ func TestExecTerminalIsLetGoWhenExecReturns(t *testing.T) {
 			t.Error("a change of size was taken after Exec returned")
 		}
 	})
-	t.Run("all of it, by Exec", func(t *testing.T) {
+	t.Run("all of it, by Exec's run", func(t *testing.T) {
 		f := execEnv(t, execSucceeds(t))
 		term := newExecTerminal(t, 80, 24)
 		opts := term.options("sh")
-		var given *execTerm
-		execTermMade = func(term *execTerm) { given = term }
-		t.Cleanup(func() { execTermMade = nil })
-		// given is read after Exec returned, which execRun waits for.
-		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), opts); err != nil {
-			t.Fatalf("Exec: %v", err)
+		given := newExecTerm(opts)
+		ctx, release, err := f.s.begin(context.Background(), actExec, f.pod("web"))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if given == nil {
-			t.Fatal("Exec made no terminal")
+		defer release()
+		if _, err := f.s.execWith(ctx, f.pod("web"), opts, given, f.s.stream); err != nil {
+			t.Fatalf("execWith: %v", err)
 		}
 		if n, err := given.out.Write([]byte("late")); n != 0 || err == nil {
 			t.Errorf("a write after Exec returned: %d, %v", n, err)
@@ -1069,6 +1069,9 @@ func TestExecTerminalIsLetGoWhenExecReturns(t *testing.T) {
 		}
 		if n, err := given.in.Read(make([]byte, 4)); n != 0 || err != io.EOF {
 			t.Errorf("a read after Exec returned: %d, %v", n, err)
+		}
+		if given.sizes == nil {
+			t.Fatal("the run made no size queue")
 		}
 		if given.out.w != nil || given.in.r != nil || given.sizes.size != nil {
 			t.Error("the stream's terminal still holds the session's")
@@ -1247,13 +1250,15 @@ func TestExecLog(t *testing.T) {
 			} else {
 				f.end()
 			}
-			receive(t, "Exec returns", done)
-			_, end := execRecords(t, f)
-			if by == "the caller" {
-				wantAttrs(t, end, map[string]string{"started": "true", "error": "context canceled"}, "status", "ended")
-			} else {
-				wantAttrs(t, end, map[string]string{"started": "true", "ended": "the session ended"}, "status", "error")
+			out := receive(t, "Exec returns", done)
+			// What Exec returns tells the two apart; the log does not:
+			// in kosh the caller's context is the session's turn, which
+			// ends only with the session.
+			if ended := errors.Is(out.err, errSessionEnded); !errors.Is(out.err, context.Canceled) || ended != (by == "the session") {
+				t.Errorf("Exec returned %v", out.err)
 			}
+			_, end := execRecords(t, f)
+			wantAttrs(t, end, map[string]string{"started": "true", "ended": "the session ended"}, "status", "error")
 		})
 	}
 
@@ -1269,8 +1274,11 @@ func TestExecLog(t *testing.T) {
 		if want := "\"sh\" \"-c\" \"echo [31mred2J\ufffd\" \"xxx"; !strings.HasPrefix(c, want) {
 			t.Errorf("command %s, want it to begin with %s", c, want)
 		}
-		if len(c) != 1024 || !strings.HasSuffix(c, "xx…") || !utf8.ValidString(c) {
-			t.Errorf("a command of %d bytes that ends in %q, want 1024 that end in the mark", len(c), c[max(0, len(c)-8):])
+		if len(c) > 1024 || !strings.HasSuffix(c, `xx" …`) || !utf8.ValidString(c) {
+			t.Errorf("a command of %d bytes that ends in %q, want 1024 at most that end in a closed word and the mark", len(c), c[max(0, len(c)-8):])
+		}
+		if words := quotedWords(t, strings.TrimSuffix(c, " …")); len(words) != 4 || words[2] != "echo [31mred2J\ufffd" || strings.Trim(words[3], "x") != "" {
+			t.Errorf("words %q", words)
 		}
 	})
 }
@@ -1337,8 +1345,148 @@ func TestExecLogKeepsTheWordsApart(t *testing.T) {
 
 	t.Run("a command of 4 KiB ends in the mark", func(t *testing.T) {
 		c := command(t, run(t, "sh", "-c", strings.Repeat("x", 4096)))
-		if !strings.HasSuffix(c, `xx…"`) {
+		if !strings.HasSuffix(c, `xx\" …"`) {
 			t.Errorf("command=…%s", c[max(0, len(c)-16):])
 		}
 	})
+}
+
+// quotedWords returns the words of s, which is Go-quoted words joined
+// by one space, and fails the test when it is not that.
+func quotedWords(t *testing.T, s string) []string {
+	t.Helper()
+	var words []string
+	for len(s) > 0 {
+		q, err := strconv.QuotedPrefix(s)
+		if err != nil {
+			t.Fatalf("not a quoted word at %q: %v", s, err)
+		}
+		w, err := strconv.Unquote(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		words = append(words, w)
+		s = strings.TrimPrefix(s[len(q):], " ")
+	}
+	return words
+}
+
+func TestExecLogCutsAtAWord(t *testing.T) {
+	escapes := strings.Repeat("\"\u202e\\", 400) // each 2 to 6 bytes once quoted
+	tests := []struct {
+		name  string
+		words []string
+		cut   bool
+	}{
+		{"short", []string{"sh", "-c", "a b"}, false},
+		{"exactly the most", []string{strings.Repeat("y", 1022)}, false},
+		{"one byte more", []string{strings.Repeat("y", 1023)}, true},
+		{"escapes cut", []string{"sh", "-c", escapes}, true},
+		{"a long first word", []string{strings.Repeat("é", 2000), "after"}, true},
+		{"many words", strings.Split(strings.Repeat("ab ", 600), " "), true},
+		{"a word that ends in the mark", []string{"sh", "x …"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := logCommand(tt.words, execMaxLogged)
+			if len(c) > execMaxLogged || !utf8.ValidString(c) {
+				t.Fatalf("%d bytes, valid %v", len(c), utf8.ValidString(c))
+			}
+			cut := strings.HasSuffix(c, `" …`)
+			if cut != tt.cut {
+				t.Fatalf("cut %v, want %v: …%s", cut, tt.cut, c[max(0, len(c)-20):])
+			}
+			words := quotedWords(t, strings.TrimSuffix(c, " …"))
+			if !cut {
+				if !slices.Equal(words, tt.words) {
+					t.Errorf("words %q, want %q", words, tt.words)
+				}
+				return
+			}
+			if len(words) == 0 || len(words) > len(tt.words) {
+				t.Fatalf("words %q", words)
+			}
+			last := len(words) - 1
+			if !slices.Equal(words[:last], tt.words[:last]) || !strings.HasPrefix(tt.words[last], words[last]) {
+				t.Errorf("words %q are not a cut of %q", words, tt.words)
+			}
+		})
+	}
+}
+
+// execWithRun runs execWith as Exec does, with term and stream, on
+// f's session.
+func execWithRun(t *testing.T, f *execFixture, ctx context.Context, opts ExecOptions, term *execTerm, stream execStreamFunc) (ExecResult, error) {
+	t.Helper()
+	actx, release, err := f.s.begin(ctx, actExec, f.pod("web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	return f.s.execWith(actx, f.pod("web"), opts, term, stream)
+}
+
+func TestExecPanicUnderTheStream(t *testing.T) {
+	f := execEnv(t, execSucceeds(t))
+	term := newExecTerminal(t, 80, 24)
+	opts := term.options("sh")
+	given := newExecTerm(opts)
+	type secret struct{ text string }
+	value := &secret{"panic-5e1d-marker"}
+	recovered := func() (r any) {
+		defer func() { r = recover() }()
+		_, _ = execWithRun(t, f, context.Background(), opts, given, func(_ context.Context, _ ObjectRef, _ string, _ []string, so remotecommand.StreamOptions) error {
+			if _, err := so.Stdout.Write([]byte("$ ")); err != nil {
+				t.Errorf("writing: %v", err)
+			}
+			panic(value)
+		})
+		return nil
+	}()
+	if recovered != value {
+		t.Fatalf("recovered %v, want the stream's own panic", recovered)
+	}
+	_, end := execRecords(t, f)
+	wantAttrs(t, end, map[string]string{"started": "true", "error": "exec failed", "panicked": "true"}, "status", "ended")
+	noneHolds(t, f, "panic-5e1d-marker", "secret")
+	if given.out.w != nil || given.in.r != nil || given.sizes == nil || given.sizes.size != nil {
+		t.Error("the terminal was not let go")
+	}
+	if n, err := given.out.Write([]byte("late")); n != 0 || err == nil {
+		t.Errorf("a write after the panic: %d, %v", n, err)
+	}
+}
+
+func TestExecStreamContextHoldsNothingOfTheCaller(t *testing.T) {
+	type key struct{}
+	f := execEnv(t, execSucceeds(t))
+	term := newExecTerminal(t, 80, 24)
+	ctx, cancel := context.WithDeadline(context.WithValue(context.Background(), key{}, "marker"), time.Now().Add(time.Hour))
+	defer cancel()
+	streamCtx := make(chan context.Context, 1)
+	done := make(chan error, 1)
+	go func() {
+		opts := term.options("sh")
+		_, err := execWithRun(t, f, ctx, opts, newExecTerm(opts), func(sctx context.Context, _ ObjectRef, _ string, _ []string, _ remotecommand.StreamOptions) error {
+			streamCtx <- sctx
+			<-sctx.Done()
+			return sctx.Err()
+		})
+		done <- err
+	}()
+	sctx := receive(t, "the stream starts", streamCtx)
+	if v := sctx.Value(key{}); v != nil {
+		t.Errorf("the stream's context has the caller's value %v", v)
+	}
+	if d, ok := sctx.Deadline(); ok {
+		t.Errorf("the stream's context has the caller's deadline %v", d)
+	}
+	f.end()
+	err := receive(t, "the run returns", done)
+	if !errors.Is(err, errSessionEnded) || !errors.Is(err, context.Canceled) {
+		t.Errorf("returned %v", err)
+	}
+	if c := context.Cause(sctx); !errors.Is(c, errSessionEnded) {
+		t.Errorf("the stream's context ended with %v, want the session's end", c)
+	}
 }

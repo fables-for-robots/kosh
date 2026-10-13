@@ -42,12 +42,20 @@ const (
 // terminal is logged. A call that the checks refuse is logged once, as
 // the action's failure.
 //
-// When ctx or the session ends, the stream is closed at once, and Exec
-// returns as soon as a write to opts.Stdout that is under way has
+// The ctx Exec is given is its session's turn, which ends only when the
+// session does: an end of the stream by ctx is logged as
+// ended="the session ended", as an end by the session's own context
+// is. What Exec returns still tells them apart: the context's error,
+// with the session's end as its cause when it was that.
+//
+// When ctx or the session ends, the stream is closed at once, but Exec
+// returns only once a write to opts.Stdout that is under way has
 // returned: it waits for that write, so that nothing of the command's
-// output reaches the terminal after Exec returned. The Stdout a caller
-// gives must therefore fail such a write when the terminal is taken
-// away from it (an SSH channel does when its session ends).
+// output reaches the terminal after Exec returned. That wait is bounded
+// by the terminal's owner, not by Exec: the write ends when the client
+// reads again or its connection closes, which at a session's end is
+// after the end's timeout at the latest. Until then Exec has not
+// returned.
 func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
 	ctx, release, err := s.begin(ctx, actExec, pod)
 	if err != nil {
@@ -59,37 +67,93 @@ func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (Ex
 		s.logAction(ctx, actExec, pod, err, slog.String("phase", "end"), container, slog.Bool("started", false))
 		return ExecResult{}, err
 	}
+	return s.execWith(ctx, pod, opts, newExecTerm(opts), s.stream)
+}
+
+// execStreamFunc runs the exec stream of a pod's container with the
+// command until it ends or ctx does: session.stream, or a test's.
+type execStreamFunc func(ctx context.Context, pod ObjectRef, container string, command []string, opts remotecommand.StreamOptions) error
+
+// execWith is Exec once its checks have passed: it logs the start, runs
+// stream on term until it ends or ctx does, lets the terminal go, and
+// logs the end. The stream runs on a context of its own (streamContext).
+// A panic under the stream is logged as the end, with panicked=true and
+// none of its value, after the terminal was let go, and goes on as it
+// was.
+func (s *session) execWith(ctx context.Context, pod ObjectRef, opts ExecOptions, term *execTerm, stream execStreamFunc) (res ExecResult, err error) {
+	container := slog.String("container", logText(opts.Container, execMaxLogged))
 	s.logAction(ctx, actExec, pod, nil, slog.String("phase", "start"), container,
 		slog.String("command", logCommand(opts.Command, execMaxLogged)))
 	began := time.Now()
-	res, err := s.exec(ctx, pod, opts)
-	attrs := []slog.Attr{slog.String("phase", "end"), container,
-		slog.Duration("duration", time.Since(began)), slog.Bool("started", res.Started)}
-	if err == nil {
-		attrs = append(attrs, slog.Int("status", res.Status))
+	sctx, stop := streamContext(ctx)
+	term.sizes = execSizes(sctx, opts)
+	returned := false
+	defer func() {
+		stop()
+		term.letGo()
+		attrs := []slog.Attr{slog.String("phase", "end"), container, slog.Duration("duration", time.Since(began))}
+		switch {
+		case !returned:
+			attrs = append(attrs, slog.Bool("started", term.out.written() > 0),
+				slog.String("error", actExec+" failed"), slog.Bool("panicked", true))
+		case err == nil:
+			attrs = append(attrs, slog.Bool("started", res.Started), slog.Int("status", res.Status))
+		default:
+			attrs = append(attrs, slog.Bool("started", res.Started))
+			attrs = append(attrs, execLogged(err, ctx.Err() != nil)...)
+		}
+		s.logAction(ctx, actExec, pod, nil, attrs...)
+	}()
+	so := remotecommand.StreamOptions{Stdout: term.out, Tty: true}
+	if opts.Stdin != nil {
+		so.Stdin = term.in
 	}
-	s.logAction(ctx, actExec, pod, nil, append(attrs, execLogged(err)...)...)
+	if term.sizes != nil {
+		// Not a nil *execSizeQueue in the interface: client-go would ask
+		// it.
+		so.TerminalSizeQueue = term.sizes
+	}
+	serr := stream(sctx, pod, opts.Container, opts.Command, so)
+	term.letGo()
+	res, err = execOutcome(ctx, serr, term.out.written())
+	returned = true
 	return res, err
+}
+
+// streamContext returns the context the stream runs on: made from
+// context.Background(), not from ctx, so that it holds none of ctx's
+// values, deadline or parents, which a stream that client-go leaves
+// behind would otherwise keep alive with it (see execTerm). It is
+// cancelled, with ctx's cause, when ctx is done, and by the function
+// returned, which the caller defers. What Exec returns and logs is
+// still decided by ctx.
+func streamContext(ctx context.Context) (context.Context, func()) {
+	sctx, cancel := context.WithCancelCause(context.Background())
+	stopAfter := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	return sctx, func() {
+		stopAfter()
+		cancel(nil)
+	}
 }
 
 // execLogged is how the end of an Exec logs its error, in words that
 // hold nothing of the error's text, which may be a webhook's or the
-// runtime's and quote the command: the session's end as
-// ended="the session ended"; ErrExecNotStarted as itself, without the
-// runtime's reason; the caller's context's end as its error; an API
-// error as its reason and code; any other as "exec failed".
-func execLogged(err error) []slog.Attr {
+// runtime's and quote the command. An end by the context (byContext:
+// the action's context was done, and err is the context's) is
+// ended="the session ended", whether the caller's context or the
+// session's own ended first: in kosh the caller is a session's turn,
+// whose context ends with the session, and whoever revokes a key looks
+// for this line. ErrExecNotStarted is logged as itself, without the
+// runtime's reason; an API error as its reason and code; any other as
+// "exec failed".
+func execLogged(err error, byContext bool) []slog.Attr {
 	switch {
 	case err == nil:
 		return nil
-	case errors.Is(err, errSessionEnded):
-		return []slog.Attr{slog.String("ended", "the session ended")}
 	case errors.Is(err, ErrExecNotStarted):
 		return []slog.Attr{slog.String("error", ErrExecNotStarted.Error())}
-	case errors.Is(err, context.Canceled):
-		return []slog.Attr{slog.String("error", context.Canceled.Error())}
-	case errors.Is(err, context.DeadlineExceeded):
-		return []slog.Attr{slog.String("error", context.DeadlineExceeded.Error())}
+	case byContext && (errors.Is(err, errSessionEnded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
+		return []slog.Attr{slog.String("ended", "the session ended")}
 	}
 	return []slog.Attr{slog.String("error", loggableError(actExec, err).Error())}
 }
@@ -97,24 +161,50 @@ func execLogged(err error) []slog.Attr {
 // logCommand returns the command as the log holds it: each word
 // cleaned by logText and quoted as Go quotes a string, the words joined
 // by one space, so that they stay apart whatever they hold:
-// "sh" "-c" "a b". What is longer than max bytes is cut after a whole
-// character and ends in logCut, within max.
+// "sh" "-c" "a b". A command that would be longer than max bytes is
+// cut: the last word that is there is cut before it is quoted, after a
+// whole character, so that its quoted form and the mark fit; its quote
+// is closed, and the mark stands after it, outside any word:
+// "sh" "-c" "xxxx" …. No escape is cut in half, and a cut is not a word
+// that ends in the mark.
 func logCommand(words []string, max int) string {
-	var b strings.Builder
+	quoted := make([]string, len(words))
 	for i, w := range words {
+		quoted[i] = strconv.Quote(logText(w, len(w)))
+	}
+	if all := strings.Join(quoted, " "); len(all) <= max {
+		return all
+	}
+	const mark = " " + logCut
+	budget := max - len(mark)
+	var b strings.Builder
+	for i, q := range quoted {
+		sep := ""
 		if i > 0 {
-			b.WriteByte(' ')
+			sep = " "
 		}
-		b.WriteString(strconv.Quote(logText(w, len(w))))
-		if b.Len() > max {
-			break
+		if b.Len()+len(sep)+len(q) <= budget {
+			b.WriteString(sep + q)
+			continue
 		}
+		// The longest start of the word whose quoted form fits.
+		room := budget - b.Len() - len(sep) - 2 // the two quotes
+		var part strings.Builder
+		for _, r := range logText(words[i], len(words[i])) {
+			e := strconv.Quote(string(r))
+			e = e[1 : len(e)-1] // as it stands inside the quotes
+			if len(e) > room {
+				break
+			}
+			part.WriteString(e)
+			room -= len(e)
+		}
+		if part.Len() > 0 {
+			b.WriteString(sep + `"` + part.String() + `"`)
+		}
+		break
 	}
-	s := b.String()
-	if len(s) > max {
-		s = cutText(s, max-len(logCut)) + logCut
-	}
-	return s
+	return b.String() + mark
 }
 
 // logText returns s as the log holds it: without control characters,
@@ -158,30 +248,9 @@ func (s *session) checkExec(pod ObjectRef, opts ExecOptions) error {
 	return nil
 }
 
-// exec runs the command on the pod's exec stream until it ends or ctx
-// does, and says how it ended.
-func (s *session) exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
-	term := newExecTerm(ctx, opts)
-	stream := remotecommand.StreamOptions{
-		Stdout: term.out,
-		Tty:    true,
-	}
-	if opts.Stdin != nil {
-		stream.Stdin = term.in
-	}
-	if term.sizes != nil {
-		// Not a nil *execSizeQueue in the interface: client-go would ask
-		// it.
-		stream.TerminalSizeQueue = term.sizes
-	}
-	err := s.stream(ctx, pod, opts.Container, opts.Command, stream)
-	term.letGo()
-	return execOutcome(ctx, err, term.out.written())
-}
-
 // execTerm is the terminal as the stream is given it: the caller's
 // input, output and sizes, each behind a guard that Exec closes before
-// it returns.
+// it returns. execWith makes the size queue, on the stream's context.
 //
 // What the stream still runs after that must hold nothing of the
 // session. It usually ends soon: client-go's heartbeat at its next
@@ -195,25 +264,22 @@ func (s *session) exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (Ex
 // and the error stream's reader, the stdout copier, the stdin waiter and
 // the stream's own goroutine wait on their pipes forever: four
 // goroutines, their pipes and a buffer of 32 KiB, for each time it
-// happens. It wants a fix upstream. Until then, letGo drops what the
-// guards hold of the session (its reader, its writer, its size), so
-// that what stays is client-go's memory only.
+// happens. It wants a fix upstream. Until then, nothing they hold is
+// the session's: letGo drops what the guards hold of it (its reader,
+// its writer, its size), and the context they run on is made from
+// context.Background() (streamContext), not from the session's turn,
+// so that it keeps neither the session's context chain nor what hangs
+// from it. What stays is client-go's memory, the executor's REST
+// configuration (the process's), and that context.
 type execTerm struct {
 	in    *execInput
 	out   *execOutput
 	sizes *execSizeQueue // nil without a Size
 }
 
-// execTermMade, when set, is given each execTerm Exec makes. Tests set
-// it.
-var execTermMade func(*execTerm)
-
-func newExecTerm(ctx context.Context, opts ExecOptions) *execTerm {
-	term := &execTerm{in: &execInput{r: opts.Stdin}, out: &execOutput{w: opts.Stdout}, sizes: execSizes(ctx, opts)}
-	if execTermMade != nil {
-		execTermMade(term)
-	}
-	return term
+// newExecTerm returns the terminal of opts, without its size queue.
+func newExecTerm(opts ExecOptions) *execTerm {
+	return &execTerm{in: &execInput{r: opts.Stdin}, out: &execOutput{w: opts.Stdout}}
 }
 
 // letGo ends the stream's hold on the terminal: no read of it begins
