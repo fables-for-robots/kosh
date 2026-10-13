@@ -98,7 +98,7 @@ type harness struct {
 
 // newHarness starts the program of sess in a window of w by h: it runs
 // Init, gives the size, and runs what follows.
-func newHarness(t *testing.T, sess kube.Session, w, h int) *harness {
+func newHarness(t testing.TB, sess kube.Session, w, h int) *harness {
 	t.Helper()
 	c := &clock{at: t0}
 	hs := &harness{

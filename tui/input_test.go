@@ -137,6 +137,7 @@ func TestEditorRefusesTooMuchText(t *testing.T) {
 	hs := editorStart(t, sess, true)
 	v := editorShown(hs)
 	before := v.ta.Value()
+	at := func() [2]int { return [2]int{v.ta.Line(), v.ta.Column()} }
 	hs.send(tea.PasteMsg{Content: mib + mib})
 	if v.ta.Value() != before {
 		t.Errorf("a paste of 2 MiB changed the text to %d bytes", len(v.ta.Value()))
@@ -145,15 +146,72 @@ func TestEditorRefusesTooMuchText(t *testing.T) {
 	if v.modified {
 		t.Error("the editor says the text was changed")
 	}
-	// A paste that fits is taken.
-	hs.send(tea.PasteMsg{Content: "x: y\n"})
-	if v.ta.Value() != "x: y\n"+before {
-		t.Errorf("a short paste was not taken: %q", v.ta.Value())
+	hs.press("left") // the flash, an error, goes with a key and its time
+	hs.clock.advance(flashFor)
+
+	// A paste that would take the text one byte past the limit is
+	// refused; one that takes it to the limit is taken.
+	hs.press("x")
+	room := editorMaxText - len(v.ta.Value())
+	text, cursor := v.ta.Value(), at()
+	hs.send(tea.PasteMsg{Content: strings.Repeat("y", room+1)})
+	if v.ta.Value() != text || at() != cursor {
+		t.Fatalf("a paste past the limit was taken: %d bytes, the cursor at %v, was %v", len(v.ta.Value()), at(), cursor)
 	}
-	// A key that would take the text past the limit is refused too.
-	v.size = editorMaxText
-	hs.press("z")
-	if v.ta.Value() != "x: y\n"+before {
-		t.Errorf("a key past the limit was taken: %q", v.ta.Value()[:20])
+	hs.wantFrame(editorTextTooLong)
+	hs.send(tea.PasteMsg{Content: strings.Repeat("y", room)})
+	if got := len(v.ta.Value()); got != editorMaxText {
+		t.Fatalf("a paste to the limit left %d bytes, want %d", got, editorMaxText)
 	}
+	hs.clock.advance(flashFor)
+	hs.press("left")
+	hs.notFrame(editorTextTooLong)
+
+	// At the limit a key that adds is refused, and enter too.
+	text, cursor = v.ta.Value(), at()
+	for _, k := range []string{"z", "enter", "space"} {
+		hs.press(k)
+		if v.ta.Value() != text || at() != cursor {
+			t.Errorf("%s at the limit was taken", k)
+		}
+		hs.wantFrame(editorTextTooLong)
+	}
+	// A key that adds nothing is taken.
+	hs.press("backspace")
+	if len(v.ta.Value()) != editorMaxText-1 {
+		t.Errorf("backspace at the limit left %d bytes", len(v.ta.Value()))
+	}
+}
+
+// The text area has more rows than the editor opens: at the largest
+// object it opens, enter adds a line. Rows past what the text area can
+// hold are refused with the flash, not in silence.
+func TestEditorEnterAtTheLimit(t *testing.T) {
+	for i, yaml := range editorLargest() {
+		sess := newSession()
+		sess.YAMLs[editorRef.String()] = yaml
+		hs := newHarness(t, sess, 80, 24)
+		actionOpen(hs, sess, "configmaps", simpleTable("cfg"))
+		hs.press("e")
+		v := editorShown(hs)
+		n := v.ta.LineCount()
+		hs.press("enter")
+		if got := v.ta.LineCount(); got != n+1 {
+			t.Errorf("YAML %d of %d lines: enter left %d lines", i, n, got)
+		}
+		hs.typeText("k: v")
+		if !strings.HasPrefix(v.ta.Value(), "\nk: v") {
+			t.Errorf("YAML %d: the text starts %q", i, v.ta.Value()[:10])
+		}
+	}
+
+	sess := newSession()
+	hs := editorStart(t, sess, true)
+	v := editorShown(hs)
+	text := v.ta.Value()
+	hs.send(tea.PasteMsg{Content: strings.Repeat("\n", editorTextMaxRows)})
+	if v.ta.Value() != text {
+		t.Errorf("a paste of more rows than the text area holds was taken: %d rows", v.ta.LineCount())
+	}
+	hs.wantFrame(editorTextTooLong)
 }

@@ -17,13 +17,13 @@ import (
 // esc leaves and asks first when the text was changed.
 
 // The largest YAML the editor opens: editorMaxLines lines and
-// editorMaxBytes bytes. The text area of bubbles draws all its text, in
+// editorMaxBytes bytes. What it holds while it is edited is bounded by
+// editorMaxText and editorTextMaxRows. The text area of bubbles draws all its text, in
 // every update and every frame, and costs about 25µs a row it draws: a
 // row a line, and a row more for each width of the window a long line
 // wraps over. These keep a key and its frame under 50ms on an Apple M4
 // Pro, in the worst case (lines of 73 cells, two rows each at 80
-// columns) as well (TestEditorKeyPressIsFast). The line numbers are as
-// wide as editorMaxLines.
+// columns) as well (TestEditorKeyPressIsFast).
 const (
 	editorMaxLines = 1000
 	editorMaxBytes = 48 << 10
@@ -58,9 +58,18 @@ type editorSavedMsg struct {
 }
 
 // editorMaxText is the most bytes the editor's text grows to by what is
-// typed or pasted; input that would take it further is refused, with
-// the flash editorTextTooLong.
-const editorMaxText = 1 << 20
+// typed or pasted, 16 KiB more than editorMaxBytes, where a key still
+// costs about what it costs at the largest object the editor opens
+// (about 40ms on an Apple M4 Pro, BenchmarkEditorKeyPress).
+// Input that would take the text further is refused, with the flash
+// editorTextTooLong, and the text and the cursor stay as they were.
+const editorMaxText = 64 << 10
+
+// editorTextMaxRows is the most lines the text area holds, which input
+// that would add more is refused for as editorMaxText refuses it: the
+// ceiling of bubbles' text area, which holds 10,000 lines at most, and
+// the width of the line numbers, four digits.
+const editorTextMaxRows = 9999
 
 // editorTextTooLong is the flash of input the editor refuses.
 const editorTextTooLong = "the text is too long to edit here"
@@ -115,9 +124,12 @@ func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why strin
 	ta := textarea.New()
 	ta.Prompt = ""
 	ta.ShowLineNumbers = true
-	ta.MaxHeight = editorMaxLines
+	ta.MaxHeight = editorTextMaxRows
 	ta.MaxWidth = 0
-	ta.CharLimit = 0
+	// input refuses what would take the text past editorMaxText bytes
+	// before the text area sees it; this is the text area's own bound,
+	// in characters, which are never more than the bytes.
+	ta.CharLimit = editorMaxText
 	// ctrl+v and the copy of a selection would use the clipboard of the
 	// machine kosh runs on, by starting a program there. A paste of the
 	// user's terminal still comes, as a PasteMsg.
@@ -184,20 +196,21 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 }
 
 // input gives msg to the text area, unless what it adds would take the
-// text past editorMaxText: then the text stays as it was, and the flash
-// says why.
+// text past editorMaxText bytes or editorTextMaxRows lines: then the
+// text and the cursor stay as they were, and the flash says why.
 func (v *editorView) input(msg tea.Msg) tea.Cmd {
-	added := 0
+	added, rows := 0, 0
 	switch m := msg.(type) {
 	case tea.PasteMsg:
 		added = len(m.Content)
+		rows = strings.Count(m.Content, "\n")
 	case tea.KeyPressMsg:
 		added = len(m.Text)
 		if m.String() == "enter" {
-			added = max(added, 1)
+			added, rows = max(added, 1), 1
 		}
 	}
-	if v.size+added > editorMaxText {
+	if v.size+added > editorMaxText || v.ta.LineCount()+rows > editorTextMaxRows {
 		return func() tea.Msg { return flashMsg{text: editorTextTooLong, err: true} }
 	}
 	var cmd tea.Cmd

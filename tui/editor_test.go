@@ -2,9 +2,13 @@ package tui
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
@@ -340,28 +344,88 @@ func editorLargest() []string {
 	return []string{short, strings.Repeat(long, n)}
 }
 
-func TestEditorKeyPressIsFast(t *testing.T) {
-	bound := 150 * time.Millisecond * slowdown
-	for i, yaml := range editorLargest() {
+// editorTimed is one case of the time a key costs in the editor: its
+// name, and the editor at 80x24 with the text of the case.
+type editorTimed struct {
+	name string
+	open func(tb testing.TB) (*harness, *editorView)
+}
+
+// editorTimedCases are the largest objects the editor opens, and the
+// largest text it holds while it is edited: lines of two rows each up
+// to editorMaxText, less a little room for the keys that are timed.
+func editorTimedCases() []editorTimed {
+	open := func(tb testing.TB, yaml string) (*harness, *editorView) {
 		sess := newSession()
 		sess.YAMLs[editorRef.String()] = yaml
-		hs := newHarness(t, sess, 80, 24)
+		hs := newHarness(tb, sess, 80, 24)
 		actionOpen(hs, sess, "configmaps", simpleTable("cfg"))
 		hs.press("e")
-		editorShown(hs)
+		return hs, editorShown(hs)
+	}
+	var cases []editorTimed
+	for i, yaml := range editorLargest() {
+		cases = append(cases, editorTimed{
+			name: fmt.Sprintf("opened %d: %d lines, %d bytes", i, strings.Count(yaml, "\n"), len(yaml)),
+			open: func(tb testing.TB) (*harness, *editorView) { return open(tb, yaml) },
+		})
+	}
+	cases = append(cases, editorTimed{
+		name: fmt.Sprintf("edited to %d bytes", editorMaxText),
+		open: func(tb testing.TB) (*harness, *editorView) {
+			hs, v := open(tb, editorLargest()[1])
+			long := strings.Repeat("a", 72) + "\n"
+			room := editorMaxText - v.size - 4096
+			hs.send(tea.PasteMsg{Content: strings.Repeat(long, room/len(long))})
+			if v.size < editorMaxText-4096-len(long) {
+				tb.Fatalf("the text is %d bytes after the paste", v.size)
+			}
+			return hs, v
+		},
+	})
+	return cases
+}
+
+// editorKeyAndFrame presses a key in the editor and draws the frame.
+func editorKeyAndFrame(hs *harness) {
+	hs.press("x")
+	hs.frame()
+}
+
+// A key and its frame in the editor at its largest. It measures time,
+// so it runs only when KOSH_TIMING_TESTS=1: a slow or loaded machine
+// would fail it otherwise. BenchmarkEditorKeyPress measures the same.
+func TestEditorKeyPressIsFast(t *testing.T) {
+	if os.Getenv("KOSH_TIMING_TESTS") != "1" {
+		t.Skip("a test of time: set KOSH_TIMING_TESTS=1 to run it, or run BenchmarkEditorKeyPress")
+	}
+	bound := 150 * time.Millisecond * slowdown
+	for _, c := range editorTimedCases() {
+		hs, _ := c.open(t)
 		hs.frame()
 		// The fastest of a few, so that a pause of the machine is not
 		// counted.
 		best := time.Hour
 		for range 3 {
 			start := time.Now()
-			hs.press("x")
-			hs.frame()
+			editorKeyAndFrame(hs)
 			best = min(best, time.Since(start))
 		}
-		t.Logf("YAML %d, %d lines, %d bytes: a key and its frame in %v", i, strings.Count(yaml, "\n"), len(yaml), best)
+		t.Logf("%s: a key and its frame in %v", c.name, best)
 		if best > bound {
-			t.Errorf("YAML %d, %d lines, %d bytes: a key and its frame take %v, more than %v", i, strings.Count(yaml, "\n"), len(yaml), best, bound)
+			t.Errorf("%s: a key and its frame take %v, more than %v", c.name, best, bound)
 		}
+	}
+}
+
+func BenchmarkEditorKeyPress(b *testing.B) {
+	for _, c := range editorTimedCases() {
+		b.Run(c.name, func(b *testing.B) {
+			hs, _ := c.open(b)
+			hs.frame()
+			for b.Loop() {
+				editorKeyAndFrame(hs)
+			}
+		})
 	}
 }
