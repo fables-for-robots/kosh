@@ -1,0 +1,30 @@
+Key:     alice@laptop   <c> Copy                <shift-n> Prev Match
+Cluster: v1.33.1        <f> Toggle FullScreen
+kosh:    v0.1.0         <w> Toggle Wrap
+                        </> Search
+                        <n> Next Match
+
+┌────────────────────────────────── Describe(pods/default/web-1) ──────────────────────────────────┐
+│Name:             web-1                                                                           │
+│Namespace:        default                                                                         │
+│Priority:         0                                                                               │
+│Node:             kind-control-plane/172.18.0.2                                                   │
+│Status:           Running                                                                         │
+│IP:               10.244.0.5                                                                      │
+│Containers:                                                                                       │
+│  web:                                                                                            │
+│    Image:          nginx:1.27                                                                    │
+│    State:          Running                                                                       │
+│Events:            <none>                                                                         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <describe>
+
