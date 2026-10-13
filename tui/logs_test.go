@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -435,5 +436,192 @@ func TestLogLinesAreCleaned(t *testing.T) {
 			t.Errorf("the copy does not hold %q: %q", want, copied)
 		}
 		hs.wantFrame(want)
+	}
+}
+
+// logLastOpts returns the reference and the options of the last call of
+// Logs.
+func logLastOpts(t *testing.T, sess *kubetest.Session) (kube.ObjectRef, kube.LogOptions) {
+	t.Helper()
+	calls := sess.Called("Logs")
+	if len(calls) == 0 {
+		t.Fatal("Logs was not called")
+	}
+	c := calls[len(calls)-1]
+	return c.Args[0].(kube.ObjectRef), c.Args[1].(kube.LogOptions)
+}
+
+// logHint reports whether v has a hint of key.
+func logHint(v *logView, key string) bool {
+	return slices.ContainsFunc(v.Hints(), func(h hint) bool { return h.Key == key })
+}
+
+func TestLogRanges(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, first := logOpenIn(t, hs, sess, logPod, kube.LogOptions{Container: "app"})
+	first.Send(logTexts(1, 3)...)
+	hs.await("three lines", func() bool { return logHas(v, "line 0003") })
+	for _, c := range []struct {
+		key   string
+		from  kube.LogFrom
+		since time.Duration
+		title string
+	}{
+		{"2", kube.LogSince, time.Minute, "1m"},
+		{"3", kube.LogSince, 5 * time.Minute, "5m"},
+		{"4", kube.LogSince, 15 * time.Minute, "15m"},
+		{"5", kube.LogSince, 30 * time.Minute, "30m"},
+		{"6", kube.LogSince, time.Hour, "1h"},
+		{"1", kube.LogHead, 0, "head"},
+		{"0", kube.LogTail, 0, "tail"},
+	} {
+		before := sess.LogOf(logPod)
+		calls := len(sess.Called("Logs"))
+		hs.press(c.key)
+		if !before.Closed() {
+			t.Errorf("%s: the stream before is open", c.key)
+		}
+		if len(sess.Called("Logs")) != calls+1 {
+			t.Fatalf("%s: Logs was called %d times", c.key, len(sess.Called("Logs"))-calls)
+		}
+		ref, opts := logLastOpts(t, sess)
+		if ref.String() != logPod.String() || opts.From != c.from || opts.Since != c.since || opts.Container != "app" {
+			t.Errorf("%s: Logs(%s, %+v)", c.key, ref, opts)
+		}
+		if len(v.lines) != 0 || len(logBody(hs)) != 0 {
+			t.Errorf("%s: the buffer was not cleared: %q", c.key, logBody(hs))
+		}
+		if !strings.HasSuffix(hs.title(), "] "+c.title) {
+			t.Errorf("%s: the title is %q", c.key, hs.title())
+		}
+		// The new stream is read.
+		s := sess.LogOf(logPod)
+		s.Send(logTexts(10, 1)...)
+		hs.await("a line of "+c.key, func() bool { return logHas(v, "line 0010") })
+		if c.key == "1" && (v.auto || logBody(hs)[0] != "line 0010") {
+			t.Errorf("1 leaves autoscroll %v and shows %q", v.auto, logBody(hs))
+		}
+	}
+	// Lines of a stream that was closed are not taken.
+	if got := logBody(hs); strings.Join(got, "\n") != "line 0010" {
+		t.Errorf("the body is %q", got)
+	}
+	// A stream that cannot be opened again: the view stays and says why.
+	sess.Errs["Logs"] = errors.New("logs refused \x1b[2J")
+	hs.press("3")
+	if _, ok := hs.root().top().(*logView); !ok {
+		t.Fatal("the view went")
+	}
+	if l := hs.drawnLine("logs refused"); !strings.Contains(l, sgr(styleError)) || strings.Contains(l, "\x1b[2J") {
+		t.Errorf("the error is drawn as %q", l)
+	}
+}
+
+func TestLogAllContainers(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	if !logHint(v, "a") {
+		t.Errorf("a pod's log has not got a: %v", v.Hints())
+	}
+	s.Send(logTexts(1, 1)...)
+	hs.await("a line", func() bool { return logHas(v, "line 0001") })
+	hs.press("a")
+	if !s.Closed() {
+		t.Error("a left the stream open")
+	}
+	if _, opts := logLastOpts(t, sess); !opts.AllContainers {
+		t.Errorf("a opened %+v", opts)
+	}
+	if len(v.lines) != 0 {
+		t.Error("a kept the lines")
+	}
+	hs.press("a")
+	if _, opts := logLastOpts(t, sess); opts.AllContainers {
+		t.Errorf("a again opened %+v", opts)
+	}
+
+	for _, c := range []struct {
+		ref  kube.ObjectRef
+		opts kube.LogOptions
+	}{
+		{logPod, kube.LogOptions{Container: "app"}},
+		{kubetest.Ref("deployments", "default", "web"), kube.LogOptions{}},
+	} {
+		v, _ := logOpenIn(t, hs, sess, c.ref, c.opts)
+		calls := len(sess.Called("Logs"))
+		hs.press("a")
+		if len(sess.Called("Logs")) != calls {
+			t.Errorf("a opened the log of %s %+v again", c.ref, c.opts)
+		}
+		if logHint(v, "a") {
+			t.Errorf("the log of %s %+v has a", c.ref, c.opts)
+		}
+	}
+}
+
+func TestLogFilter(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	below := &testView{name: "below"}
+	hs.send(pushViewMsg{below})
+	v, s := logOpenIn(t, hs, sess, logPod, kube.LogOptions{})
+	text := func(texts ...string) []kube.LogLine {
+		var out []kube.LogLine
+		for _, t := range texts {
+			out = append(out, kube.LogLine{Pod: "web-1", Container: "app", Text: t})
+		}
+		return out
+	}
+	s.Send(text("an error here", "all is well", "ERROR again")...)
+	hs.await("three lines", func() bool { return logHas(v, "ERROR again") })
+	hs.press("/")
+	hs.typeText("error")
+	hs.press("enter")
+	if body := logBody(hs); strings.Join(body, "\n") != "an error here\nERROR again" {
+		t.Errorf("/error shows %q", body)
+	}
+	if !strings.HasSuffix(hs.title(), " </error>") {
+		t.Errorf("the title is %q", hs.title())
+	}
+	if l := hs.drawnLine("an error here"); !strings.Contains(l, styleMatch.Render("error")) {
+		t.Errorf("the match is not styled: %q", l)
+	}
+	if l := hs.drawnLine("ERROR again"); !strings.Contains(l, styleMatch.Render("ERROR")) {
+		t.Errorf("the match is not styled: %q", l)
+	}
+	s.Send(text("fine again", "one more error")...)
+	hs.await("five lines", func() bool { return logHas(v, "one more error") })
+	hs.press("m")
+	if body := logBody(hs); len(body) != 4 || body[2] != "one more error" || !strings.HasPrefix(body[3], "──") {
+		t.Errorf("the lines that came, and a mark, show as %q", body)
+	}
+	// The copy is of what is shown.
+	hs.press("c")
+	if got, _ := logClipboard(below); !strings.HasPrefix(got, "an error here\nERROR again\none more error\n──") {
+		t.Errorf("the copy is %q", got)
+	}
+	// esc clears the filter, and shows the lines that came meanwhile.
+	hs.press("esc")
+	if body := logBody(hs); len(body) != 6 || body[3] != "fine again" {
+		t.Errorf("after esc the body is %q", body)
+	}
+	if strings.Contains(hs.title(), "</") {
+		t.Errorf("after esc the title is %q", hs.title())
+	}
+	// A text that is no regular expression is taken as it stands.
+	s.Send(text("a (x b")...)
+	hs.await("the line", func() bool { return logHas(v, "a (x b") })
+	hs.press("/")
+	hs.typeText("(x")
+	hs.press("enter")
+	// The mark stays: only the log's own lines are filtered.
+	if body := logBody(hs); len(body) != 2 || !strings.HasPrefix(body[0], "──") || body[1] != "a (x b" {
+		t.Errorf("/(x shows %q", body)
+	}
+	hs.press("esc", "esc")
+	if _, ok := hs.root().top().(*logView); ok {
+		t.Error("the second esc did not pop the view")
 	}
 }

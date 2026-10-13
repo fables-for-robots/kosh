@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +80,24 @@ func logColorOf(src string) int {
 // logTimeFormat is how a line's time is shown.
 const logTimeFormat = time.RFC3339
 
+// logRange is where a log starts, as a key of the view chooses it.
+type logRange struct {
+	from  kube.LogFrom
+	since time.Duration
+	name  string // in the title
+}
+
+// logRanges are the ranges of the keys 0 to 6.
+var logRanges = []logRange{
+	{kube.LogTail, 0, "tail"},
+	{kube.LogHead, 0, "head"},
+	{kube.LogSince, time.Minute, "1m"},
+	{kube.LogSince, 5 * time.Minute, "5m"},
+	{kube.LogSince, 15 * time.Minute, "15m"},
+	{kube.LogSince, 30 * time.Minute, "30m"},
+	{kube.LogSince, time.Hour, "1h"},
+}
+
 // logPrepare cleans a batch of lines of the log. It is the one place
 // where text of a log is cleaned: once, when it comes.
 func logPrepare(batch []kube.LogLine) []logLine {
@@ -137,6 +156,14 @@ type (
 		skipped int
 		at      time.Time // when the lines were taken
 	}
+	// logOpenedMsg is a stream opened again, or why it could not be.
+	logOpenedMsg struct {
+		id      int64
+		gen     int
+		stream  kube.LogStream
+		skipped int
+		err     string // cleaned
+	}
 )
 
 // logView is the log of a pod, of one of its containers, or of the
@@ -170,6 +197,10 @@ type logView struct {
 	multi bool
 
 	auto, wrap, times, full bool
+	// filter is the text of /, and re what it matches; nil shows every
+	// line.
+	filter string
+	re     *regexp.Regexp
 
 	top  int // the first line shown, as an index of shown, while auto is off
 	w, h int // of the last drawing
@@ -304,6 +335,16 @@ func (v *logView) Update(msg tea.Msg) (view, tea.Cmd) {
 			return v, nil
 		}
 		return v, v.read()
+	case logOpenedMsg:
+		if msg.id != v.id || msg.gen != v.gen || v.closed {
+			return v, nil
+		}
+		if msg.err != "" {
+			v.add([]logLine{{kind: logNote, text: msg.err, err: true}})
+			return v, nil
+		}
+		v.stream, v.skipped = msg.stream, msg.skipped
+		return v, v.read()
 	case tea.KeyPressMsg:
 		return v, v.key(msg)
 	}
@@ -315,7 +356,9 @@ func (v *logView) Update(msg tea.Msg) (view, tea.Cmd) {
 func (v *logView) add(lines []logLine) {
 	for _, l := range lines {
 		v.lines = append(v.lines, l)
-		v.shown = append(v.shown, len(v.lines)-1)
+		if v.passes(&l) {
+			v.shown = append(v.shown, len(v.lines)-1)
+		}
 		if l.kind == logText {
 			if v.first == "" {
 				v.first = l.src
@@ -338,6 +381,88 @@ func (v *logView) add(lines []logLine) {
 		v.shown[i] -= n
 	}
 	v.top = max(v.top-d, 0)
+}
+
+// passes reports whether l is shown under the filter. The lines the
+// view adds itself are always shown.
+func (v *logView) passes(l *logLine) bool {
+	return l.kind != logText || v.re == nil || v.re.MatchString(l.text)
+}
+
+// SetFilter shows only the lines whose text matches text: a regular
+// expression without regard to case, or the text as it stands when it
+// is none. The empty text shows every line.
+func (v *logView) SetFilter(text string) tea.Cmd {
+	v.filter, v.re = text, nil
+	if text != "" {
+		re, err := regexp.Compile("(?i)" + text)
+		if err != nil {
+			re = regexp.MustCompile("(?i)" + regexp.QuoteMeta(text))
+		}
+		v.re = re
+	}
+	v.shown = v.shown[:0]
+	for i := range v.lines {
+		if v.passes(&v.lines[i]) {
+			v.shown = append(v.shown, i)
+		}
+	}
+	v.top = max(min(v.top, v.endTop()), 0)
+	return nil
+}
+
+// canAll reports whether a toggles all containers: in the log of a pod
+// that names no container.
+func (v *logView) canAll() bool {
+	return v.ref.Resource.Is("", "pods") && v.opts.Container == ""
+}
+
+// reopen closes the stream, empties the buffer and opens the stream
+// again with the view's options, in a command. When it cannot be
+// opened, the view says why in a line.
+func (v *logView) reopen() tea.Cmd {
+	close(v.stop)
+	v.stop = make(chan struct{})
+	if v.box != nil {
+		v.box.close()
+	}
+	v.gen++
+	v.stream, v.skipped, v.last = nil, 0, time.Time{}
+	v.first, v.multi = "", false
+	v.clear()
+	box := v.newBox()
+	sess, ref, opts, id, gen := v.e.sess, v.ref, v.opts, v.id, v.gen
+	return func() tea.Msg {
+		s, err := sess.Logs(box.ctx, ref, opts)
+		if err != nil {
+			return logOpenedMsg{id: id, gen: gen, err: cleanLine(err.Error())}
+		}
+		if !box.set(s) {
+			s.Close()
+			return nil
+		}
+		return logOpenedMsg{id: id, gen: gen, stream: s, skipped: s.Skipped()}
+	}
+}
+
+// from makes the log start where range i says, and opens it again.
+func (v *logView) from(i int) tea.Cmd {
+	r := logRanges[i]
+	v.opts.From, v.opts.Since = r.from, r.since
+	if r.from == kube.LogHead {
+		v.auto = false
+	}
+	return v.reopen()
+}
+
+// rangeName is the name of where the log starts.
+func (v *logView) rangeName() string {
+	for _, r := range logRanges {
+		if r.from == v.opts.From && (r.from != kube.LogSince || r.since == v.opts.Since) {
+			return r.name
+		}
+	}
+	return v.opts.Since.String()
 }
 
 // key handles a key press.
@@ -373,7 +498,19 @@ func (v *logView) key(k tea.KeyPressMsg) tea.Cmd {
 		v.clear()
 	case "c":
 		return v.copy()
-	case "esc", "q":
+	case "0", "1", "2", "3", "4", "5", "6":
+		return v.from(int(k.String()[0] - '0'))
+	case "a":
+		if v.canAll() {
+			v.opts.AllContainers = !v.opts.AllContainers
+			return v.reopen()
+		}
+	case "esc":
+		if v.filter != "" {
+			return v.SetFilter("")
+		}
+		return popView()
+	case "q":
 		return popView()
 	}
 	return nil
@@ -456,7 +593,15 @@ func (v *logView) text(l *logLine, w int) (string, []logSpan) {
 		spans = append(spans, logSpan{b.Len(), b.Len() + len(ts), logStyleTime})
 		b.WriteString(ts + " ")
 	}
+	off := b.Len()
 	b.WriteString(l.text)
+	if v.re != nil {
+		for _, m := range v.re.FindAllStringIndex(l.text, -1) {
+			if m[0] < m[1] {
+				spans = append(spans, logSpan{off + m[0], off + m[1], styleMatch})
+			}
+		}
+	}
 	return b.String(), spans
 }
 
@@ -578,7 +723,10 @@ func (v *logView) Title() string {
 	} else {
 		b.WriteString(" [autoscroll:off]")
 	}
-	b.WriteString(" tail")
+	b.WriteString(" " + v.rangeName())
+	if v.filter != "" {
+		b.WriteString(" </" + v.filter + ">")
+	}
 	if v.skipped > 0 {
 		fmt.Fprintf(&b, " (%d containers left out)", v.skipped)
 	}
@@ -590,15 +738,20 @@ func (v *logView) Crumb() string { return "logs" }
 
 // Hints are the keys of the view.
 func (v *logView) Hints() []hint {
-	return []hint{
+	hs := []hint{
 		{"s", "Autoscroll"},
 		{"w", "Wrap"},
 		{"t", "Times"},
 		{"f", "Full Screen"},
-		{"m", "Mark"},
-		{"shift-c", "Clear"},
-		{"c", "Copy"},
 	}
+	for i, r := range logRanges {
+		hs = append(hs, hint{fmt.Sprint(i), capital(r.name)})
+	}
+	hs = append(hs, hint{"/", "Filter"}, hint{"m", "Mark"}, hint{"shift-c", "Clear"})
+	if v.canAll() {
+		hs = append(hs, hint{"a", "All Containers"})
+	}
+	return append(hs, hint{"c", "Copy"})
 }
 
 func (v *logView) Capturing() bool { return false }
