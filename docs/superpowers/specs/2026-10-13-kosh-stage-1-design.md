@@ -157,6 +157,11 @@ program listening for the process's signals.
   from its authentication and from the end of its last session. A client
   of `iroh-ssh` that exits often sends no close, and the connection
   would otherwise linger until QUIC's idle timeout.
+- **A key may have 16 connections open at once, and a connection 10
+  session channels.** More are refused. The handshake's limit bounds
+  peers that have not authenticated; these two bound what one key, a
+  read-only one included, can make kosh hold: every channel lets its
+  client send two megabytes that nothing reads.
 - **Twenty tries to authenticate**, not the library's six: `iroh-ssh`
   lets `ssh` offer every key of the user's agent before the one it was
   given.
