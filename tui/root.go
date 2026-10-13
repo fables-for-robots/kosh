@@ -99,7 +99,7 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		return r, r.updateTop(msg)
 	case commandMsg:
-		return r, r.runCommand(msg.text, true)
+		return r, r.runCommand(msg.text, true, msg.literal)
 	case resolvedMsg:
 		return r, r.resolved(msg)
 	case useNamespaceMsg:

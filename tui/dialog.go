@@ -77,9 +77,10 @@ func formCheckField(label string, on bool) *formField {
 	return &formField{kind: formIsCheck, label: label, on: on}
 }
 
-// formInput returns the text input of a field: no blinking cursor, and
-// no ctrl+v, which would read the clipboard of the machine kosh runs on
-// rather than the user's (a paste of the user's terminal still comes).
+// formInput returns the text input of a field: no blinking cursor, at
+// most inputMaxChars characters, and no ctrl+v, which would read the
+// clipboard of the machine kosh runs on rather than the user's (a paste
+// of the user's terminal still comes).
 func formInput(value string) textinput.Model {
 	in := textinput.New()
 	in.Prompt = ""
@@ -88,6 +89,7 @@ func formInput(value string) textinput.Model {
 	st.Focused.Text = stylePromptText
 	st.Blurred.Text = stylePromptText
 	in.SetStyles(st)
+	in.CharLimit = inputMaxChars
 	in.KeyMap.Paste.SetEnabled(false)
 	in.SetValue(value)
 	return in
@@ -245,7 +247,8 @@ func (d *formDialog) Update(msg tea.Msg) (dialog, tea.Cmd) {
 		return d, d.key(msg)
 	case tea.PasteMsg:
 		if f := d.focused(); f != nil {
-			return d, f.input(msg)
+			// Cleaned, on one line, and cut to what a field takes.
+			return d, f.input(tea.PasteMsg{Content: inputCut(cleanLine(msg.Content))})
 		}
 	}
 	return d, nil

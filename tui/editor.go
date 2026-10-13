@@ -42,7 +42,9 @@ type editorView struct {
 	firstOf  string
 	onOpen   func()
 	modified bool
-	saving   bool
+	// size is the length of the text in bytes.
+	size   int
+	saving bool
 	// why is the error of a refused update, cleaned, shown under the
 	// text until the next update is sent; whyWrap keeps its lines.
 	why     string
@@ -54,6 +56,14 @@ type editorSavedMsg struct {
 	id  int64
 	err error
 }
+
+// editorMaxText is the most bytes the editor's text grows to by what is
+// typed or pasted; input that would take it further is refused, with
+// the flash editorTextTooLong.
+const editorMaxText = 1 << 20
+
+// editorTextTooLong is the flash of input the editor refuses.
+const editorTextTooLong = "the text is too long to edit here"
 
 // The flashes of a YAML the editor will not open.
 const (
@@ -128,7 +138,7 @@ func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why strin
 	}
 	ta.MoveToBegin()
 	ta.Focus()
-	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: yaml}, ""
+	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: yaml, size: len(yaml)}, ""
 }
 
 // Init calls onOpen.
@@ -173,11 +183,28 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 	return v, nil
 }
 
-// input gives msg to the text area.
+// input gives msg to the text area, unless what it adds would take the
+// text past editorMaxText: then the text stays as it was, and the flash
+// says why.
 func (v *editorView) input(msg tea.Msg) tea.Cmd {
+	added := 0
+	switch m := msg.(type) {
+	case tea.PasteMsg:
+		added = len(m.Content)
+	case tea.KeyPressMsg:
+		added = len(m.Text)
+		if m.String() == "enter" {
+			added = max(added, 1)
+		}
+	}
+	if v.size+added > editorMaxText {
+		return func() tea.Msg { return flashMsg{text: editorTextTooLong, err: true} }
+	}
 	var cmd tea.Cmd
 	v.ta, cmd = v.ta.Update(msg)
-	v.modified = v.ta.Value() != v.was
+	text := v.ta.Value()
+	v.size = len(text)
+	v.modified = text != v.was
 	return cmd
 }
 
