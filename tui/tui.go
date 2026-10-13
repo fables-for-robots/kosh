@@ -21,5 +21,9 @@ type Options struct {
 
 // New returns the program of a session.
 func New(sess kube.Session, opts Options) tea.Model {
-	panic("not implemented")
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	return newRoot(env{sess: sess, now: now}, opts.Version)
 }
