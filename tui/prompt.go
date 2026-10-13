@@ -74,10 +74,12 @@ func (r *root) openCommand() tea.Cmd {
 		rr := sess.Resources()
 		var names []string
 		for _, res := range rr {
-			names = append(names, res.GVR.Resource)
+			names = append(names, cleanLine(res.GVR.Resource))
 		}
 		for _, res := range rr {
-			names = append(names, res.ShortNames...)
+			for _, s := range res.ShortNames {
+				names = append(names, cleanLine(s))
+			}
 		}
 		return suggestionsMsg{names}
 	}

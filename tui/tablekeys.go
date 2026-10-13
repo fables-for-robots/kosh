@@ -190,7 +190,7 @@ func (v *tableView) Hints() []hint {
 		hint{"/", "Filter"},
 		hint{"space", "Mark"},
 	)
-	if !v.plain {
+	if v.hasOwner() {
 		hs = append(hs, hint{"shift-j", "Owner"})
 	}
 	hs = append(hs, hint{"?", "Help"})

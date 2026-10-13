@@ -221,6 +221,12 @@ func TestEnterOnAContainer(t *testing.T) {
 	if hs.title() != "Containers(pods/default/web-1)[1]" {
 		t.Fatalf("the title is %q", hs.title())
 	}
+	// A container has no owner.
+	hs.notFrame("Owner")
+	hs.press("J")
+	if len(sess.Called("Owner")) != 0 {
+		t.Error("the owner of a container was asked for")
+	}
 	hs.press("enter")
 	want := kube.ObjectRef{Resource: kube.Containers, Namespace: "default", Name: "app"}
 	if len(runs) != 1 || runs[0].key != "l" || len(runs[0].refs) != 1 || runs[0].refs[0].String() != want.String() || runs[0].refs[0].Resource.GVR != kube.Containers.GVR || !sameQuery(runs[0].q, cq) {
@@ -343,8 +349,12 @@ func TestBindings(t *testing.T) {
 	hs.press("?")
 	hs.wantFrame("<z>", "Zap", "<shift-z>", "Zap Hard")
 	hs.press("esc")
-	if l := hs.line("<shift-z>"); strings.Index(l, "<shift-z>") > strings.Index(l, "<z>") && strings.Contains(l, "<z>") {
-		t.Errorf("the hints are not by Order: %q", l)
+	hints := hs.table().Hints()
+	at := func(key string) int {
+		return slices.IndexFunc(hints, func(h hint) bool { return h.Key == key })
+	}
+	if at("shift-z") < 0 || at("shift-z") > at("z") || at("?") > at("shift-z") {
+		t.Errorf("the hints are not the table's and then the bindings' by Order: %v", hints)
 	}
 	hs.press("down", "z")
 	ref := func(n string) kube.ObjectRef { return kubetest.Ref("pods", "default", n) }

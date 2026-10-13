@@ -52,7 +52,7 @@ func newRoot(e env, version string) *root {
 
 // Init resolves pods and opens their table in the namespace default.
 func (r *root) Init() tea.Cmd {
-	return r.resolve("pods", "pods", "", false, true)
+	return r.resolve("pods", "pods", "", false, true, true)
 }
 
 // Update routes msg: a key press to the one part that has the keys, a
@@ -63,7 +63,7 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		r.w, r.h = msg.Width, msg.Height
 		r.prompt.resize(r.w)
-		return r, nil
+		return r, r.broadcast(msg)
 	case tea.KeyPressMsg:
 		return r, r.key(msg)
 	case tea.KeyReleaseMsg:

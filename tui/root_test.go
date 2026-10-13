@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/keys"
@@ -27,20 +28,16 @@ func TestReadOnlyIsInTheHeader(t *testing.T) {
 }
 
 func TestTooSmall(t *testing.T) {
-	for _, size := range [][2]int{{79, 12}, {80, 11}} {
+	for _, size := range [][2]int{{79, 12}, {80, 11}, {40, 30}} {
 		hs := newHarness(t, newSession(), size[0], size[1])
-		want := fmt.Sprintf("kosh needs a terminal of at least 80 by 12 (this one is %dx%d)", size[0], size[1])
-		if got := hs.lines(); len(got) != 1 || strings.TrimRight(got[0], " ") != fit(want, size[0]) && strings.TrimRight(got[0], " ") != want {
+		// The line is cut to the window.
+		want := fit(fmt.Sprintf("kosh needs a terminal of at least 80 by 12 (this one is %dx%d)", size[0], size[1]), size[0])
+		if got := hs.lines(); len(got) != 1 || got[0] != ansi.Strip(want) {
 			t.Errorf("at %dx%d the frame is %q, want the one line %q", size[0], size[1], got, want)
 		}
-		if size[0] >= len(want) && !strings.Contains(hs.frame(), want) {
-			t.Errorf("at %dx%d the frame is %q", size[0], size[1], hs.frame())
-		}
 	}
-	// The line is cut to a narrow window: 79 is narrower than it.
-	hs := newHarness(t, newSession(), 79, 12)
-	if !strings.HasPrefix(hs.frame(), "kosh needs a terminal of at least 80 by 12") {
-		t.Errorf("at 79x12 the frame is %q", hs.frame())
+	if got := newHarness(t, newSession(), 80, 11).frame(); !strings.HasPrefix(got, "kosh needs a terminal of at least 80 by 12 (this one is 80x11)") {
+		t.Errorf("at 80x11 the frame is %q", got)
 	}
 	for _, size := range [][2]int{{0, 0}, {1, 1}, {5, 2}, {0, 30}, {100, 0}, {1, 100}} {
 		hs := newHarness(t, newSession(), size[0], size[1])
@@ -51,7 +48,7 @@ func TestTooSmall(t *testing.T) {
 	if f := newHarness(t, newSession(), 0, 0).frame(); f != "" {
 		t.Errorf("a window of no size shows %q", f)
 	}
-	hs = newHarness(t, newSession(), 80, 12)
+	hs := newHarness(t, newSession(), 80, 12)
 	if got := len(hs.lines()); got != 12 {
 		t.Errorf("at 80x12 the frame has %d lines", got)
 	}
@@ -152,6 +149,10 @@ func TestEveryMessageGoesToEveryView(t *testing.T) {
 	hs.send(pushViewMsg{b})
 	hs.send(openDialogMsg{d})
 	hs.send(testMsg{7})
+	hs.send(tea.WindowSizeMsg{Width: 120, Height: 40})
+	if a.got(tea.WindowSizeMsg{Width: 120, Height: 40}) != 1 || b.got(tea.WindowSizeMsg{Width: 120, Height: 40}) != 1 {
+		t.Error("the size did not reach every view")
+	}
 	if a.got(testMsg{7}) != 1 || b.got(testMsg{7}) != 1 || countMsgs(d.msgs, testMsg{7}) != 1 {
 		t.Errorf("the message reached a %d, b %d, the dialog %d times", a.got(testMsg{7}), b.got(testMsg{7}), countMsgs(d.msgs, testMsg{7}))
 	}

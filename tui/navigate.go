@@ -105,13 +105,14 @@ func (r *root) runCommand(text string, record bool) tea.Cmd {
 	if len(fields) > 1 {
 		ns = fields[1]
 	}
-	return r.resolve(strings.Join(fields, " "), fields[0], ns, len(fields) > 1, record)
+	return r.resolve(strings.Join(fields, " "), fields[0], ns, len(fields) > 1, record, false)
 }
 
-// resolve asks the session for the resource of name, in a command.
-func (r *root) resolve(text, name, ns string, hasNS, record bool) tea.Cmd {
+// resolve asks the session for the resource of name, in a command. start
+// is the resolving of the session's first table, whose failure the body
+// shows.
+func (r *root) resolve(text, name, ns string, hasNS, record, start bool) tea.Cmd {
 	sess := r.e.sess
-	start := len(r.stack) == 0
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
 		defer cancel()
@@ -124,7 +125,7 @@ func (r *root) resolve(text, name, ns string, hasNS, record bool) tea.Cmd {
 // named, or says why there is none.
 func (r *root) resolved(msg resolvedMsg) tea.Cmd {
 	if msg.err != nil {
-		if msg.start && len(r.stack) == 0 {
+		if msg.start {
 			r.startErr = msg.err
 		}
 		if errors.Is(msg.err, kube.ErrUnknownResource) {
@@ -245,7 +246,7 @@ func (v *tableView) openResource(name, ns string) tea.Cmd {
 // in the flash.
 func (v *tableView) owner() tea.Cmd {
 	r := v.cursorRow()
-	if r == nil || v.plain {
+	if r == nil || !v.hasOwner() {
 		return nil
 	}
 	e, ref := v.e, v.ref(r)
@@ -265,6 +266,12 @@ func (v *tableView) owner() tea.Cmd {
 		}
 		return pushViewMsg{newTableView(e, q, owner.Name)}
 	}
+}
+
+// hasOwner reports whether the rows are objects of the cluster, which
+// may have an owner: not the containers, the rules or the names.
+func (v *tableView) hasOwner() bool {
+	return !v.plain && v.q.Resource.GVR.Group != kube.Containers.GVR.Group
 }
 
 // useShortcut switches the table to the namespace of shortcut i, and

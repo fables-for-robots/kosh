@@ -121,6 +121,20 @@ func TestCommandSuggests(t *testing.T) {
 	}
 }
 
+func TestSuggestionsAreCleaned(t *testing.T) {
+	sess := newSession()
+	evil := kubetest.Resource("pods")
+	evil.GVR.Resource = "zz\x1b]0;owned\x07evil"
+	sess.ResourceList = append(sess.ResourceList, evil)
+	hs := newHarness(t, sess, 100, 30)
+	hs.press(":")
+	hs.typeText("zz")
+	if d := hs.drawn(); strings.Contains(d, "\x1b]0;") || strings.Contains(d, "\x07") {
+		t.Errorf("the suggestion was drawn raw: %q", hs.drawnLine(":zz"))
+	}
+	hs.wantFrame(":zzevil")
+}
+
 func TestCommandQuits(t *testing.T) {
 	for _, cmd := range []string{"q", "q!", "qa", "Q"} {
 		hs := newHarness(t, newSession(), 100, 30)
@@ -236,6 +250,13 @@ func TestTheStartCanFailAndTheCommandsWork(t *testing.T) {
 	sess.Errs["Resolve"] = errors.New("the API is down")
 	hs := newHarness(t, sess, 100, 30)
 	hs.wantFrame("the API is down")
+	// A command that fails says so in the flash; the body keeps the
+	// error of the start.
+	sess.Errs["Resolve"] = errors.New("still down")
+	hs.command("svc")
+	if l := hs.line("│the API is down"); l == "" {
+		t.Errorf("the body lost the error of the start:\n%s", hs.frame())
+	}
 	delete(sess.Errs, "Resolve")
 	hs.command("deploy")
 	if !strings.HasPrefix(hs.title(), "Deployments(default)[") {
