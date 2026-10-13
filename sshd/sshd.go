@@ -224,12 +224,20 @@ func (s *Server) serverConfig(ssh.Context) *gossh.ServerConfig {
 }
 
 // connectionFailed logs a connection that ended before it authenticated.
+// One that ended before the client sent a byte, and not by the deadline
+// of the handshake, is logged at debug level: it is what a TCP probe
+// does, the kubelet's twice every 10 seconds.
 func (s *Server) connectionFailed(nc net.Conn, err error) {
 	c := connOf(nc.RemoteAddr())
 	if c == nil || c.overKeyLimit.Load() {
 		return
 	}
-	s.logRefused(slog.LevelInfo, c.transport, c.remote, failureReason(err))
+	reason := failureReason(err)
+	level := slog.LevelInfo
+	if c.read.Load() == 0 && reason != reasonHandshakeDeadline {
+		level = slog.LevelDebug
+	}
+	s.logRefused(level, c.transport, c.remote, reason)
 }
 
 // logRefused logs a connection that is closed without having

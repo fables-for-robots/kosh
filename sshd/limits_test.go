@@ -3,6 +3,7 @@ package sshd
 import (
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -495,4 +496,49 @@ func TestConnectionsPerKeyLimit(t *testing.T) {
 		t.Cleanup(func() { _ = cl.Close() })
 		return true
 	})
+}
+
+// endLogged waits for the record of the end of c before it authenticated,
+// and fails the test when there is more than one or when it is not at
+// level.
+func (h *harness) endLogged(c net.Conn, level slog.Level, what string) logRecord {
+	h.t.Helper()
+	remote := c.LocalAddr().String()
+	of := func(r logRecord) bool {
+		return r.Msg == "connection closed before authenticating" && r.Attrs["remote"] == remote
+	}
+	rec := h.log.waitFor(h.t, "of "+what, of)
+	var n int
+	for _, r := range h.log.records() {
+		if of(r) {
+			n++
+		}
+	}
+	if n != 1 || rec.Level != level || rec.Attrs["transport"] != "tcp" {
+		h.t.Errorf("%s: %d records, the first %v; want one at %v", what, n, rec, level)
+	}
+	return rec
+}
+
+// The kubelet's TCP probe connects and closes, twice every 10 seconds.
+func TestProbeIsLoggedAtDebug(t *testing.T) {
+	h := newHarness(t, withConfig(func(c *Config) { c.HandshakeTimeout = 200 * time.Millisecond }))
+
+	probe := h.dialRaw()
+	_ = probe.Close()
+	h.endLogged(probe, slog.LevelDebug, "a probe")
+
+	said := h.dialRaw()
+	if _, err := io.WriteString(said, "SSH-2.0-x\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	readBanner(t, said)
+	_ = said.Close()
+	h.endLogged(said, slog.LevelInfo, "a client that said its version")
+
+	silent := h.dialRaw()
+	waitClosed(t, silent, "a peer that sends nothing")
+	if rec := h.endLogged(silent, slog.LevelInfo, "a peer cut by the deadline"); rec.Attrs["reason"] != reasonHandshakeDeadline {
+		t.Errorf("the peer cut by the deadline is logged as %v", rec)
+	}
 }

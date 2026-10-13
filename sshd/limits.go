@@ -63,6 +63,8 @@ type conn struct {
 	// overKeyLimit is set when the connection is closed for its key's
 	// limit, which is logged then and not again as a failed connection.
 	overKeyLimit atomic.Bool
+	// read counts the bytes read from the client.
+	read atomic.Int64
 
 	mu       sync.Mutex
 	authed   bool
@@ -218,6 +220,15 @@ func (c *conn) disarmIdleLocked() {
 		c.idle.Stop()
 		c.idle = nil
 	}
+}
+
+// Read reads from the client, and counts what it read.
+func (c *conn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.read.Add(int64(n))
+	}
+	return n, err
 }
 
 // Close closes the connection, and gives its place in the handshake back
