@@ -72,13 +72,14 @@ func (s *session) watchContainers(pod ObjectRef) (Watch, error) {
 }
 
 // Table returns the rows of the pod's containers; none when the pod is
-// gone.
+// gone. As the tables of the typed kinds: Err when the cache's first
+// list failed, and the last rows, Stale, when a later one did.
 func (w *containersWatch) Table(now time.Time) Table {
 	synced, stale, err := w.cache.status()
-	if err != nil {
+	if err != nil && !synced {
 		return Table{Err: err}
 	}
-	t := Table{Columns: render.ContainerColumns(), Stale: stale}
+	t := Table{Columns: render.ContainerColumns(), Stale: stale || err != nil}
 	if !synced {
 		t.Stale = true
 		return t

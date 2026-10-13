@@ -159,10 +159,12 @@ func TestRelationOwnerMissing(t *testing.T) {
 
 func TestPseudoResourcesGoToWatchPseudo(t *testing.T) {
 	e := newEnv(t, envConfig{})
-	of := ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "ns", Name: "p"}
+	// Neither table has rows of a deployment: watchPseudo says so, where
+	// watchTyped would find no renderer for Containers.
+	of := ObjectRef{Resource: e.resource(t, "apps", "deployments"), Namespace: "ns", Name: "p"}
 	for _, r := range []Resource{Containers, Rules} {
 		if _, err := e.session(t).Watch(Query{Resource: r, Of: &of}); !errors.Is(err, ErrNoRelation) {
-			t.Errorf("%s: %v, want the placeholder's ErrNoRelation", r.GVR.Resource, err)
+			t.Errorf("%s: %v, want watchPseudo's ErrNoRelation", r.GVR.Resource, err)
 		}
 	}
 }

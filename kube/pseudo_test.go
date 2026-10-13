@@ -10,9 +10,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/fables-for-robots/kosh/render"
@@ -84,6 +86,44 @@ func TestContainersFollowTheCacheStatus(t *testing.T) {
 		tab := w.Table(time.Now())
 		return tab.Err != nil && len(tab.Rows) == 0
 	})
+}
+
+func TestContainersKeepTheirRowsWhenARelistFails(t *testing.T) {
+	var fw atomic.Pointer[watch.FakeWatcher]
+	var lists atomic.Int32
+	e := newEnv(t, envConfig{before: func(e *env) {
+		e.dyn.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+			if fw.Load() != nil {
+				return true, nil, apierrors.NewTooManyRequests("the API is busy", 1)
+			}
+			w := watch.NewFakeWithChanSize(1, false)
+			fw.Store(w)
+			return true, w, nil
+		})
+		e.dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+			if lists.Add(1) > 1 {
+				return true, nil, errors.New("pods are forbidden")
+			}
+			return false, nil, nil
+		})
+	}}, readPodWith("default", "web", nil, "app"))
+	of := ObjectRef{Resource: e.resource(t, "", "pods"), Namespace: "default", Name: "web"}
+	w := watchOf(t, e.session(t), Query{Resource: Containers, Of: &of})
+	rowsWhen(t, w, "default/app")
+	eventually(t, "the watch", func() bool { return fw.Load() != nil })
+
+	// The watch ends with an error, the relist fails.
+	fw.Load().Error(&metav1.Status{Status: metav1.StatusFailure, Code: 500, Reason: metav1.StatusReasonInternalError, Message: "broken"})
+	cache := w.(*containersWatch).cache
+	eventually(t, "the failed relist in the cache", func() bool {
+		_, _, err := cache.status()
+		return err != nil
+	})
+	tab := w.Table(time.Now())
+	if tab.Err != nil || !tab.Stale || len(tab.Rows) != 1 || len(tab.Columns) == 0 {
+		t.Errorf("after a failed relist: err %v, stale %v, %d rows, %d columns; want the last rows, stale",
+			tab.Err, tab.Stale, len(tab.Rows), len(tab.Columns))
+	}
 }
 
 var (
