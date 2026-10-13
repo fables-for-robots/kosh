@@ -85,6 +85,10 @@ type session struct {
 	// finished is set when the session has exited: end does nothing
 	// after that.
 	finished bool
+
+	// in is what the client sends, for whoever has the terminal. It is
+	// read from the channel from the moment the program starts.
+	in *input
 }
 
 // run gives the session its program, and ends it when the program ends.
@@ -93,7 +97,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	defer cancel()
 	// The session ends when the client closes its channel, even if the
 	// connection stays: nothing would end the program then.
-	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx}
+	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput()}
 	win := s.windowOf(ss)
 	go func() {
 		select {
@@ -125,9 +129,13 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			tea.WithContext(ctx),
 			// SIGINT and SIGTERM are kosh's, not a session's.
 			tea.WithoutSignalHandler(),
+			// The channel is read by the session, and the program is
+			// given what is the program's: see input.
+			tea.WithInput(programInput{sess.in}),
 		)
 		p := tea.NewProgram(m, opts...)
 		if started = sess.start(p); started {
+			go sess.in.pump(ss)
 			s.mu.Lock()
 			s.running++
 			s.mu.Unlock()
@@ -136,6 +144,9 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 
 			go win.forward(ctx, p)
 			_, err := p.Run()
+			// Bubble Tea leaves its reader in Read: it ends here, and
+			// the pump with the channel.
+			sess.in.close()
 			// Taken now: a channel that closes after the program ended
 			// by itself is not why it ended.
 			byClient := sess.channelClosed.Load()
