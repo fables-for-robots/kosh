@@ -59,7 +59,7 @@ func (statefulSet) Row(obj runtime.Object, now time.Time) (Row, error) {
 		Text(sts.Name).
 		Text(strconv.Itoa(int(st.ReadyReplicas))+"/"+strconv.Itoa(int(desired))).
 		Text(workloadSelector(sts.Spec.Selector)).
-		Text(podOr(sts.Spec.ServiceName, NAValue)).
+		Text(workloadOr(sts.Spec.ServiceName, NAValue)).
 		Text(Join(names)).
 		Text(Join(images)).
 		Map(sts.Labels).

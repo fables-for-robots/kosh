@@ -103,9 +103,9 @@ func containerRow(pod *corev1.Pod, idx string, c *corev1.Container, cs *corev1.C
 func containerState(s corev1.ContainerState) string {
 	switch {
 	case s.Waiting != nil:
-		return podOr(s.Waiting.Reason, "Waiting")
+		return workloadOr(s.Waiting.Reason, "Waiting")
 	case s.Terminated != nil:
-		return podOr(s.Terminated.Reason, "Terminating")
+		return workloadOr(s.Terminated.Reason, "Terminating")
 	case s.Running != nil:
 		return "Running"
 	}

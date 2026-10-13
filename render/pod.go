@@ -59,7 +59,7 @@ func (pod) Row(obj runtime.Object, now time.Time) (Row, error) {
 		Text(po.Namespace).
 		Text(po.Name).
 		Text(strconv.Itoa(ready) + "/" + strconv.Itoa(total)).
-		Text(podOr(status, UnknownValue)).
+		Text(workloadOr(status, UnknownValue)).
 		Int(int64(restarts))
 	if lastRestart.IsZero() {
 		b.Num(NAValue, 0)
@@ -68,9 +68,9 @@ func (pod) Row(obj runtime.Object, now time.Time) (Row, error) {
 	}
 	b.Num(workloadCPU(req)+":"+workloadCPU(lim), float64(req.cpu)).
 		Num(workloadMem(req)+":"+workloadMem(lim), float64(req.mem)).
-		Text(podOr(st.PodIP, NAValue)).
-		Text(podOr(spec.NodeName, NAValue)).
-		Text(podOr(spec.ServiceAccountName, NAValue)).
+		Text(workloadOr(st.PodIP, NAValue)).
+		Text(workloadOr(spec.NodeName, NAValue)).
+		Text(workloadOr(spec.ServiceAccountName, NAValue)).
 		Text(Or(st.NominatedNodeName)).
 		Text(podGates(gatesReady, gates)).
 		Text(podQOS(st.QOSClass)).
@@ -180,8 +180,8 @@ func podQOS(class corev1.PodQOSClass) string {
 	return "BE"
 }
 
-// podOr returns s, or blank when s is empty.
-func podOr(s, blank string) string {
+// workloadOr returns s, or blank when s is empty.
+func workloadOr(s, blank string) string {
 	if s == "" {
 		return blank
 	}
