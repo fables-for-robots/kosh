@@ -1,7 +1,6 @@
 package kube
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,11 +20,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
-	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"sigs.k8s.io/yaml"
+	yaml3 "sigs.k8s.io/yaml/goyaml.v3"
 )
 
 // objectClient returns the dynamic client of ref's resource, in
@@ -85,7 +84,11 @@ func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 	defer func() {
 		logged := err
 		if ref.Resource.Is("", "secrets") {
-			// A webhook's denial may quote the Secret it was given.
+			// logAction already logs an error of the API as its reason
+			// and code. What this adds is the rest: an error that is no
+			// API status, which may still quote the Secret (a webhook's
+			// text passed on in some other form), is logged as "delete
+			// failed".
 			logged = loggableError(actDelete, err)
 		}
 		s.logAction(ctx, actDelete, ref, logged,
@@ -176,70 +179,53 @@ func parseObject(ref ObjectRef, text string) (*unstructured.Unstructured, error)
 	return obj, nil
 }
 
-// oneDocument returns the one YAML document of text. Documents that hold
-// nothing but comments and directives do not count; anything but those
-// after a document's end marker "..." is another document.
+// oneDocument returns the one document of the YAML stream text, which
+// must be a mapping, as the text of that document alone.
+//
+// A YAML decoder decides what the documents are: the first must be a
+// mapping, and after it there may be nothing but documents that are
+// empty (a "---" with nothing or only comments after it). The first
+// document's node is then written out again by itself, and that text is
+// what parseObject reads with sigs.k8s.io/yaml, as kubectl does: what is
+// checked and what is sent are one parse of one document, and nothing of
+// the text after it can be dropped unseen.
 func oneDocument(text string) ([]byte, error) {
-	more := &editRefusal{"the YAML holds more than one document", ""}
-	r := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(text)))
-	var docs [][]byte
+	dec := yaml3.NewDecoder(strings.NewReader(text))
+	var first yaml3.Node
+	if err := dec.Decode(&first); err == io.EOF {
+		return nil, &editRefusal{"the YAML is not an object", ""}
+	} else if err != nil {
+		return nil, &editRefusal{"the YAML does not parse", err.Error()}
+	}
+	if len(first.Content) != 1 || first.Content[0].Kind != yaml3.MappingNode {
+		return nil, &editRefusal{"the YAML is not an object", ""}
+	}
 	for {
-		doc, err := r.Read()
+		var next yaml3.Node
+		err := dec.Decode(&next)
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
-			return nil, &editRefusal{"the YAML does not parse", err.Error()}
-		}
-		content, after := documentContent(doc)
-		if after {
-			return nil, more
-		}
-		if content {
-			docs = append(docs, doc)
+		if err != nil || !emptyDocument(&next) {
+			return nil, &editRefusal{"the YAML holds more than one document", ""}
 		}
 	}
-	switch len(docs) {
-	case 0:
-		return nil, &editRefusal{"the YAML is not an object", ""}
-	case 1:
-		return docs[0], nil
+	doc, err := yaml3.Marshal(first.Content[0])
+	if err != nil {
+		return nil, &editRefusal{"the YAML does not parse", err.Error()}
 	}
-	return nil, more
+	return doc, nil
 }
 
-// documentContent reports whether a part of a YAML stream between two
-// "---" holds more than blank lines, comments, directives and markers,
-// and whether anything of that kind follows a document end marker "...".
-// Both markers and directives are only those at the start of a line,
-// where nothing else can be.
-func documentContent(doc []byte) (content, afterEnd bool) {
-	ended := false
-	for _, line := range strings.Split(string(doc), "\n") {
-		line = strings.TrimRight(line, "\r")
-		switch {
-		case isMarker(line, "..."):
-			ended = true
-			continue
-		case isMarker(line, "---"), strings.HasPrefix(line, "%"):
-			continue
-		}
-		if t := strings.TrimSpace(line); t == "" || strings.HasPrefix(t, "#") {
-			continue
-		}
-		if ended {
-			return content, true
-		}
-		content = true
+// emptyDocument reports whether a document holds nothing: what the
+// decoder makes of a "---" followed by nothing but comments. An explicit
+// null ("null", "~") is not empty.
+func emptyDocument(doc *yaml3.Node) bool {
+	if len(doc.Content) == 0 {
+		return true
 	}
-	return content, false
-}
-
-// isMarker reports whether line is the marker, alone or before white
-// space.
-func isMarker(line, marker string) bool {
-	rest, ok := strings.CutPrefix(line, marker)
-	return ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t')
+	n := doc.Content[0]
+	return len(doc.Content) == 1 && n.Kind == yaml3.ScalarNode && n.ShortTag() == "!!null" && n.Value == "" && n.Anchor == ""
 }
 
 // scaleClient is the scale subresource of one kind, in one namespace.

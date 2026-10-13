@@ -279,43 +279,6 @@ func TestUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("a separator before and after the document", func(t *testing.T) {
-		f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
-		ref := f.ref(t, "apps", "deployments", "default", "web")
-		text := actionYAML(t, f, ref, func(m map[string]any) {
-			_ = unstructured.SetNestedField(m, int64(6), "spec", "replicas")
-		})
-		if err := f.s.Update(context.Background(), ref, "# edited\n---\n"+text+"---\n# nothing more\n"); err != nil {
-			t.Fatal(err)
-		}
-		obj, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
-		if n, _, _ := unstructured.NestedInt64(obj.(*unstructured.Unstructured).Object, "spec", "replicas"); n != 6 {
-			t.Errorf("replicas %d, want 6", n)
-		}
-	})
-
-	for _, wrap := range []struct{ name, before, after string }{
-		{"a directive before the document", "%YAML 1.2\n---\n", ""},
-		{"a directive and a comment before it", "# edited\n%YAML 1.2\n%TAG ! tag:example.com,2000:\n---\n", ""},
-		{"an end marker and comments after it", "", "...\n# the end\n\n   \n"},
-		{"an end marker and a directive", "%YAML 1.2\n---\n", "... # done\n"},
-	} {
-		t.Run(wrap.name, func(t *testing.T) {
-			f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
-			ref := f.ref(t, "apps", "deployments", "default", "web")
-			text := actionYAML(t, f, ref, func(m map[string]any) {
-				_ = unstructured.SetNestedField(m, int64(8), "spec", "replicas")
-			})
-			if err := f.s.Update(context.Background(), ref, wrap.before+text+wrap.after); err != nil {
-				t.Fatal(err)
-			}
-			obj, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
-			if n, _, _ := unstructured.NestedInt64(obj.(*unstructured.Unstructured).Object, "spec", "replicas"); n != 8 {
-				t.Errorf("replicas %d, want 8", n)
-			}
-		})
-	}
-
 	t.Run("a cluster-scoped object", func(t *testing.T) {
 		n := actionNode("n1")
 		n.ResourceVersion = "4"
@@ -339,7 +302,6 @@ func TestUpdate(t *testing.T) {
 		want string
 	}{
 		{"not YAML", func(*testing.T, *actionFixture, ObjectRef) string { return "metadata: [unclosed\n  - {" }, "the YAML does not parse"},
-		{"not an object", func(*testing.T, *actionFixture, ObjectRef) string { return "- just\n- a list\n" }, "the YAML is not an object"},
 		{"another name", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { _ = unstructured.SetNestedField(m, "api", "metadata", "name") })
 		}, "the YAML names another object: "},
@@ -355,22 +317,6 @@ func TestUpdate(t *testing.T) {
 		{"another apiVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { m["apiVersion"] = "apps/v1beta2" })
 		}, "the YAML names another object: "},
-		{"two documents", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "---\napiVersion: v1\nkind: ConfigMap\nmetadata: {name: other, namespace: default}\n"
-		}, "the YAML holds more than one document"},
-		{"the same document twice", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			text := actionYAML(t, f, ref, nil)
-			return text + "---\n" + text
-		}, "the YAML holds more than one document"},
-		{"another document after its end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "...\nkind: B\n"
-		}, "the YAML holds more than one document"},
-		{"text that is no YAML after the end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "...\n[[[ not yaml\n"
-		}, "the YAML holds more than one document"},
-		{"a directive and a document after the end", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
-			return actionYAML(t, f, ref, nil) + "...\n%YAML 1.2\n---\nkind: B\n"
-		}, "the YAML holds more than one document"},
 		{"no resourceVersion", func(t *testing.T, f *actionFixture, ref ObjectRef) string {
 			return actionYAML(t, f, ref, func(m map[string]any) { unstructured.RemoveNestedField(m, "metadata", "resourceVersion") })
 		}, "the YAML has no resourceVersion: it must be the object as it was read"},
@@ -388,6 +334,76 @@ func TestUpdate(t *testing.T) {
 			}
 			if a := f.sent(); len(a) != 0 {
 				t.Errorf("sent %v", a)
+			}
+		})
+	}
+}
+
+func TestUpdateTakesOneDocument(t *testing.T) {
+	const (
+		parse  = "the YAML does not parse"
+		more   = "the YAML holds more than one document"
+		object = "the YAML is not an object"
+	)
+	tests := []struct {
+		name string
+		text func(obj string) string // obj: the object's YAML, edited
+		want string                  // the refusal; empty: accepted
+		// extra is the top-level field extra of the object sent.
+		extra string
+	}{
+		{"a single document", func(o string) string { return o }, "", ""},
+		{"a leading ---", func(o string) string { return "---\n" + o }, "", ""},
+		{"a comment and ---", func(o string) string { return "# edited\n---\n" + o }, "", ""},
+		{"a trailing --- and nothing after it", func(o string) string { return o + "---\n" }, "", ""},
+		{"a second document that is only a comment", func(o string) string { return "---\n" + o + "---\n# nothing more\n" }, "", ""},
+		{"an end marker and a comment", func(o string) string { return o + "...\n# the end\n" }, "", ""},
+		{"a %YAML 1.1 preamble", func(o string) string { return "%YAML 1.1\n---\n" + o }, "", ""},
+		{"--- in a block scalar", func(o string) string { return o + "extra: |\n  a\n  ---\n  b\n" }, "", "a\n---\nb\n"},
+		{"--- in a quoted string", func(o string) string { return o + "extra: \"a\n  ---\n  b\"\n" }, "", "a --- b"},
+
+		{"a second document after ---", func(o string) string { return o + "---\nkind: B\n" }, more, ""},
+		{"the same document twice", func(o string) string { return o + "---\n" + o }, more, ""},
+		{"a second document that is null", func(o string) string { return o + "---\nnull\n" }, more, ""},
+		{"... kind: B", func(o string) string { return o + "... kind: B\n" }, parse, ""},
+		{"... {kind: B}", func(o string) string { return o + "... {kind: B}\n" }, more, ""},
+		{"... and a line of %", func(o string) string { return o + "...\n%password: x\n" }, parse, ""},
+		{"... and more YAML", func(o string) string { return o + "...\nkind: B\n" }, more, ""},
+		{"... and text that is not YAML", func(o string) string { return o + "...\n[[[ not yaml\n" }, more, ""},
+		{"... and another document", func(o string) string { return o + "...\n%YAML 1.1\n---\nkind: B\n" }, more, ""},
+		{"a %YAML 1.2 preamble, which the decoder does not know", func(o string) string { return "%YAML 1.2\n---\n" + o }, parse, ""},
+		{"a list", func(string) string { return "- just\n- a list\n" }, object, ""},
+		{"a scalar", func(string) string { return "just a word\n" }, object, ""},
+		{"nothing", func(string) string { return "" }, object, ""},
+		{"only a comment", func(string) string { return "# nothing\n" }, object, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := actionEnv(t, fullGrant, nil, actionDeployment("default", "web", "app"))
+			ref := f.ref(t, "apps", "deployments", "default", "web")
+			obj := actionYAML(t, f, ref, func(m map[string]any) {
+				_ = unstructured.SetNestedField(m, int64(9), "spec", "replicas")
+			})
+			err := f.s.Update(context.Background(), ref, tt.text(obj))
+			if tt.want != "" {
+				if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+					t.Errorf("%v, want %q", err, tt.want)
+				}
+				if a := f.sent(); len(a) != 0 {
+					t.Errorf("sent %v", a)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := f.dyn.Tracker().Get(ref.Resource.GVR, "default", "web")
+			u := got.(*unstructured.Unstructured).Object
+			if n, _, _ := unstructured.NestedInt64(u, "spec", "replicas"); n != 9 {
+				t.Errorf("replicas %d, want 9", n)
+			}
+			if extra, _, _ := unstructured.NestedString(u, "extra"); extra != tt.extra {
+				t.Errorf("extra %q, want %q", extra, tt.extra)
 			}
 		})
 	}

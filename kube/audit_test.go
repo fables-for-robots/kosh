@@ -467,6 +467,12 @@ func auditWebhookStatus(code int32, reason string, causes ...metav1.StatusCause)
 	}}
 }
 
+// auditStatus is an apierrors.APIStatus that is not a StatusError.
+type auditStatus struct{ status metav1.Status }
+
+func (a auditStatus) Status() metav1.Status { return a.status }
+func (a auditStatus) Error() string         { return a.status.Message }
+
 func TestLoggableError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -490,6 +496,12 @@ func TestLoggableError(t *testing.T) {
 		{"a code out of range", auditWebhookStatus(7, "Forbidden"), "the API answered Forbidden"},
 		{"another code out of range", auditWebhookStatus(600, "Forbidden"), "the API answered Forbidden"},
 		{"no reason", auditWebhookStatus(500, ""), "the API answered unknown (500)"},
+		{"a reason in another case", auditWebhookStatus(422, "invalid"), "the API answered unknown (422)"},
+		{"a reason with space around it", auditWebhookStatus(422, " Invalid "), "the API answered unknown (422)"},
+		{"another APIStatus than StatusError", auditStatus{metav1.Status{Code: 409, Reason: metav1.StatusReasonConflict, Message: auditMarker}}, "the API answered Conflict (409)"},
+		{"code 0", auditWebhookStatus(0, "Forbidden"), "the API answered Forbidden"},
+		{"a negative code", auditWebhookStatus(-403, "Forbidden"), "the API answered Forbidden"},
+		{"code 99999", auditWebhookStatus(99999, "Forbidden"), "the API answered Forbidden"},
 		{"an API error inside another", fmt.Errorf("cordon error: %w", apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, auditMarker)), "the API answered NotFound (404)"},
 	}
 	for _, tt := range tests {
