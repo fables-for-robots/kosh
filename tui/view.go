@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"sort"
 	"time"
 
@@ -118,6 +119,9 @@ func refresh() tea.Cmd            { return func() tea.Msg { return refreshMsg{} 
 type env struct {
 	sess kube.Session
 	now  func() time.Time
+	// handover gives the session's terminal to a shell (Options.Handover);
+	// nil when the session has none to give.
+	handover func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
 }
 
 // apiTimeout bounds every call a view makes to the session. No call to

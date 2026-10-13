@@ -66,11 +66,12 @@ section (§5, §11, §13), it is a section of that document.
    $PATH`), the API's refusal (`pods "web" is forbidden: User … cannot
    create resource "pods/exec"`), or that the container is not running.
    That is the moment the Command field is for.
-6. **When kosh or the key goes.** A shell ends when its session does
-   (§5 below): the key leaves the list, the client goes away, kosh
-   stops. The user sees what a session sees then (`kosh: this key is no
-   longer accepted`, `kosh is shutting down`), on a terminal that is
-   back in its normal state.
+6. **When kosh or the key goes.** A shell's connection ends when its
+   session does (§5 below): the key leaves the list, the client goes
+   away, kosh stops. The user sees what a session sees then (`kosh:
+   this key is no longer accepted`, `kosh is shutting down`), on a
+   terminal that is back in its normal state. What was running in the
+   container at that moment is not ended by this: see §7.
 
 ## 2. The command
 
@@ -116,20 +117,18 @@ says `pod default/web has no running container`.
 
 ```go
 // Exec runs a command in a container of a pod with a terminal, as
-// kubectl exec -it does, and returns when the command has ended. Its
-// input and output are the caller's; the sizes of the terminal are read
-// from Sizes until it is closed or the command ends.
+// kubectl exec -it does, and returns when the command has ended, or
+// when ctx or the session has.
 Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error)
 
 type ExecOptions struct {
-	Container string        // "" is the pod's default container
-	Command   []string      // the command and its arguments; not empty
-	Stdin     io.Reader     // the terminal's input
-	Stdout    io.Writer     // the terminal's output; with a terminal there is no separate stderr
-	Sizes     <-chan TermSize // the terminal's size: the first one before anything is drawn, then each change
+	Container string                     // may be empty for a pod with one container
+	Command   []string                   // the command and its arguments; not empty
+	Stdin     io.Reader                  // the terminal's input
+	Stdout    io.Writer                  // the terminal's output; with a terminal there is no separate stderr
+	Size      func() (width, height int) // the terminal's size now
+	Resized   <-chan struct{}            // has a value when the size has changed
 }
-
-type TermSize struct{ Width, Height int }
 
 type ExecResult struct {
 	Started bool // the command was started in the container
@@ -138,20 +137,29 @@ type ExecResult struct {
 ```
 
 - It is an action: `begin` refuses a read-only grant and a session that
-  has ended, and it is logged (§6). It runs with a context that ends
+  has ended, and it is logged (§7). It runs with a context that ends
   with the caller's and with the session's, as every action does: when
-  either ends, the stream is closed and the API ends the command.
+  either ends, the stream is closed at once.
 - The stream is the API's exec subresource of the pod, with a terminal,
-  over WebSocket with the fallback to SPDY that kubectl uses.
+  over WebSocket. The fallback to SPDY that kubectl has is not used: it
+  turns the API's typed refusals into plain text, and kosh talks to the
+  API server directly, with no proxy between that cannot do WebSocket.
 - **Errors a caller tells apart.** `ErrReadOnly`; the API's refusal
-  (forbidden, not found), as it is; and a new `ErrExecNotStarted`,
-  wrapped around the runtime's words, when the stream was made and the
-  command could not be started (no such program, container not
-  running). A command that started and ended with a status that is not
+  (forbidden, not found, bad request), as the API's own error, which
+  the stream's upgrade error carries as its cause; the context's error
+  when the session or the caller ended it; and a new
+  `ErrExecNotStarted`, wrapped around the runtime's words, when the
+  command could not be started: the image has no such program, or the
+  container is not running. The runtime says these as plain text
+  (`… exec: "sh": executable file not found in $PATH`, `container not
+  found ("web")`), which differs between runtimes, so `Exec` does not
+  go by the words: an error of the stream that is none of the above,
+  with not one byte of output received, is a command that did not
+  start. A command that started and ended with a status that is not
   zero is not an error: it is `ExecResult{Started: true, Status: n}`.
 - The reference is checked as every reference is (`checkRef`); the
-  container's name must be a DNS label; no word of the command is
-  checked beyond there being at least one.
+  container's name must be a DNS label when it is given; no word of the
+  command is checked beyond there being at least one.
 
 `kube/kubetest` gets the same method on its fake, with what it was
 given recorded and an answer the test sets.
@@ -178,21 +186,40 @@ has to let go of both, completely, and get them back, completely:
 this:
 
 ```go
-// Terminal hands the session's terminal to run, which has it until it
-// returns: its input, its output as raw bytes, and its sizes. The
-// command it returns is run by the program like any other; the message
-// of the callback arrives when the terminal is the program's again.
-Terminal func(run func(t RawTerminal) error, done func(error) tea.Msg) tea.Cmd
+// Exec returns a command for the session's program that gives the
+// session's terminal to run until run returns, and then gives the
+// program done's message with what run returned.
+Exec func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
 
-type RawTerminal struct {
-	In    io.Reader
-	Out   io.Writer
-	Sizes <-chan Size // the size now, then each change; closed at the return
+type Terminal struct {
+	In      io.Reader                  // the client's bytes from the hand-over on; io.EOF when the turn ends
+	Out     io.Writer                  // the client's terminal, byte for byte
+	Size    func() (width, height int) // the window now
+	Resized <-chan struct{}            // has a value when Size has changed
 }
 ```
 
-How it is done inside `sshd` is settled by the probe (§10) and written
-here when it is.
+run's context is done when the session ends. A second command while
+one has the terminal is refused (`ErrTerminalBusy`).
+
+**How, as the probe settled it** (`task-00-probe.md` beside the plan).
+The UI library's own hand-over (`tea.Exec`) does the terminal's modes
+and screens rightly, and is used for that; over an SSH channel it loses
+input at every hand-over, because it cannot stop a read of something
+that is not a file. So `sshd` reads the channel itself, in one goroutine
+per session, and gives the bytes to whoever has the terminal: the UI
+through a reader that ends when a command gets the terminal, the
+command through one that ends when its turn does. Before the UI's
+reader ends it is given a mark, a terminal report that no terminal
+sends, and the hand-over waits until the UI has taken it: every key
+typed before the hand-over has then been delivered, in order. The
+command's output goes to the SSH channel itself, past the emulated
+terminal's writer, which turns every line feed into carriage return and
+line feed and would break any full-screen program. The window's sizes
+reach the command from the session's window directly, since the UI's
+program takes no message while a command runs. Measured: 1,200
+hand-overs with typing across both seams, no byte lost or out of order,
+about a third of a millisecond each.
 
 ## 6. `tui`
 
@@ -222,7 +249,7 @@ here when it is.
   key has no binding, and `Exec` refuses it whatever the UI does.
 - **Into what.** Whatever the ServiceAccount's role allows: with the
   chart's default, `cluster-admin`, every container of every pod. A
-  narrower role needs `create` and `get` on `pods/exec`; without them
+  narrower role needs `get` and `create` on `pods/exec`; without them
   the API refuses and the dialog says so. kosh adds no rule of its own
   about which pods.
 - **The log** has two lines for every shell, with the key's name and
@@ -237,9 +264,19 @@ here when it is.
   request under kosh's ServiceAccount.
 - **The command's text** is the user's; it is cleaned before it is
   drawn or logged, and cut to 1,024 characters as every input is.
-- **A shell does not outlive its session.** The stream is tied to the
-  session's context; a key that leaves the list loses its shell with
-  its session, within the time §6 of the stage 1 design gives.
+- **A shell's connection does not outlive its session.** The stream is
+  tied to the session's context; a key that leaves the list loses its
+  shell with its session, within the time §6 of the stage 1 design
+  gives, and nobody can type into that shell again.
+- **What was running in the container can outlive it.** When the
+  stream is cut rather than the shell ended (`exit`, ctrl-d), the
+  container's runtime leaves the shell and what it started running,
+  without a terminal, until they end by themselves or the container
+  does. That is the API's exec, the same with `kubectl exec` when its
+  client goes away, and kosh has no call to end them: the API offers
+  none. kosh says so in its log: the end line of such a shell carries
+  `ended="the session ended"`, with the pod and the container, so that
+  whoever revokes a key knows where to look.
 - **What it holds.** One stream and a few goroutines per shell, one
   shell per session; nothing is buffered beyond the stream's own
   windows.
@@ -280,20 +317,29 @@ stay.
   again with the reason; a pod without a shell (kosh's own image):
   the default fails with the reason, and nothing hangs; the read-only
   key has no `<s> Shell` and `s` does nothing; a key removed while its
-  shell is open: the shell ends and the remote process is gone; the two
-  log lines.
+  shell is open: the user reads that the key is no longer accepted, the
+  session ends, and the log's end line says the session ended the
+  shell; the two log lines of an ordinary shell.
 
 ## 10. Settled first
 
-Whether the UI library's own hand-over (`tea.Exec`) loses or misroutes
-input over an SSH channel that is not a terminal device, and what
-`sshd` does about it if so; how the shell's output gets past the
-emulated terminal's line-feed translation; how the sizes reach the
-shell while the UI is not running; and how the exec stream of this
-client-go behaves at its edges (a command that is not there, a status,
-a cancelled context). A probe answers these against the real libraries
-and a real cluster before the plan is written; its report is beside the
-plan.
+A probe answered these against the real libraries and a real cluster
+before the plan was written; its report is `task-00-probe.md` beside
+the plan.
+
+- The UI library's hand-over loses input over an SSH channel, always;
+  `sshd` reading the channel itself, with a mark that drains the UI's
+  reader, loses nothing (§5).
+- The emulated terminal's writer breaks a full-screen program's output;
+  the SSH channel itself does not.
+- The exec stream over WebSocket gives typed errors for the API's
+  refusals and an exit status for a command that ended; "no such
+  program" and "container not running" are plain text.
+- On Kubernetes 1.35 the WebSocket exec needs `get` and `create` on
+  `pods/exec`.
+- A stream that is cut leaves the remote shell running (§7).
+- `go.mod` gains `k8s.io/streaming`, and `gorilla/websocket` and
+  `moby/spdystream` as indirect requirements.
 
 ## 11. Not in this change
 

@@ -116,7 +116,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	started := false
 	if sess.ending() == "" {
 		m = makeModel(func() tea.Model {
-			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote})
+			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote, Exec: execNotBuilt})
 		}, &sess.stopped, panicked)
 	}
 	if m != nil {

@@ -256,7 +256,16 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		Version:    Version,
 		Log:        log,
 		Model: func(s sshd.Session) tea.Model {
-			return tui.New(cluster.Session(s.Context, s.Grant), tui.Options{Version: Version})
+			return tui.New(cluster.Session(s.Context, s.Grant), tui.Options{
+				Version: Version,
+				// The session's terminal, for a shell in a pod. tui does
+				// not know sshd: its Terminal is sshd's, field for field.
+				Handover: func(run func(context.Context, tui.Terminal) error, done func(error) tea.Msg) tea.Cmd {
+					return s.Exec(func(ctx context.Context, t sshd.Terminal) error {
+						return run(ctx, tui.Terminal(t))
+					}, done)
+				},
+			})
 		},
 	})
 	if err != nil {

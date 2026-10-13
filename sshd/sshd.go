@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -49,7 +50,48 @@ type Session struct {
 	// Remote is the client's address: an IP address and port, or an
 	// endpoint ID.
 	Remote string
+
+	// Exec returns a command for the session's program that gives the
+	// session's terminal to run: the program leaves its screen, run is
+	// called with the terminal, and when run has returned the program
+	// has the terminal again, draws its screen, and is given done's
+	// message with what run returned. The program takes no message
+	// while run has not returned.
+	//
+	// run must return when its context is done, which it is when the
+	// session ends: the client gone, the channel closed, the key removed
+	// or changed, kosh shutting down. done is told ErrTerminalBusy, and
+	// run is not called, when a command has the terminal already; it is
+	// told ErrSessionEnded when the session ended before run began.
+	Exec func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
 }
+
+// Terminal is a session's terminal for the time a command has it.
+type Terminal struct {
+	// In is what the client sends, from the hand-over on, the first
+	// byte included. It ends with io.EOF when the command's turn ends:
+	// nothing of what the client sends after that is lost to a reader
+	// that is still in Read.
+	In io.Reader
+	// Out is the client's terminal, byte for byte: the translation of
+	// line feeds that the program's own output gets is not applied. A
+	// write after the turn fails with io.ErrClosedPipe.
+	Out io.Writer
+	// Size returns the window's size now, in cells.
+	Size func() (width, height int)
+	// Resized has a value when the size has changed since Size was last
+	// asked.
+	Resized <-chan struct{}
+}
+
+var (
+	// ErrTerminalBusy is what Session.Exec's done is told when a command
+	// has the terminal already.
+	ErrTerminalBusy = errors.New("sshd: a command has the terminal")
+	// ErrSessionEnded is what Session.Exec's done is told when the
+	// session ended before the command began.
+	ErrSessionEnded = errors.New("sshd: the session has ended")
+)
 
 // Config configures a Server.
 type Config struct {

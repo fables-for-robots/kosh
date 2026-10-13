@@ -16,6 +16,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -41,6 +42,11 @@ var (
 	// ErrNoRelation is what Watch returns for a Query whose Of names an
 	// object that the resource has no rows for.
 	ErrNoRelation = errors.New("nothing of that kind belongs to such an object")
+	// ErrExecNotStarted is what Exec returns, wrapped around the
+	// reason as the container's runtime or the API worded it, when the
+	// command could not be started in the container: the image has no
+	// such program, or the container is not running.
+	ErrExecNotStarted = errors.New("the command could not be started")
 )
 
 // Resource is one resource type of the cluster.
@@ -254,6 +260,39 @@ type DeleteOptions struct {
 	Force bool
 }
 
+// ExecOptions say what Exec runs, where, and on which terminal.
+type ExecOptions struct {
+	// Container is the container's name. It may be empty for a pod with
+	// one container.
+	Container string
+	// Command is the command and its arguments, as the container's
+	// runtime gets them. It has at least one word.
+	Command []string
+	// Stdin is the terminal's input. Exec reads it until the command
+	// ends, and may read once more after that: a reader that must not
+	// lose a byte ends with its turn.
+	Stdin io.Reader
+	// Stdout is the terminal's output. With a terminal the command's
+	// standard error is part of it.
+	Stdout io.Writer
+	// Size returns the terminal's size now, in cells. It is asked at the
+	// start and each time Resized has a value.
+	Size func() (width, height int)
+	// Resized has a value when the size has changed since Size was last
+	// asked. Nil means the size never changes.
+	Resized <-chan struct{}
+}
+
+// ExecResult is how a command that Exec ran has ended.
+type ExecResult struct {
+	// Started says that the command was started in the container.
+	Started bool
+	// Status is its exit status: 0 when it ended well, and what the
+	// runtime reports otherwise (130 after ctrl-c and exit, 137 when
+	// the container was killed under it).
+	Status int
+}
+
 // DrainOptions are the choices of the drain dialog, as kubectl drain
 // has them.
 type DrainOptions struct {
@@ -365,6 +404,18 @@ type Actions interface {
 	Cordon(ctx context.Context, node ObjectRef, on bool) error
 	// Drain cordons a node and evicts its pods, as kubectl drain does.
 	Drain(ctx context.Context, node ObjectRef, opts DrainOptions) error
+	// Exec runs a command in a container of a pod with a terminal, as
+	// kubectl exec -it does, and returns when the command has ended, or
+	// when ctx or the session has: it then closes the stream, and what
+	// was running in the container is the container's to end.
+	//
+	// A command that started and ended is no error, whatever its
+	// status: the result has it. The error is ErrExecNotStarted,
+	// wrapped around the reason, when the command could not be started;
+	// the API's own error when it refused (not found, forbidden: the
+	// ServiceAccount needs get and create on pods/exec); and the
+	// context's when ctx or the session ended first.
+	Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error)
 }
 
 // Session is one SSH session's handle on the cluster.
