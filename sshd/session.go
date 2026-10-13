@@ -202,7 +202,8 @@ func (sess *session) end(msg string) bool {
 	sess.stopped.Store(true)
 	sess.timer = time.AfterFunc(sess.srv.endTimeout, func() {
 		sess.srv.log.Warn("session did not end in time: its connection is closed",
-			"transport", sess.conn.transport, "remote", sess.conn.remote, "key", sess.grant.Name, "reason", msg)
+			"transport", sess.conn.transport, "remote", sess.conn.remote,
+			"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "reason", msg)
 		_ = sess.conn.Close()
 	})
 	if p := sess.program; p != nil {
@@ -268,8 +269,9 @@ func (s *Server) register(sess *session) {
 
 // keysChanged is called when the key list has changed. A session whose
 // key is gone is ended with MsgKeyRemoved, and one whose key went from
-// full to read-only or back with MsgGrantChanged. It does not wait for
-// any session: it is called in the goroutine of the list's Replace.
+// full to read-only or back with MsgGrantChanged; then a connection whose
+// key is gone is closed once it has no session. It does not wait for any
+// session: it is called in the goroutine of the list's Replace.
 func (s *Server) keysChanged() {
 	type ending struct {
 		sess *session
@@ -300,6 +302,24 @@ func (s *Server) keysChanged() {
 	}
 	if removed+changed > 0 {
 		s.log.Info("key list changed: sessions are closed", "key_removed", removed, "grant_changed", changed)
+	}
+
+	// The connections of a key that left the list are closed, each when
+	// it has no session; a key whose grant changed keeps its own. c.key
+	// is read under s.mu after countKey set keyFingerprint under it.
+	var gone []*conn
+	s.mu.Lock()
+	for c := range s.conns {
+		if c.keyFingerprint == "" {
+			continue
+		}
+		if _, ok := s.cfg.Keys.Lookup(c.key); !ok {
+			gone = append(gone, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range gone {
+		c.keyRemoved()
 	}
 }
 

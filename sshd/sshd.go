@@ -192,8 +192,9 @@ func New(cfg Config) (*Server, error) {
 }
 
 // sessionChannel is the handler of session channels: the library's,
-// for at most maxSessionChannels of a connection at once. A channel
-// beyond them is rejected before it is accepted. The library's handler
+// for at most maxSessionChannels of a connection at once, given only the
+// requests filterRequests passes on. A channel beyond them is rejected
+// before it is accepted. The library's handler
 // returns when the channel's request loop ends, which is the life of
 // what the channel holds.
 func (s *Server) sessionChannel(srv *ssh.Server, sc *gossh.ServerConn, nc gossh.NewChannel, ctx ssh.Context) {
@@ -203,7 +204,7 @@ func (s *Server) sessionChannel(srv *ssh.Server, sc *gossh.ServerConn, nc gossh.
 		return
 	}
 	defer c.closeChannel()
-	ssh.DefaultSessionHandler(srv, sc, nc, ctx)
+	ssh.DefaultSessionHandler(srv, sc, filteredChannel{nc}, ctx)
 }
 
 // keyAccepted is the public key handler: a key is accepted when the key
@@ -241,10 +242,10 @@ func (s *Server) connectionFailed(nc net.Conn, err error) {
 }
 
 // logRefused logs a connection that is closed without having
-// authenticated.
+// authenticated, its reason cut by cutReason.
 func (s *Server) logRefused(level slog.Level, transport, remote, reason string) {
 	s.log.Log(context.Background(), level, "connection closed before authenticating",
-		"transport", transport, "remote", remote, "reason", reason)
+		"transport", transport, "remote", remote, "reason", cutReason(reason))
 }
 
 // Serve accepts connections from l until l is closed or Shutdown is
