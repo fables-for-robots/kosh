@@ -1,8 +1,8 @@
-Key:     alice@laptop   <0> all       <shift-n> Sort Name     </> Filter        <ctrl-d> Delete
-Cluster: v1.33.1        <1> default   <shift-a> Sort Age      <space> Mark      <e> Edit
-kosh:    v0.1.0                       <shift-o> Sort Column   <shift-j> Owner   <s> Scale
-                                      <ctrl-w> Wide           <?> Help          <r> Restart
-                                      <ctrl-z> Faults         <l> Logs          <i> Set Image
+Key:     alice@laptop   <0> all       <shift-n> Sort Name     </> Filter        <y> YAML
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      <space> Mark      <l> Logs
+kosh:    v0.1.0                       <shift-o> Sort Column   <shift-j> Owner   <ctrl-d> Delete
+                                      <ctrl-w> Wide           <?> Help          <e> Edit
+                                      <ctrl-z> Faults         <d> Describe      <s> Scale
 
 ┌──────────────────────────────────── Deployments(default)[1] ─────────────────────────────────────┐
 │NAME↑  AGE                                                                                        │
