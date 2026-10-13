@@ -1,0 +1,17 @@
+{{- if .Values.state.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "kosh.fullname" . }}
+  labels:
+    {{- include "kosh.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.state.persistence.size }}
+  {{- with .Values.state.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}

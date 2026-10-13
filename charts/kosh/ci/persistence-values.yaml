@@ -1,0 +1,4 @@
+state:
+  persistence:
+    enabled: true
+    storageClass: fast
