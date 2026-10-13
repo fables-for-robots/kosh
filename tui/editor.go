@@ -254,4 +254,13 @@ func (v *editorView) Hints() []hint {
 // takes first.
 func (v *editorView) Capturing() bool  { return true }
 func (v *editorView) Fullscreen() bool { return false }
-func (v *editorView) Close()           {}
+
+// Close gives back the hold on the session's keys of actions when the
+// editor was never opened, as when the stack had no room for it. Init
+// gave it back otherwise, and it is given back once.
+func (v *editorView) Close() {
+	if v.onOpen != nil {
+		v.onOpen()
+		v.onOpen = nil
+	}
+}

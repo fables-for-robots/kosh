@@ -85,6 +85,30 @@ func (v *tableView) bury() tea.Cmd {
 	return nil
 }
 
+// bury makes a text view rest while it is buried: the wait of its turn
+// of r ends, and the readings and ticks of that turn no longer re-arm it.
+// A reading under way is taken when it comes.
+func (v *textView) bury() {
+	if v.closed || v.buried {
+		return
+	}
+	v.buried = true
+	if v.autoStop != nil {
+		v.autoGen++
+		close(v.autoStop)
+		v.autoStop = make(chan struct{})
+	}
+}
+
+// surface tells a text view that it is the top again, and reports
+// whether the reading it does now is one of its turn of r, which re-arms
+// it: when r was on while it was buried.
+func (v *textView) surface() bool {
+	was := v.buried
+	v.buried = false
+	return was && v.auto
+}
+
 // pop takes the top view off the stack and closes it, and asks the view
 // below to read again, which also tells it that it is the top again. The
 // last view stays, unless it is the help or the names, which leave the
