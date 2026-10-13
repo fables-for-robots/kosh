@@ -1,0 +1,54 @@
+name: Test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  # The Go module, with the Go that go.mod names. The tests that start an
+  # API server get kube-apiserver and etcd from scripts/envtest-assets.sh,
+  # which fetches them on first use.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: test
+        run: KUBEBUILDER_ASSETS="$(scripts/envtest-assets.sh)" go test -race ./...
+
+  # The Helm chart: lint, render, schemas and refusals, with the helm,
+  # kubeconform and yq of the flake's bare shell.
+  chart:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: nix develop .#bare --command bash -e {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: chart
+        run: scripts/test-chart.sh
+
+  # The program and the image as a release builds them. gonixgo runs a
+  # program while Nix evaluates, which Nix allows only when asked.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: nix build
+        run: |
+          nix build --option allow-unsafe-native-code-during-evaluation true
+          ./result/bin/kosh version
+      - name: image
+        run: |
+          nix build .#image --option allow-unsafe-native-code-during-evaluation true
+          docker load < result
+          scripts/test-image.sh ghcr.io/fables-for-robots/kosh:nix
