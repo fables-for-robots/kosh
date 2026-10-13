@@ -286,6 +286,11 @@ func TestDescribeConfig(t *testing.T) {
 	if got := describeConfig(ctx, short).Timeout; got != 2*time.Second {
 		t.Errorf("a config of 2s, a deadline in 5s: %v", got)
 	}
+	far, cancelFar := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancelFar()
+	if got := describeConfig(far, cfg).Timeout; got != 30*time.Second {
+		t.Errorf("a deadline in 5m: %v, want 30s", got)
+	}
 	long := &rest.Config{Host: cfg.Host, Timeout: time.Minute}
 	if got := describeConfig(context.Background(), long).Timeout; got != 30*time.Second {
 		t.Errorf("a config of 1m, without a deadline: %v", got)
