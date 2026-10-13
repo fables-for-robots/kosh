@@ -1029,3 +1029,25 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 		t.Error("the read-only key is still accepted for a new connection")
 	}
 }
+
+// iroh-ssh finds kosh, which runs as a process on this machine with the
+// relays off, by mDNS alone: scripts/test-mdns.sh.
+func TestIrohSSHFindsKoshByMDNS(t *testing.T) {
+	if !cfg.mdns {
+		t.Skip("KOSH_E2E_MDNS is not 1: scripts/test-mdns.sh runs this test")
+	}
+	need(t, "KOSH_E2E_FULL_KEY", "KOSH_E2E_ENDPOINT", "KOSH_E2E_IROH_SSH", "KOSH_E2E_LOG")
+	k := fullKey(t)
+	cmd := exec.Command(cfg.irohSSH, "-i", k.file,
+		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes",
+		"kosh@"+cfg.endpoint)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
+	p := startPTY(t, cmd, 120, 40)
+	overIroh(t, p, "the pods, found by mDNS", func(lines []string) bool {
+		return lineWith(lines, "Pods(default)") && lineWith(lines, "Key:", k.name)
+	})
+	p.send(":q" + keyEnter)
+	if status := p.exitedWith(wait); status != 0 {
+		t.Errorf("iroh-ssh exited with status %d after :q; the screen:\n%s", status, p.scr)
+	}
+}
