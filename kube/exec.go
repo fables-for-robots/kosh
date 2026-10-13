@@ -3,20 +3,446 @@ package kube
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
-	// The exec stream of the API, and the errors of its upgrade. Named
-	// here so that go.mod holds what Exec is built on.
-	_ "k8s.io/client-go/tools/remotecommand"
-	_ "k8s.io/streaming/pkg/httpstream"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
+	utilexec "k8s.io/client-go/util/exec"
+	"k8s.io/streaming/pkg/httpstream"
 )
 
-// Exec is not built yet: it begins as every action does, and then says
-// that it is not.
+const (
+	// execMaxReason is the longest reason, in bytes, that
+	// ErrExecNotStarted is wrapped around.
+	execMaxReason = 1 << 10
+	// execMaxLogged is the most the log holds, in bytes, of the
+	// container's name and of the command's words together.
+	execMaxLogged = 1 << 10
+)
+
+// Exec begins as every action does; checks the pod's reference, the
+// container's name and the command; and runs the command on the API's
+// exec stream with a terminal, over WebSocket alone: kubectl's fallback
+// to SPDY would turn the API's typed refusals into plain text.
+//
+// It is logged twice: when it starts, with the container and the
+// command, and when it ends, with how. Nothing of what passes on the
+// terminal is logged. A call that the checks refuse is logged once, as
+// the action's failure.
+//
+// When ctx or the session ends, the stream is closed at once, and Exec
+// returns as soon as a write to opts.Stdout that is under way has
+// returned: it waits for that write, so that nothing of the command's
+// output reaches the terminal after Exec returned. The Stdout a caller
+// gives must therefore fail such a write when the terminal is taken
+// away from it (an SSH channel does when its session ends).
 func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
-	_, release, err := s.begin(ctx, actExec, pod)
+	ctx, release, err := s.begin(ctx, actExec, pod)
 	if err != nil {
 		return ExecResult{}, err
 	}
 	defer release()
-	return ExecResult{}, errors.New("not implemented")
+	container := slog.String("container", logText(opts.Container, execMaxLogged))
+	if err := s.checkExec(pod, opts); err != nil {
+		s.logAction(ctx, actExec, pod, err, slog.String("phase", "end"), container, slog.Bool("started", false))
+		return ExecResult{}, err
+	}
+	s.logAction(ctx, actExec, pod, nil, slog.String("phase", "start"), container,
+		slog.String("command", logCommand(opts.Command, execMaxLogged)))
+	began := time.Now()
+	res, err := s.exec(ctx, pod, opts)
+	attrs := []slog.Attr{slog.String("phase", "end"), container,
+		slog.Duration("duration", time.Since(began)), slog.Bool("started", res.Started)}
+	if err == nil {
+		attrs = append(attrs, slog.Int("status", res.Status))
+	}
+	s.logAction(ctx, actExec, pod, nil, append(attrs, execLogged(err)...)...)
+	return res, err
+}
+
+// execLogged is how the end of an Exec logs its error, in words that
+// hold nothing of the error's text, which may be a webhook's or the
+// runtime's and quote the command: the session's end as
+// ended="the session ended"; ErrExecNotStarted as itself, without the
+// runtime's reason; the caller's context's end as its error; an API
+// error as its reason and code; any other as "exec failed".
+func execLogged(err error) []slog.Attr {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errSessionEnded):
+		return []slog.Attr{slog.String("ended", "the session ended")}
+	case errors.Is(err, ErrExecNotStarted):
+		return []slog.Attr{slog.String("error", ErrExecNotStarted.Error())}
+	case errors.Is(err, context.Canceled):
+		return []slog.Attr{slog.String("error", context.Canceled.Error())}
+	case errors.Is(err, context.DeadlineExceeded):
+		return []slog.Attr{slog.String("error", context.DeadlineExceeded.Error())}
+	}
+	return []slog.Attr{slog.String("error", loggableError(actExec, err).Error())}
+}
+
+// logCommand returns the command as the log holds it: each word
+// cleaned by logText and quoted as Go quotes a string, the words joined
+// by one space, so that they stay apart whatever they hold:
+// "sh" "-c" "a b". What is longer than max bytes is cut after a whole
+// character and ends in logCut, within max.
+func logCommand(words []string, max int) string {
+	var b strings.Builder
+	for i, w := range words {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strconv.Quote(logText(w, len(w))))
+		if b.Len() > max {
+			break
+		}
+	}
+	s := b.String()
+	if len(s) > max {
+		s = cutText(s, max-len(logCut)) + logCut
+	}
+	return s
+}
+
+// logText returns s as the log holds it: without control characters,
+// with U+FFFD for what is not UTF-8, cut to max bytes after a whole
+// character.
+func logText(s string, max int) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+	return cutText(s, max)
+}
+
+// checkExec refuses what Exec cannot ask the API for: a reference that
+// is not a pod's, or not one the Cluster knows; a container's name that
+// is not a DNS-1123 label; and a command of no words. The words are
+// not looked at otherwise: they are the container's runtime's.
+func (s *session) checkExec(pod ObjectRef, opts ExecOptions) error {
+	if err := s.c.checkRef(pod); err != nil {
+		return err
+	}
+	if err := kindIs("exec in", pod, podKinds...); err != nil {
+		return err
+	}
+	if c := opts.Container; c != "" {
+		if len(c) > validation.DNS1123LabelMaxLength {
+			return fmt.Errorf("a name of %d bytes is no container's: at most %d", len(c), validation.DNS1123LabelMaxLength)
+		}
+		if len(validation.IsDNS1123Label(c)) > 0 {
+			return fmt.Errorf("%q is not the name of a container", c)
+		}
+	}
+	if len(opts.Command) == 0 {
+		return errors.New("there is no command to run")
+	}
+	if s.c.cfg == nil {
+		return errors.New("the cluster has no API to run a command through")
+	}
+	return nil
+}
+
+// exec runs the command on the pod's exec stream until it ends or ctx
+// does, and says how it ended.
+func (s *session) exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
+	term := newExecTerm(ctx, opts)
+	stream := remotecommand.StreamOptions{
+		Stdout: term.out,
+		Tty:    true,
+	}
+	if opts.Stdin != nil {
+		stream.Stdin = term.in
+	}
+	if term.sizes != nil {
+		// Not a nil *execSizeQueue in the interface: client-go would ask
+		// it.
+		stream.TerminalSizeQueue = term.sizes
+	}
+	err := s.stream(ctx, pod, opts.Container, opts.Command, stream)
+	term.letGo()
+	return execOutcome(ctx, err, term.out.written())
+}
+
+// execTerm is the terminal as the stream is given it: the caller's
+// input, output and sizes, each behind a guard that Exec closes before
+// it returns.
+//
+// What the stream still runs after that must hold nothing of the
+// session. It usually ends soon: client-go's heartbeat at its next
+// beat, its stdin copier with the caller's reader. But client-go
+// v0.37.1 has a race that leaves the stream's goroutines blocked for
+// good. In remotecommand's WebSocket executor (websocket.go), when the
+// context ends between the upgrade and the moment the read loop has set
+// its first read deadline (microseconds, as the stream opens), the
+// executor has returned and closed the connection, readDemuxLoop fails
+// to set the deadline on it and returns without closeAllStreamReaders,
+// and the error stream's reader, the stdout copier, the stdin waiter and
+// the stream's own goroutine wait on their pipes forever: four
+// goroutines, their pipes and a buffer of 32 KiB, for each time it
+// happens. It wants a fix upstream. Until then, letGo drops what the
+// guards hold of the session (its reader, its writer, its size), so
+// that what stays is client-go's memory only.
+type execTerm struct {
+	in    *execInput
+	out   *execOutput
+	sizes *execSizeQueue // nil without a Size
+}
+
+// execTermMade, when set, is given each execTerm Exec makes. Tests set
+// it.
+var execTermMade func(*execTerm)
+
+func newExecTerm(ctx context.Context, opts ExecOptions) *execTerm {
+	term := &execTerm{in: &execInput{r: opts.Stdin}, out: &execOutput{w: opts.Stdout}, sizes: execSizes(ctx, opts)}
+	if execTermMade != nil {
+		execTermMade(term)
+	}
+	return term
+}
+
+// letGo ends the stream's hold on the terminal: no read of it begins
+// after this, no write reaches it, no size is asked; and drops it.
+func (t *execTerm) letGo() {
+	t.in.letGo()
+	t.out.letGo()
+	if t.sizes != nil {
+		t.sizes.letGo()
+	}
+}
+
+// stream asks the API for the exec subresource of the pod, with the
+// container and the command, as kubectl exec builds the request, and
+// runs the stream over WebSocket until it ends.
+func (s *session) stream(ctx context.Context, pod ObjectRef, container string, command []string, opts remotecommand.StreamOptions) error {
+	req := s.c.typed.CoreV1().RESTClient().Post().
+		Namespace(pod.Namespace).Resource("pods").Name(pod.Name).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: container,
+			Command:   command,
+			Stdin:     true,
+			Stdout:    true,
+			TTY:       true,
+		}, scheme.ParameterCodec)
+	ex, err := remotecommand.NewWebSocketExecutor(s.c.cfg, "GET", req.URL().String())
+	if err != nil {
+		return err
+	}
+	return ex.StreamWithContext(ctx, opts)
+}
+
+// execOutcome turns how the stream ended into what Exec returns, given
+// the context it ran with and how many bytes of output passed.
+func execOutcome(ctx context.Context, err error, written int64) (ExecResult, error) {
+	started := written > 0
+	if err == nil {
+		return ExecResult{Started: true}, nil
+	}
+	var exit utilexec.CodeExitError
+	if errors.As(err, &exit) {
+		return ExecResult{Started: true, Status: exit.Code}, nil
+	}
+	if ctx.Err() != nil {
+		return ExecResult{Started: started}, contextError(ctx)
+	}
+	var upgrade *httpstream.UpgradeFailureError
+	if errors.As(err, &upgrade) {
+		var status apierrors.APIStatus
+		if errors.As(upgrade.Cause, &status) {
+			return ExecResult{}, upgrade.Cause
+		}
+	}
+	if !started {
+		return ExecResult{}, fmt.Errorf("%w: %s", ErrExecNotStarted, notStartedReason(err.Error()))
+	}
+	return ExecResult{Started: true}, err
+}
+
+// contextError is the error of ctx, which is done: its cause, which for
+// the session's end is errSessionEnded, joined to context.Canceled.
+func contextError(ctx context.Context) error {
+	cause := context.Cause(ctx)
+	if errors.Is(cause, ctx.Err()) {
+		return cause
+	}
+	return fmt.Errorf("%w: %w", cause, ctx.Err())
+}
+
+// notStartedReason is the reason a command could not be started, from
+// the text of the stream's error: without the API's "Internal error
+// occurred: " before it, and from the runtime's own words on when they
+// are there (exec: "sh": executable file not found in $PATH), which
+// leaves out the exec's id; cut to execMaxReason bytes.
+func notStartedReason(text string) string {
+	const internal = "Internal error occurred: "
+	for strings.HasPrefix(text, internal) {
+		text = text[len(internal):]
+	}
+	if i := strings.Index(text, `exec: "`); i >= 0 {
+		text = text[i:]
+	}
+	return cutText(text, execMaxReason)
+}
+
+// cutText cuts s to at most n bytes, after a whole character.
+func cutText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// execSizes is the terminal's sizes as the stream asks for them: the
+// size now, and then the size each time opts.Resized has a value, until
+// ctx is done. A size of zero or less in either direction is not sent.
+// A closed Resized means the size never changes again. Without
+// opts.Size there is none: nil.
+func execSizes(ctx context.Context, opts ExecOptions) *execSizeQueue {
+	if opts.Size == nil {
+		return nil
+	}
+	return &execSizeQueue{ctx: ctx, size: opts.Size, resized: opts.Resized}
+}
+
+type execSizeQueue struct {
+	ctx     context.Context
+	resized <-chan struct{} // nil: the size never changes
+	asked   bool            // the size was asked once
+
+	mu   sync.Mutex
+	size func() (width, height int) // nil once Exec let go
+}
+
+// Next returns the next size to send, or nil when ctx is done or Exec
+// let go of the terminal. The stream calls it from one goroutine.
+func (q *execSizeQueue) Next() *remotecommand.TerminalSize {
+	for {
+		if q.ctx.Err() != nil {
+			return nil
+		}
+		if q.asked {
+			select {
+			case <-q.ctx.Done():
+				return nil
+			case _, ok := <-q.resized:
+				if !ok {
+					q.resized = nil
+					continue
+				}
+			}
+		}
+		q.asked = true
+		if w, h, ok := q.ask(); !ok {
+			return nil
+		} else if w > 0 && h > 0 {
+			return &remotecommand.TerminalSize{Width: uint16(min(w, math.MaxUint16)), Height: uint16(min(h, math.MaxUint16))}
+		}
+	}
+}
+
+// ask returns the terminal's size now; false once Exec let go of it.
+func (q *execSizeQueue) ask() (w, h int, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.size == nil || q.ctx.Err() != nil {
+		return 0, 0, false
+	}
+	w, h = q.size()
+	return w, h, true
+}
+
+// letGo drops the terminal's size: no call of it begins after this, and
+// one under way has returned.
+func (q *execSizeQueue) letGo() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.size = nil
+}
+
+// execOutput is the writer the stream is given: it passes the command's
+// output to the terminal, and counts it, until Exec lets the terminal
+// go; then it takes nothing more.
+type execOutput struct {
+	w io.Writer // nil: the output is counted and dropped
+
+	mu     sync.Mutex
+	n      int64
+	closed bool
+}
+
+// errLetGo is what the stream gets when it writes after Exec returned.
+var errLetGo = errors.New("the terminal was let go")
+
+func (o *execOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return 0, errLetGo
+	}
+	if o.w == nil {
+		o.n += int64(len(p))
+		return len(p), nil
+	}
+	n, err := o.w.Write(p)
+	o.n += int64(n)
+	return n, err
+}
+
+// letGo ends the writes to the terminal, and drops it: it waits for one
+// that is under way.
+func (o *execOutput) letGo() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	o.w = nil
+}
+
+// written returns how many bytes of output passed.
+func (o *execOutput) written() int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.n
+}
+
+// execInput is the reader the stream is given: the terminal's input,
+// until Exec lets the terminal go. A read that is under way then is the
+// terminal's to end (ExecOptions.Stdin); no read begins after it.
+type execInput struct {
+	mu sync.Mutex
+	r  io.Reader // nil once Exec let go
+}
+
+func (i *execInput) Read(p []byte) (int, error) {
+	i.mu.Lock()
+	r := i.r
+	i.mu.Unlock()
+	if r == nil {
+		return 0, io.EOF
+	}
+	return r.Read(p)
+}
+
+// letGo drops the terminal's input: no read of it begins after this.
+func (i *execInput) letGo() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.r = nil
 }
