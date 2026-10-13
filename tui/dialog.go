@@ -20,11 +20,16 @@ import (
 // dialogWidth is the width of a dialog in a window that has room for it.
 const dialogWidth = 64
 
-// dialogNames is how many names a dialog lists; the others are counted.
+// dialogNames is how many names a dialog lists at most; the others are
+// counted. A screen with fewer lines lists fewer.
 const dialogNames = 10
 
 // dialogCancel is the label of the button that changes nothing.
 const dialogCancel = "Cancel"
+
+// dialogTextTooSmall is the flash of a dialog that the screen has too few
+// lines for: it is not opened, or it is closed, and nothing is done.
+const dialogTextTooSmall = "the window is too small for this dialog: nothing was done"
 
 // formKind is the kind of a field of a form.
 type formKind int
@@ -72,9 +77,10 @@ func formCheckField(label string, on bool) *formField {
 	return &formField{kind: formIsCheck, label: label, on: on}
 }
 
-// formInput returns the text input of a field: no blinking cursor, and
-// no ctrl+v, which would read the clipboard of the machine kosh runs on
-// rather than the user's (a paste of the user's terminal still comes).
+// formInput returns the text input of a field: no blinking cursor, at
+// most inputMaxChars characters, and no ctrl+v, which would read the
+// clipboard of the machine kosh runs on rather than the user's (a paste
+// of the user's terminal still comes).
 func formInput(value string) textinput.Model {
 	in := textinput.New()
 	in.Prompt = ""
@@ -83,6 +89,7 @@ func formInput(value string) textinput.Model {
 	st.Focused.Text = stylePromptText
 	st.Blurred.Text = stylePromptText
 	in.SetStyles(st)
+	in.CharLimit = inputMaxChars
 	in.KeyMap.Paste.SetEnabled(false)
 	in.SetValue(value)
 	return in
@@ -142,9 +149,10 @@ type formButton struct {
 // formDialog is a dialog with fields: the confirm dialog is one without.
 type formDialog struct {
 	question string
-	names    []string
-	more     int
-	fields   []*formField
+	// names are all the names the dialog is about, cleaned; View lists
+	// as many as fit and counts the others.
+	names  []string
+	fields []*formField
 	// buttons start with Cancel.
 	buttons []formButton
 	// focus is a field's index, or len(fields) plus a button's.
@@ -163,19 +171,16 @@ func dialogConfirm(question string, names []string, buttons ...formButton) *form
 
 // dialogForm returns a dialog with fields, and the buttons Cancel and
 // then buttons. The first field has the focus, or Cancel when there is
-// none. The question and the names are cleaned; ten names are listed
-// and the others counted.
+// none. The question and the names are cleaned; at most dialogNames
+// names are listed, as many as the screen has lines for, and the others
+// counted.
 func dialogForm(question string, names []string, fields []*formField, buttons ...formButton) *formDialog {
 	d := &formDialog{
 		question: cleanLine(question),
 		fields:   fields,
 		buttons:  append([]formButton{{label: dialogCancel}}, buttons...),
 	}
-	for i, n := range names {
-		if i == dialogNames {
-			d.more = len(names) - dialogNames
-			break
-		}
+	for _, n := range names {
 		d.names = append(d.names, cleanLine(n))
 	}
 	d.setFocus(0)
@@ -221,11 +226,17 @@ func (d *formDialog) setFocus(i int) {
 
 // Init calls onOpen.
 func (d *formDialog) Init() tea.Cmd {
+	d.Drop()
+	return nil
+}
+
+// Drop calls onOpen, once: what it releases was held until the dialog
+// opened, and is released as well when it is not.
+func (d *formDialog) Drop() {
 	if d.onOpen != nil {
 		d.onOpen()
 		d.onOpen = nil
 	}
-	return nil
 }
 
 // Update takes the dialog's keys and pastes; it has no messages of its
@@ -236,7 +247,8 @@ func (d *formDialog) Update(msg tea.Msg) (dialog, tea.Cmd) {
 		return d, d.key(msg)
 	case tea.PasteMsg:
 		if f := d.focused(); f != nil {
-			return d, f.input(msg)
+			// Cleaned, on one line, and cut to what a field takes.
+			return d, f.input(tea.PasteMsg{Content: inputCut(cleanLine(msg.Content))})
 		}
 	}
 	return d, nil
@@ -303,22 +315,66 @@ func (d *formDialog) press(b formButton) tea.Cmd {
 	return tea.Batch(closeDialog(), cmd)
 }
 
-// View draws the dialog in a box at most width cells wide.
-func (d *formDialog) View(width int) string {
-	bw := min(width, dialogWidth)
-	iw := max(bw-4, 1)
-	var body []string
-	body = append(body, "")
+// View draws the dialog in a box at most width cells wide and height
+// lines high. What gives way when the lines are few: first the names,
+// down to "… and N more" alone; then the blank lines; then, from the
+// top, the question. The fields and the buttons are always drawn.
+func (d *formDialog) View(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	bw := max(min(width, dialogWidth), 5)
+	iw := bw - 4
+	room := max(height-2, 0)
+	body, ok := d.body(iw, room, true)
+	if !ok {
+		body, _ = d.body(iw, room, false)
+	}
+	if len(body) > room {
+		body = body[len(body)-room:]
+	}
+	side := styleBorder.Render("│")
+	lines := []string{styleBorder.Render("╭" + strings.Repeat("─", bw-2) + "╮")}
+	for _, l := range body {
+		lines = append(lines, side+" "+fit(l, iw)+" "+side)
+	}
+	lines = append(lines, styleBorder.Render("╰"+strings.Repeat("─", bw-2)+"╯"))
+	if len(lines) > height {
+		lines = lines[len(lines)-height:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Fits reports whether the dialog, drawn at most width cells wide, shows
+// its question, its fields and its buttons in height lines, and when it
+// has names at least the line that counts them.
+func (d *formDialog) Fits(width, height int) bool {
+	if width <= 0 || height < 2 {
+		return false
+	}
+	iw := max(min(width, dialogWidth), 5) - 4
+	_, ok := d.body(iw, height-2, false)
+	return ok
+}
+
+// body returns the lines inside the box, iw cells wide, for room lines:
+// as many names as fit with the rest, at most dialogNames, and the line
+// that counts the others; blank lines between the parts when blanks is
+// set. ok is false when the lines are more than room even with no name
+// listed.
+func (d *formDialog) body(iw, room int, blanks bool) (lines []string, ok bool) {
+	blank := func(ls []string) []string {
+		if blanks {
+			return append(ls, "")
+		}
+		return ls
+	}
+	top := blank(nil)
 	for _, l := range dialogWrap(d.question, iw) {
-		body = append(body, styleTitle.Render(l))
+		top = append(top, styleTitle.Render(l))
 	}
-	for _, n := range d.names {
-		body = append(body, styleText.Render(fit("  "+n, iw)))
-	}
-	if d.more > 0 {
-		body = append(body, styleText.Render(fit(fmt.Sprintf("  … and %d more", d.more), iw)))
-	}
-	body = append(body, "")
+	var bottom []string
+	bottom = blank(bottom)
 	if len(d.fields) > 0 {
 		lw := 0
 		for _, f := range d.fields {
@@ -326,25 +382,33 @@ func (d *formDialog) View(width int) string {
 		}
 		lw = min(lw, iw/2)
 		for i, f := range d.fields {
-			body = append(body, d.fieldLine(f, i == d.focus, lw, iw))
+			bottom = append(bottom, d.fieldLine(f, i == d.focus, lw, iw))
 		}
-		body = append(body, "")
+		bottom = blank(bottom)
 	}
 	if d.why != "" {
 		for _, l := range dialogWrap(d.why, iw) {
-			body = append(body, styleError.Render(l))
+			bottom = append(bottom, styleError.Render(l))
 		}
-		body = append(body, "")
+		bottom = blank(bottom)
 	}
-	body = append(body, d.buttonLine(iw), "")
+	bottom = blank(append(bottom, d.buttonLine(iw)))
 
-	side := styleBorder.Render("│")
-	lines := []string{styleBorder.Render("╭" + strings.Repeat("─", bw-2) + "╮")}
-	for _, l := range body {
-		lines = append(lines, side+" "+fit(l, iw)+" "+side)
+	n := len(d.names)
+	shown, more := n, 0
+	if left := room - len(top) - len(bottom); n > dialogNames || n > left {
+		shown = max(min(n, dialogNames, left-1), 0)
+		more = n - shown
 	}
-	lines = append(lines, styleBorder.Render("╰"+strings.Repeat("─", bw-2)+"╯"))
-	return strings.Join(lines, "\n")
+	lines = top
+	for _, name := range d.names[:shown] {
+		lines = append(lines, styleText.Render(fit("  "+name, iw)))
+	}
+	if more > 0 {
+		lines = append(lines, styleText.Render(fit(fmt.Sprintf("  … and %d more", more), iw)))
+	}
+	lines = append(lines, bottom...)
+	return lines, len(lines) <= room
 }
 
 // fieldLine draws a field: a mark when it has the focus, its label, its

@@ -345,7 +345,7 @@ func (v *logView) read() tea.Cmd {
 			got, _ = logFit(got)
 			m := logReadMsg{id: id, gen: gen, lines: got, ended: ended, skipped: s.Skipped(), at: time.Now()}
 			if ended && s.Err() != nil {
-				m.err = cleanLine(s.Err().Error())
+				m.err = errorLine(s.Err().Error())
 			}
 			return m
 		}
@@ -529,7 +529,7 @@ func (v *logView) reopen() tea.Cmd {
 	return func() tea.Msg {
 		s, err := sess.Logs(box.ctx, ref, opts)
 		if err != nil {
-			return logOpenedMsg{id: id, gen: gen, err: cleanLine(err.Error())}
+			return logOpenedMsg{id: id, gen: gen, err: errorLine(err.Error())}
 		}
 		if !box.set(s) {
 			s.Close()

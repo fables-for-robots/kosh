@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/kube"
 )
@@ -64,8 +65,13 @@ type (
 	// useNamespaceMsg asks the root to make ns the current namespace.
 	useNamespaceMsg struct{ ns string }
 	// commandMsg asks the root to run text as a command typed at the
-	// prompt.
-	commandMsg struct{ text string }
+	// prompt. With literal set its second word is the name of a
+	// namespace as the cluster has it: all is the namespace named all,
+	// not all of them.
+	commandMsg struct {
+		text    string
+		literal bool
+	}
 	// resolvedMsg is the outcome of resolving the name of a command.
 	resolvedMsg struct {
 		text   string // the command, to be put into the history
@@ -86,9 +92,11 @@ func (r *root) useNamespace(ns string) tea.Cmd {
 }
 
 // runCommand runs a command of the prompt: a name and optionally a
-// namespace. record puts it into the history when it goes to a
-// resource.
-func (r *root) runCommand(text string, record bool) tea.Cmd {
+// namespace, where "all" and "-A" are all of them, as 0 is, unless
+// literal is set. record puts it into the history when it goes to a
+// resource. A namespace that is not a namespace's name (isNamespaceName)
+// is said in the flash, and nothing is opened.
+func (r *root) runCommand(text string, record, literal bool) tea.Cmd {
 	fields := strings.Fields(text)
 	if len(fields) == 0 {
 		return nil
@@ -103,9 +111,44 @@ func (r *root) runCommand(text string, record bool) tea.Cmd {
 	}
 	ns := ""
 	if len(fields) > 1 {
-		ns = fields[1]
+		// What follows the name, as one word: a space in it is no name.
+		word := strings.Join(fields[1:], " ")
+		switch {
+		case !literal && (word == "all" || word == "-A"):
+			// A namespace named all is chosen from the namespaces'
+			// table, which sends it as literal.
+		case isNamespaceName(word):
+			ns = word
+		default:
+			text := "not a namespace: " + ansi.Truncate(cleanLine(word), namespaceShown, "…")
+			return func() tea.Msg { return flashMsg{text: text, err: true} }
+		}
 	}
 	return r.resolve(strings.Join(fields, " "), fields[0], ns, len(fields) > 1, record, false)
+}
+
+// namespaceShown is how many cells of a word that is not a namespace's
+// name the flash shows.
+const namespaceShown = 40
+
+// isNamespaceName reports whether s is a namespace's name: a DNS-1123
+// label, of lower-case letters, digits and "-", beginning and ending
+// with a letter or a digit, of at most 63 characters. The UI sends no
+// other namespace to the session, which puts it into the path of a
+// request.
+func isNamespaceName(s string) bool {
+	if len(s) == 0 || len(s) > 63 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-' && i > 0 && i < len(s)-1:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // resolve asks the session for the resource of name, in a command. start
@@ -190,7 +233,7 @@ func (v *tableView) enter() tea.Cmd {
 	case isAny("rbac.authorization.k8s.io", "roles", "clusterroles", "rolebindings", "clusterrolebindings"):
 		return pushView(newTableView(v.e, kube.Query{Resource: kube.Rules, Of: &ref}, ""))
 	case isAny("", "namespaces"):
-		return func() tea.Msg { return commandMsg{text: "pods " + r.Name} }
+		return func() tea.Msg { return commandMsg{text: "pods " + r.Name, literal: true} }
 	case isAny("apiextensions.k8s.io", "customresourcedefinitions"):
 		return v.openResource(r.Name, v.ns.current)
 	case isAny(kube.Containers.GVR.Group, kube.Containers.GVR.Resource):

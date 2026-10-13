@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
@@ -16,9 +18,18 @@ import (
 // in kosh, with the YAML as it was read; ctrl+s sends it as an update,
 // esc leaves and asks first when the text was changed.
 
-// editorMaxLines is the most lines the editor holds. Its line numbers
-// are as wide as this number.
-const editorMaxLines = 9999
+// The largest YAML the editor opens: editorMaxLines lines and
+// editorMaxBytes bytes. What it holds while it is edited is bounded by
+// editorMaxText and editorTextMaxRows. The text area of bubbles draws all its text, in
+// every update and every frame, and costs about 25µs a row it draws: a
+// row a line, and a row more for each width of the window a long line
+// wraps over. These keep a key and its frame under 50ms on an Apple M4
+// Pro, in the worst case (lines of 73 cells, two rows each at 80
+// columns) as well (TestEditorKeyPressIsFast).
+const (
+	editorMaxLines = 1000
+	editorMaxBytes = 48 << 10
+)
 
 // editorView is the editor of one object's YAML.
 type editorView struct {
@@ -33,9 +44,13 @@ type editorView struct {
 	firstOf  string
 	onOpen   func()
 	modified bool
-	saving   bool
-	// why is the error of a refused update, shown until the next key.
-	why string
+	// size is the length of the text in bytes.
+	size   int
+	saving bool
+	// why is the error of a refused update, cleaned, shown under the
+	// text until the next update is sent; whyWrap keeps its lines.
+	why     string
+	whyWrap wrapped
 }
 
 // editorSavedMsg is what came of the update of the editor id.
@@ -44,10 +59,29 @@ type editorSavedMsg struct {
 	err error
 }
 
-// The flashes of a YAML the editor will not open.
+// editorMaxText is the most bytes the editor's text grows to by what is
+// typed or pasted, 16 KiB more than editorMaxBytes, where a key still
+// costs about what it costs at the largest object the editor opens
+// (about 40ms on an Apple M4 Pro, BenchmarkEditorKeyPress).
+// Input that would take the text further is refused, with the flash
+// editorTextTooLong, and the text and the cursor stay as they were.
+const editorMaxText = 64 << 10
+
+// editorTextMaxRows is the most lines the text area holds, which input
+// that would add more is refused for as editorMaxText refuses it: the
+// ceiling of bubbles' text area, which holds 10,000 lines at most, and
+// the width of the line numbers, four digits.
+const editorTextMaxRows = 9999
+
+// editorTextTooLong is the flash of input the editor refuses.
+const editorTextTooLong = "the text is too long to edit here"
+
+// The flashes of a YAML the editor will not open. editorTextCannotHold
+// names editorMaxLines and editorMaxBytes, which
+// TestEditorRefusesWhatItCannotHold keeps it in step with.
 const (
 	editorTextCannotKeep = "this object holds characters the editor cannot keep (a tab or a control character outside a quoted string): edit it with kubectl"
-	editorTextCannotHold = "this object's YAML has more lines than the editor holds, or characters it cannot hold: edit it with kubectl"
+	editorTextCannotHold = "this object's YAML is larger than the editor opens (1000 lines, 48 KiB) or has characters it cannot hold: edit it with kubectl"
 )
 
 // editorOpen reads the YAML of the first row in a command and opens the
@@ -75,9 +109,12 @@ func editorOpen(e env, _ kube.Query, refs []kube.ObjectRef) tea.Cmd {
 // read and what the user typed, so it returns why instead when it could
 // not keep the text as it is: a line that clean would change (a raw tab,
 // a control character, an escape sequence, bytes that are not UTF-8),
-// more lines than editorMaxLines, or anything the text area would not
-// hold.
+// more lines than editorMaxLines or bytes than editorMaxBytes, or
+// anything the text area would not hold.
 func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why string) {
+	if len(yaml) > editorMaxBytes {
+		return nil, editorTextCannotHold
+	}
 	lines := strings.Split(yaml, "\n")
 	if len(lines) > editorMaxLines {
 		return nil, editorTextCannotHold
@@ -91,9 +128,12 @@ func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why strin
 	ta := textarea.New()
 	ta.Prompt = ""
 	ta.ShowLineNumbers = true
-	ta.MaxHeight = editorMaxLines
+	ta.MaxHeight = editorTextMaxRows
 	ta.MaxWidth = 0
-	ta.CharLimit = 0
+	// input refuses what would take the text past editorMaxText bytes
+	// before the text area sees it; this is the text area's own bound,
+	// in characters, which are never more than the bytes.
+	ta.CharLimit = editorMaxText
 	// ctrl+v and the copy of a selection would use the clipboard of the
 	// machine kosh runs on, by starting a program there. A paste of the
 	// user's terminal still comes, as a PasteMsg.
@@ -114,7 +154,35 @@ func editorNew(e env, ref kube.ObjectRef, yaml string) (v *editorView, why strin
 	}
 	ta.MoveToBegin()
 	ta.Focus()
-	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: yaml}, ""
+	return &editorView{id: newID(), e: e, ref: ref, ta: ta, was: yaml, size: len(yaml)}, ""
+}
+
+// editorTab is what the text area makes of a tab.
+const editorTab = "    "
+
+// editorHeld returns s as the text area holds what is pasted into it,
+// as its sanitizer makes it, so that it has nothing left to change: a
+// CRLF, and a CR alone, become one line feed; a tab becomes editorTab;
+// U+FFFD and bytes that are not UTF-8, and every control character but
+// the line feed, are dropped. Bidirectional controls are dropped too,
+// which the text area would keep: the editor draws its text as it holds
+// it, and opens no text that clean would change.
+func editorHeld(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\r' || r == '\n':
+			b.WriteByte('\n')
+		case r == '\t':
+			b.WriteString(editorTab)
+		case r == utf8.RuneError, unicode.IsControl(r), isBidiControl(r):
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // Init calls onOpen.
@@ -135,7 +203,7 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		}
 		v.saving = false
 		if msg.err != nil {
-			v.why = cleanLine(msg.err.Error())
+			v.why = errorText(msg.err.Error())
 			return v, nil
 		}
 		return v, tea.Sequence(popView(), flash("Updated "+v.ref.String()), refresh())
@@ -143,7 +211,6 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		if v.saving {
 			return v, nil
 		}
-		v.why = ""
 		switch msg.String() {
 		case "ctrl+s":
 			return v, v.save()
@@ -155,17 +222,38 @@ func (v *editorView) Update(msg tea.Msg) (view, tea.Cmd) {
 		if v.saving {
 			return v, nil
 		}
-		v.why = ""
 		return v, v.input(msg)
 	}
 	return v, nil
 }
 
-// input gives msg to the text area.
+// input gives msg to the text area, unless what it adds would take the
+// text past editorMaxText bytes or editorTextMaxRows lines: then the
+// text and the cursor stay as they were, and the flash says why. A
+// paste is measured, and given to the text area, as the text area holds
+// it (editorHeld), so that it is taken whole or not at all.
 func (v *editorView) input(msg tea.Msg) tea.Cmd {
+	added, rows := 0, 0
+	switch m := msg.(type) {
+	case tea.PasteMsg:
+		m.Content = editorHeld(m.Content)
+		msg = m
+		added = len(m.Content)
+		rows = strings.Count(m.Content, "\n")
+	case tea.KeyPressMsg:
+		added = len(editorHeld(m.Text))
+		if m.String() == "enter" {
+			added, rows = max(added, 1), 1
+		}
+	}
+	if v.size+added > editorMaxText || v.ta.LineCount()+rows > editorTextMaxRows {
+		return func() tea.Msg { return flashMsg{text: editorTextTooLong, err: true} }
+	}
 	var cmd tea.Cmd
 	v.ta, cmd = v.ta.Update(msg)
-	v.modified = v.ta.Value() != v.was
+	text := v.ta.Value()
+	v.size = len(text)
+	v.modified = text != v.was
 	return cmd
 }
 
@@ -180,6 +268,7 @@ func (v *editorView) save() tea.Cmd {
 		return flash(actionTextBusy)
 	}
 	v.saving = true
+	v.why = ""
 	sess, ref, id := v.e.sess, v.ref, v.id
 	return waitCmd(func() tea.Msg {
 		defer actionEnd(sess)
@@ -202,15 +291,16 @@ func (v *editorView) leave() tea.Cmd {
 }
 
 // View draws the text area over the body, and under it the error of a
-// refused update.
+// refused update, wrapped onto up to half the lines.
 func (v *editorView) View(w, h int) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	th := h
+	var why []string
 	if v.why != "" {
-		th--
+		why = v.whyWrap.get(v.why, w, max(h/2, 1))
 	}
+	th := h - len(why)
 	var out []string
 	if th > 0 {
 		v.ta.SetWidth(w)
@@ -224,8 +314,8 @@ func (v *editorView) View(w, h int) string {
 			out = append(out, fit(l, w))
 		}
 	}
-	if v.why != "" {
-		out = append(out, styleError.Render(fit(v.why, w)))
+	for _, l := range why {
+		out = append(out, styleError.Render(fit(l, w)))
 	}
 	return strings.Join(out, "\n")
 }

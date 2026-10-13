@@ -403,6 +403,8 @@ func (v *textView) key(k tea.KeyPressMsg) tea.Cmd {
 		return popView()
 	case "q":
 		return popView()
+	case "ctrl+r":
+		return v.load(false)
 	}
 	return nil
 }
@@ -816,6 +818,26 @@ func (v *textView) Hints() []hint {
 		hs = append(hs, hint{"r", "Toggle Auto-Refresh"}, hint{"m", "Toggle ManagedFields"})
 	}
 	return hs
+}
+
+// helpHints are every key of the view, for the help: the movement keys,
+// the hints, reading again, and the ways back.
+func (v *textView) helpHints() []hint {
+	hs := []hint{
+		{"j/down", "Down"},
+		{"k/up", "Up"},
+		{"ctrl-f/pgdown/space", "Page Down"},
+		{"ctrl-b/pgup", "Page Up"},
+		{"g/home", "Top"},
+		{"shift-g/end", "Bottom"},
+		{"left/right", "Sideways"},
+	}
+	hs = append(hs, v.Hints()...)
+	return append(hs,
+		hint{"ctrl-r", "Read Again"},
+		hint{"esc", "Clear Search / Back"},
+		hint{"q", "Back"},
+	)
 }
 
 func (v *textView) Capturing() bool  { return false }

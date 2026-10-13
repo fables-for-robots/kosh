@@ -98,7 +98,7 @@ type harness struct {
 
 // newHarness starts the program of sess in a window of w by h: it runs
 // Init, gives the size, and runs what follows.
-func newHarness(t *testing.T, sess kube.Session, w, h int) *harness {
+func newHarness(t testing.TB, sess kube.Session, w, h int) *harness {
 	t.Helper()
 	c := &clock{at: t0}
 	hs := &harness{
@@ -612,9 +612,11 @@ func (d *testDialog) Update(msg tea.Msg) (dialog, tea.Cmd) {
 	}
 	return d, nil
 }
-func (d *testDialog) View(width int) string {
+func (d *testDialog) View(width, height int) string {
 	return "╔══════════╗\n║ a dialog ║\n╚══════════╝"
 }
+func (d *testDialog) Fits(width, height int) bool { return height >= 3 }
+func (d *testDialog) Drop()                       {}
 
 // testMsg is a message of the tests that no part knows.
 type testMsg struct{ n int }

@@ -174,3 +174,89 @@ func fit(s string, width int) string {
 	}
 	return s
 }
+
+// wrapText cleans s and wraps it into lines of at most w cells: at a
+// line feed of s, at the spaces where it can, and inside a word that is
+// longer than a line where it must. Lines that are empty are left out,
+// and the lines are not padded. With most above zero there are at most
+// most lines, the last one ending in "…" when s had more. A width below
+// one gives no lines.
+func wrapText(s string, w, most int) []string {
+	if w <= 0 {
+		return nil
+	}
+	var out []string
+	for _, para := range strings.Split(clean(s), "\n") {
+		if strings.TrimSpace(para) == "" {
+			continue
+		}
+		for _, l := range strings.Split(ansi.Wrap(para, w, ""), "\n") {
+			l = strings.TrimRight(l, " ")
+			if l == "" {
+				continue
+			}
+			if ansi.StringWidth(l) > w {
+				l = ansi.Truncate(l, w, "…")
+			}
+			out = append(out, l)
+			if most > 0 && len(out) > most {
+				break
+			}
+		}
+		if most > 0 && len(out) > most {
+			break
+		}
+	}
+	if most > 0 && len(out) > most {
+		out = out[:most]
+		last := out[most-1]
+		if ansi.StringWidth(last) >= w {
+			last = ansi.Truncate(last, w-1, "")
+		}
+		out[most-1] = last + "…"
+	}
+	return out
+}
+
+// wrapped keeps the lines of the last text it wrapped, so that a text
+// drawn in every frame is wrapped once for each width.
+type wrapped struct {
+	text     string
+	w, most  int
+	lines    []string
+	computed bool
+}
+
+// get returns wrapText(text, w, most), from what it kept when it can.
+func (c *wrapped) get(text string, w, most int) []string {
+	if !c.computed || c.text != text || c.w != w || c.most != most {
+		c.text, c.w, c.most = text, w, most
+		c.lines = wrapText(text, w, most)
+		c.computed = true
+	}
+	return c.lines
+}
+
+// errorMaxBytes is how much of an error's text is kept: a webhook may
+// word a message of any length.
+const errorMaxBytes = 64 << 10
+
+// errorText is the text of an error as the UI keeps it to wrap and draw:
+// its first errorMaxBytes bytes, with "…" when there were more, cleaned.
+// The flash, the editor and a table each keep an error's text so, and
+// so cost a bounded amount at each reading.
+// The mark is added after the cleaning, which would take it into an
+// escape sequence the cut fell in.
+func errorText(s string) string {
+	if len(s) <= errorMaxBytes {
+		return clean(s)
+	}
+	i := errorMaxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return clean(s[:i]) + "…"
+}
+
+// errorLine is errorText on one line: a line feed becomes a space.
+func errorLine(s string) string { return strings.ReplaceAll(errorText(s), "\n", " ") }

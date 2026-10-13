@@ -11,7 +11,7 @@ import (
 )
 
 // Every text input and text area the package makes has bubbles' Paste
-// disabled in the function that makes it: Paste reads the clipboard by
+// disabled, and a limit of characters, in the function that makes it: Paste reads the clipboard by
 // starting xclip, xsel or wl-paste, on the server, and kosh starts no
 // other process. The check reads the package's Go files that are not
 // tests.
@@ -47,6 +47,12 @@ func TestEveryTextInputHasNoPaste(t *testing.T) {
 				found++
 				if !strings.Contains(body, "KeyMap.Paste.SetEnabled(false)") {
 					t.Errorf("%s: %s calls %s and does not disable its Paste (KeyMap.Paste.SetEnabled(false))", name, fn.Name.Name, ctor)
+				}
+				// And it has an end: inputMaxChars for a line, editorMaxText
+				// for the editor's text area.
+				limit := map[string]string{"textinput.New()": "CharLimit = inputMaxChars", "textarea.New()": "CharLimit = editorMaxText"}[ctor]
+				if !strings.Contains(body, limit) {
+					t.Errorf("%s: %s calls %s and does not limit what it takes (%s)", name, fn.Name.Name, ctor, limit)
 				}
 			}
 		}

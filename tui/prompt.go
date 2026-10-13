@@ -14,6 +14,10 @@ const (
 	promptFilter
 )
 
+// inputMaxChars is how many characters the prompt and a field of a
+// dialog take at most, typed or pasted.
+const inputMaxChars = 1024
+
 // prompt is the line in which a command or a filter is typed.
 type prompt struct {
 	kind promptKind
@@ -32,6 +36,7 @@ func newInput(w int) textinput.Model {
 	st.Focused.Suggestion = styleDim
 	in.SetStyles(st)
 	in.SetWidth(max(w-3, 1))
+	in.CharLimit = inputMaxChars
 	// Paste would read the clipboard by starting a program on the server.
 	// What the user pastes comes from their terminal as a tea.PasteMsg.
 	in.KeyMap.Paste.SetEnabled(false)
@@ -102,7 +107,7 @@ func (r *root) promptKey(k tea.KeyPressMsg) tea.Cmd {
 		text := r.prompt.in.Value()
 		r.prompt.close()
 		if kind == promptCommand {
-			return r.runCommand(text, true)
+			return r.runCommand(text, true, false)
 		}
 		return nil
 	case "esc":
@@ -125,9 +130,21 @@ func (r *root) promptKey(k tea.KeyPressMsg) tea.Cmd {
 }
 
 // promptPaste puts what the terminal pasted into the prompt as typed
-// text, cleaned and on one line.
+// text, cleaned, on one line, and cut to what the prompt takes.
 func (r *root) promptPaste(p tea.PasteMsg) tea.Cmd {
-	return r.promptInput(tea.PasteMsg{Content: cleanLine(p.Content)})
+	return r.promptInput(tea.PasteMsg{Content: inputCut(cleanLine(p.Content))})
+}
+
+// inputCut returns the first inputMaxChars characters of s.
+func inputCut(s string) string {
+	n := 0
+	for i := range s {
+		if n == inputMaxChars {
+			return s[:i]
+		}
+		n++
+	}
+	return s
 }
 
 // promptInput gives msg to the text input, and a changed filter to the
@@ -189,5 +206,5 @@ func (r *root) historyGo(i int) tea.Cmd {
 	if !ok {
 		return nil
 	}
-	return r.runCommand(cmd, false)
+	return r.runCommand(cmd, false, false)
 }

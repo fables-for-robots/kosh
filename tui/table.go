@@ -75,7 +75,7 @@ func prepare(t kube.Table) ttable {
 		out.cols[i] = c
 	}
 	if t.Err != nil {
-		out.err = cleanLine(t.Err.Error())
+		out.err = errorText(t.Err.Error())
 		return out
 	}
 	out.rows = make([]trow, len(t.Rows))
@@ -180,6 +180,9 @@ type tableView struct {
 	sortDesc     bool
 	colAt        int
 
+	// errWrap keeps the lines of openErr or data.err.
+	errWrap wrapped
+
 	vis       []int // the columns shown, as indexes of data.cols
 	widths    []int // of the columns shown
 	shown     []int // the rows shown, as indexes of data.rows
@@ -235,7 +238,7 @@ func (v *tableView) openWatch() tea.Cmd {
 	return func() tea.Msg {
 		w, err := open()
 		if err != nil {
-			return tableReadMsg{id: id, gen: gen, err: cleanLine(err.Error())}
+			return tableReadMsg{id: id, gen: gen, err: errorText(err.Error())}
 		}
 		if !box.set(w) {
 			w.Close()
@@ -646,11 +649,17 @@ func (v *tableView) draw(w, h int) string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	if v.openErr != "" {
-		return styleError.Render(fit(v.openErr, w))
+	err := v.openErr
+	if err == "" {
+		err = v.data.err
 	}
-	if v.data.err != "" {
-		return styleError.Render(fit(v.data.err, w))
+	if err != "" {
+		// Wrapped into the body: the error of the watch, or of its list.
+		var lines []string
+		for _, l := range v.errWrap.get(err, w, h) {
+			lines = append(lines, styleError.Render(fit(l, w)))
+		}
+		return strings.Join(lines, "\n")
 	}
 	var lines []string
 	if len(v.vis) > 0 {

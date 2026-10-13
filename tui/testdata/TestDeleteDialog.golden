@@ -8,8 +8,6 @@ kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark      
 │NAME↑  READY  STATUS   RESTARTS  AGE                                                              │
 │web-1  1/1    Running         0   1h                                                              │
 │                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
 │                 ╭──────────────────────────────────────────────────────────────╮                 │
 │                 │                                                              │                 │
 │                 │ Delete pods/default/web-1?                                   │                 │
@@ -20,6 +18,8 @@ kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark      
 │                 │                      Cancel      Delete                      │                 │
 │                 │                                                              │                 │
 │                 ╰──────────────────────────────────────────────────────────────╯                 │
+│                                                                                                  │
+│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

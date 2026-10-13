@@ -62,14 +62,24 @@ type hint struct {
 	Text string
 }
 
-// dialog is a box over the body that has every key until it closes
+// dialog is a box over the screen that has every key until it closes
 // itself with closeDialogMsg.
 type dialog interface {
+	// Init is called when the root shows the dialog.
 	Init() tea.Cmd
 	Update(msg tea.Msg) (dialog, tea.Cmd)
-	// View draws the box, at most width cells wide. The root centres
-	// it.
-	View(width int) string
+	// View draws the box, at most width cells wide and height lines
+	// high. The root centres it over the whole screen.
+	View(width, height int) string
+	// Fits reports whether the box, drawn at most width cells wide,
+	// shows all its fields and buttons in height lines. The root does
+	// not open a dialog that does not fit, and closes one that no
+	// longer does.
+	Fits(width, height int) bool
+	// Drop is called instead of Init when the root does not open the
+	// dialog, and when it closes one that no longer fits: it releases
+	// what was held until the dialog opened.
+	Drop()
 }
 
 // The messages a view or a dialog sends the root.
@@ -78,8 +88,10 @@ type (
 	pushViewMsg struct{ v view }
 	// popViewMsg takes the top view off the stack. The last view stays.
 	popViewMsg struct{}
-	// flashMsg shows a line in the flash, in the colour of an error
-	// when err is set, until the next one or for 5 seconds.
+	// flashMsg shows a line in the flash for 5 seconds, or until the
+	// next one. With err set it is an error: in the colour of one,
+	// wrapped onto up to 4 lines, and shown until a key is pressed
+	// after its 5 seconds.
 	flashMsg struct {
 		text string
 		err  bool

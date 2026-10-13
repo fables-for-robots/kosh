@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -63,7 +64,14 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		r.w, r.h = msg.Width, msg.Height
 		r.prompt.resize(r.w)
-		return r, r.broadcast(msg)
+		cmd := r.broadcast(msg)
+		if r.dlg != nil && !r.dialogFits(r.dlg) {
+			// Closed, as Cancel would: nothing is done.
+			r.dlg.Drop()
+			r.dlg = nil
+			cmd = tea.Batch(cmd, flashErr(errors.New(dialogTextTooSmall)))
+		}
+		return r, cmd
 	case tea.KeyPressMsg:
 		return r, r.key(msg)
 	case tea.KeyReleaseMsg:
@@ -80,6 +88,10 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.flash.done(msg)
 		return r, nil
 	case openDialogMsg:
+		if !r.dialogFits(msg.d) {
+			msg.d.Drop()
+			return r, flashErr(errors.New(dialogTextTooSmall))
+		}
 		r.dlg = msg.d
 		return r, msg.d.Init()
 	case closeDialogMsg:
@@ -88,7 +100,7 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		return r, r.updateTop(msg)
 	case commandMsg:
-		return r, r.runCommand(msg.text, true)
+		return r, r.runCommand(msg.text, true, msg.literal)
 	case resolvedMsg:
 		return r, r.resolved(msg)
 	case useNamespaceMsg:
@@ -107,6 +119,7 @@ func (r *root) key(k tea.KeyPressMsg) tea.Cmd {
 	if s == "ctrl+c" {
 		return tea.Quit
 	}
+	r.flash.key()
 	if r.dlg != nil {
 		var cmd tea.Cmd
 		r.dlg, cmd = r.dlg.Update(k)
@@ -201,12 +214,26 @@ func (r *root) render() string {
 			h--
 		}
 		lines := block(top.View(r.w, h), r.w, h)
-		r.overlayDialog(lines, 0, h)
 		if r.prompt.open() {
 			lines = append(lines, r.prompt.line(r.w))
 		}
+		r.overlayDialog(lines)
 		return strings.Join(lines, "\n")
 	}
+	bodyTop := 0
+	if !r.noHeader {
+		bodyTop += headerHeight
+	}
+	if r.prompt.open() {
+		bodyTop++
+	}
+	// The lines of an error in the flash are taken from the body, which
+	// keeps its frame and a line inside it.
+	fl := r.flash.lines(r.w, min(flashMaxLines, r.h-bodyTop-1-3), r.e.now())
+	bodyH := r.h - bodyTop - 1 - len(fl)
+	// The body is drawn before the header, whose hints may depend on how
+	// the view was drawn (the help's on whether a column is cut).
+	body := r.body(bodyH)
 	var lines []string
 	if !r.noHeader {
 		lines = append(lines, r.header()...)
@@ -214,11 +241,10 @@ func (r *root) render() string {
 	if r.prompt.open() {
 		lines = append(lines, r.prompt.line(r.w))
 	}
-	bodyTop := len(lines)
-	bodyH := r.h - bodyTop - 2
-	lines = append(lines, r.body(bodyH)...)
-	r.overlayDialog(lines, bodyTop, bodyH)
-	lines = append(lines, r.crumbs(), r.flash.line(r.w, r.e.now()))
+	lines = append(lines, body...)
+	lines = append(lines, r.crumbs())
+	lines = append(lines, fl...)
+	r.overlayDialog(lines)
 	return strings.Join(lines, "\n")
 }
 
@@ -232,11 +258,13 @@ func (r *root) body(h int) []string {
 		title = cleanLine(top.Title())
 		inner = block(top.View(iw, ih), iw, ih)
 	} else {
-		var text string
+		var text []string
 		if r.startErr != nil {
-			text = styleError.Render(fit(cleanLine(r.startErr.Error()), iw))
+			for _, l := range wrapText(errorText(r.startErr.Error()), iw, ih) {
+				text = append(text, styleError.Render(fit(l, iw)))
+			}
 		}
-		inner = block(text, iw, ih)
+		inner = block(strings.Join(text, "\n"), iw, ih)
 	}
 	lines := make([]string, 0, h)
 	lines = append(lines, topBorder(title, w))
@@ -298,16 +326,27 @@ func block(s string, w, h int) []string {
 	return out
 }
 
+// dialogBoxWidth is the width a dialog is drawn in at most.
+func (r *root) dialogBoxWidth() int { return max(r.w-4, 1) }
+
+// dialogFits reports whether d can be shown on the screen: the screen is
+// not too small for the frame, and has the lines for d's fields and
+// buttons.
+func (r *root) dialogFits(d dialog) bool {
+	return r.w >= minWidth && r.h >= minHeight && d.Fits(r.dialogBoxWidth(), r.h)
+}
+
 // overlayDialog draws the dialog, when there is one, centred over the
-// h lines of lines from y.
-func (r *root) overlayDialog(lines []string, y, h int) {
+// whole screen, whose lines are lines: no taller than they are.
+func (r *root) overlayDialog(lines []string) {
+	h := len(lines)
 	if r.dlg == nil || h <= 0 {
 		return
 	}
-	boxW := max(r.w-4, 1)
-	box := strings.Split(r.dlg.View(boxW), "\n")
+	boxW := r.dialogBoxWidth()
+	box := strings.Split(r.dlg.View(boxW, h), "\n")
 	if len(box) > h {
-		box = box[:h]
+		box = box[len(box)-h:]
 	}
 	bw := 0
 	for i, l := range box {
@@ -315,7 +354,7 @@ func (r *root) overlayDialog(lines []string, y, h int) {
 		bw = max(bw, ansi.StringWidth(box[i]))
 	}
 	x := (r.w - bw) / 2
-	y += (h - len(box)) / 2
+	y := (h - len(box)) / 2
 	for i, l := range box {
 		at := y + i
 		if at < 0 || at >= len(lines) {
