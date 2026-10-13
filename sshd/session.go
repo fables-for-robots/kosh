@@ -89,6 +89,10 @@ type session struct {
 	// in is what the client sends, for whoever has the terminal. It is
 	// read from the channel from the moment the program starts.
 	in *input
+	// win is the session's window.
+	win *window
+	// raw writes to the session channel what it is given: ss does not.
+	raw io.Writer
 }
 
 // run gives the session its program, and ends it when the program ends.
@@ -99,6 +103,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	// connection stays: nothing would end the program then.
 	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput()}
 	win := s.windowOf(ss)
+	sess.win, sess.raw = win, rawWriter(ss)
 	go func() {
 		select {
 		case <-win.closed:
@@ -120,7 +125,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	started := false
 	if sess.ending() == "" {
 		m = makeModel(func() tea.Model {
-			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote, Exec: execNotBuilt})
+			return s.cfg.Model(Session{Context: ctx, Grant: sess.grant, Transport: c.transport, Remote: c.remote, Exec: sess.exec})
 		}, &sess.stopped, panicked)
 	}
 	if m != nil {
@@ -132,6 +137,8 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			// The channel is read by the session, and the program is
 			// given what is the program's: see input.
 			tea.WithInput(programInput{sess.in}),
+			// In place of the filter among MakeOptions.
+			tea.WithFilter(sess.filter),
 		)
 		p := tea.NewProgram(m, opts...)
 		if started = sess.start(p); started {
@@ -365,6 +372,10 @@ type window struct {
 
 	mu   sync.Mutex
 	size ssh.Window
+	// watcher is given a value, when it has none, with each change of
+	// size: it is the Resized of the command that has the terminal, or
+	// nil.
+	watcher chan struct{}
 }
 
 // ptyHandler is the library's PtyHandler: the library's emulated
@@ -387,6 +398,12 @@ func (s *Server) ptyHandler(emulate ssh.PtyHandler) ssh.PtyHandler {
 			for size := range sizes {
 				w.mu.Lock()
 				w.size = size
+				if w.watcher != nil {
+					select {
+					case w.watcher <- struct{}{}:
+					default:
+					}
+				}
 				w.mu.Unlock()
 				select {
 				case w.changed <- struct{}{}:
@@ -438,4 +455,37 @@ func (w *window) forward(ctx context.Context, p *tea.Program) {
 			p.Send(tea.WindowSizeMsg{Width: size.Width, Height: size.Height})
 		}
 	}
+}
+
+// watch returns a Terminal's Size and Resized for the turn of a command,
+// and what ends them. The program cannot tell the command of a size: it
+// takes no message while a command runs, and forward waits in Send with
+// the first change. So the command asks the window: size returns the
+// size now, and resized has a value when the size has changed since size
+// was last called, one however many changes there were. After stop
+// resized gets no more.
+func (w *window) watch() (size func() (width, height int), resized <-chan struct{}, stop func()) {
+	ch := make(chan struct{}, 1)
+	w.mu.Lock()
+	w.watcher = ch
+	w.mu.Unlock()
+	size = func() (int, int) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		// Under the lock a change is made under: the size returned is
+		// the one this value was for, or a later one.
+		select {
+		case <-ch:
+		default:
+		}
+		return w.size.Width, w.size.Height
+	}
+	stop = func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.watcher == ch {
+			w.watcher = nil
+		}
+	}
+	return size, ch, stop
 }

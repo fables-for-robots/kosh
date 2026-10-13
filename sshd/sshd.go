@@ -246,7 +246,10 @@ func (s *Server) sessionChannel(srv *ssh.Server, sc *gossh.ServerConn, nc gossh.
 		return
 	}
 	defer c.closeChannel()
-	ssh.DefaultSessionHandler(srv, sc, filteredChannel{nc}, ctx)
+	// The session finds the channel the library accepts in its context:
+	// see rawWriter.
+	a := &accepted{}
+	ssh.DefaultSessionHandler(srv, sc, filteredChannel{nc, a}, channelContext{ctx, a})
 }
 
 // keyAccepted is the public key handler: a key is accepted when the key

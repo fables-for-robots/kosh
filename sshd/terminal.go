@@ -2,17 +2,191 @@ package sshd
 
 import (
 	"context"
-	"errors"
 	"io"
 	"sync"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/ssh"
+	gossh "golang.org/x/crypto/ssh"
 )
 
-// execNotBuilt is Session.Exec until the hand-over is built: done is told
-// that it is not.
-func execNotBuilt(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
-	return func() tea.Msg { return done(errors.New("not implemented")) }
+// The hand-over of a session's terminal to a command, and back.
+//
+// Bubble Tea's own hand-over, tea.Exec, does the terminal's screens and
+// modes, and is used for them: it leaves the alternate screen and the
+// program's modes, runs the command in the program's event loop, and
+// afterwards sets the modes again and draws the whole frame. What it
+// cannot do over an SSH channel is hand over the input (see input), and
+// its output is the session's, which translates line feeds. So the
+// command is given neither of the two that Bubble Tea offers it: it
+// reads a reader of the session's input that is its own for its turn,
+// and writes to the channel itself.
+
+// exec is Session.Exec.
+func (sess *session) exec(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		// From here on what the client sends is the command's, and the
+		// program's reader is given the mark and its end.
+		in, drained, told := sess.in.give()
+		if in == nil {
+			return done(ErrTerminalBusy)
+		}
+		// The mark arrives when the model has every key that was read
+		// before the hand-over. It does not arrive when the reader was
+		// in the middle of a paste or of an escape sequence: the mark is
+		// then a part of that.
+		wait := time.NewTimer(drainWait)
+		defer wait.Stop()
+		select {
+		case <-drained:
+		case <-wait.C:
+		case <-sess.ctx.Done():
+		}
+		// The reader that was told its end reads no more. One that has
+		// not been told yet, because the program was slow to take what
+		// it had read, would read next to the reader Bubble Tea starts
+		// after the command: two readers of one terminal.
+		select {
+		case <-told:
+		case <-sess.ctx.Done():
+		}
+		return tea.Exec(&turn{sess: sess, run: run, in: in}, done)()
+	}
+}
+
+// turn is the time one command has the terminal, as a tea.ExecCommand:
+// Bubble Tea calls Run in the program's event loop when it has released
+// the terminal, and takes the terminal back when Run has returned.
+type turn struct {
+	sess *session
+	run  func(context.Context, Terminal) error
+	in   *commandInput
+}
+
+// SetStdin, SetStdout and SetStderr are given the program's input and
+// output, and the standard error of kosh. The command gets none of
+// them: see Terminal.
+func (t *turn) SetStdin(io.Reader) {}
+
+// SetStdout is SetStdin for the output.
+func (t *turn) SetStdout(io.Writer) {}
+
+// SetStderr is SetStdin for the error stream.
+func (t *turn) SetStderr(io.Writer) {}
+
+// Run calls the command with the terminal, and returns what it
+// returned. When Run returns the turn is over: the command's reader is
+// told io.EOF, its writer is closed, and the input is the program's, for
+// the reader Bubble Tea starts next.
+func (t *turn) Run() error {
+	sess := t.sess
+	defer sess.in.takeBack(t.in)
+	out := &gate{w: sess.raw}
+	defer out.close()
+	ctx, cancel := context.WithCancel(sess.ctx)
+	defer cancel()
+	size, resized, unwatch := sess.win.watch()
+	defer unwatch()
+	return t.run(ctx, Terminal{In: t.in, Out: out, Size: size, Resized: resized})
+}
+
+// gate is the writer of one command's turn: it passes what it is given
+// on to w, and after close it passes nothing.
+type gate struct {
+	mu     sync.Mutex
+	w      io.Writer
+	closed bool
+}
+
+// Write writes p to w, or fails with io.ErrClosedPipe after close.
+func (g *gate) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return 0, io.ErrClosedPipe
+	}
+	return g.w.Write(p)
+}
+
+// close closes the gate. It waits for a Write that is under way: when
+// it returns nothing more of the command's reaches the terminal.
+func (g *gate) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+}
+
+// filter is the program's filter. It does what the filter of wish did,
+// which it replaces: a suspension becomes a resumption, since there is
+// no process to suspend. And it takes drainMark out, whoever sent it:
+// the model is never given it.
+func (sess *session) filter(_ tea.Model, msg tea.Msg) tea.Msg {
+	switch msg := msg.(type) {
+	case tea.SuspendMsg:
+		return tea.ResumeMsg{}
+	case tea.ModeReportMsg:
+		if msg.Mode != nil && msg.Mode.Mode() == drainMode {
+			sess.in.markSeen()
+			return nil
+		}
+	}
+	return msg
+}
+
+// The session channel itself.
+
+// channelKey is the key under which a session channel's context has the
+// channel's accepted.
+type channelKey struct{}
+
+// accepted holds the channel that filteredChannel accepted.
+type accepted struct {
+	mu sync.Mutex
+	ch gossh.Channel
+}
+
+func (a *accepted) set(ch gossh.Channel) {
+	a.mu.Lock()
+	a.ch = ch
+	a.mu.Unlock()
+}
+
+// channelContext is a connection's context for one of its session
+// channels. The library keeps the channel it accepts to itself, and
+// gives the session the context it was given: through this one the
+// session's handler finds the channel. Everything else, the values that
+// are set too, is the connection's context.
+type channelContext struct {
+	ssh.Context
+	a *accepted
+}
+
+// Value returns the channel's accepted for channelKey, and the
+// connection's value for any other key.
+func (c channelContext) Value(key any) any {
+	if _, ok := key.(channelKey); ok {
+		return c.a
+	}
+	return c.Context.Value(key)
+}
+
+// rawWriter returns the session channel of ss, which writes what it is
+// given. ss writes through the library's emulated terminal, which makes
+// every line feed a carriage return and a line feed: right for the
+// program, whose renderer counts on it, and wrong for anything that
+// draws by itself. A session whose channel is not known, which there is
+// none of since every session channel comes through sessionChannel, gets
+// ss.
+func rawWriter(ss ssh.Session) io.Writer {
+	if a, ok := ss.Context().Value(channelKey{}).(*accepted); ok {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.ch != nil {
+			return a.ch
+		}
+	}
+	return ss
 }
 
 // The input of a session.
@@ -42,6 +216,8 @@ const (
 const (
 	drainMode = 28657
 	drainMark = "\x1b[?28657;0$y"
+	// drainWait is how long a hand-over waits for the mark to arrive.
+	drainWait = 250 * time.Millisecond
 )
 
 // input is what the client sends on the session channel. One goroutine,

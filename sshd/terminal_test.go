@@ -28,7 +28,10 @@ type handover struct {
 	run func(context.Context, Terminal) error
 	// atStart makes the model ask for the hand-over in Init.
 	atStart bool
-	// blocked gets a value when "b" was pressed and Update waits for a
+	// ask, when it is not nil, makes the model ask for the hand-over
+	// when it has a value: a hand-over that no key asks for.
+	ask chan struct{}
+	// blocked gets a value when "%" was pressed and Update waits for a
 	// value on release.
 	blocked chan struct{}
 	release chan struct{}
@@ -40,6 +43,7 @@ type handover struct {
 	sizes  int             // sizes the model was given
 	w, h   int             // the last of them
 	began  int             // calls of run
+	cmd    []byte          // what echo read
 	ended  []error         // what the model's done was told
 	begins []time.Time     // when each call of run began
 	wake   chan<- struct{} // has a value put on it whenever something above changes
@@ -99,7 +103,7 @@ func (hv *handover) typed() string {
 type handoverDone struct{ err error }
 
 // handoverModel draws a full screen. "!" hands the terminal to the
-// test's run, "@" asks for that twice at once, "b" makes Update wait for
+// test's run, "@" asks for that twice at once, "%" makes Update wait for
 // the test, "q" quits.
 type handoverModel struct {
 	s    Session
@@ -119,9 +123,21 @@ func (m handoverModel) exec() tea.Cmd {
 	}, func(err error) tea.Msg { return handoverDone{err} })
 }
 
+type handoverAsked struct{}
+
 func (m handoverModel) Init() tea.Cmd {
-	if m.hv.atStart {
+	switch {
+	case m.hv.atStart:
 		return m.exec()
+	case m.hv.ask != nil:
+		return func() tea.Msg {
+			select {
+			case <-m.hv.ask:
+				return handoverAsked{}
+			case <-m.s.Context.Done():
+				return nil
+			}
+		}
 	}
 	return nil
 }
@@ -136,6 +152,8 @@ func (m handoverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		hv.note(func() { hv.marks++ })
 	case tea.PasteMsg:
 		hv.note(func() { hv.pastes = append(hv.pastes, msg.Content) })
+	case handoverAsked:
+		return m, m.exec()
 	case handoverDone:
 		m.done++
 		hv.note(func() { hv.ended = append(hv.ended, msg.err) })
@@ -147,7 +165,7 @@ func (m handoverModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.exec()
 		case "@":
 			return m, tea.Batch(m.exec(), m.exec())
-		case "b":
+		case "%":
 			hv.blocked <- struct{}{}
 			<-hv.release
 		case "q":
@@ -367,7 +385,7 @@ func TestInputIsBounded(t *testing.T) {
 
 	// The program does not read: its Update waits, and its read loop
 	// waits for it with the key after.
-	tm.press("b")
+	tm.press("%")
 	select {
 	case <-hv.blocked:
 	case <-time.After(waitTime):
@@ -441,4 +459,562 @@ func TestInputIsBounded(t *testing.T) {
 	if n := buffered(); n > inputBuffer {
 		t.Errorf("the server holds %d bytes of input, more than its bound of %d", n, inputBuffer)
 	}
+}
+
+// What gets the terminal.
+
+// endMark is the byte that ends echo.
+const endMark = "#"
+
+// echo is a command that reads its input byte by byte, so that it takes
+// nothing after its end mark, and writes each byte back.
+func (hv *handover) echo(_ context.Context, t Terminal) error {
+	b := make([]byte, 1)
+	for {
+		n, err := t.In.Read(b)
+		if n > 0 {
+			hv.note(func() { hv.cmd = append(hv.cmd, b[0]) })
+			if _, err := t.Out.Write(b[:n]); err != nil {
+				return err
+			}
+			if string(b[:n]) == endMark {
+				return nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// held is a turn that a test has: the test does with the terminal what
+// a command would, and ends the turn with finish.
+type held struct {
+	ctx    context.Context
+	t      Terminal
+	finish chan error
+}
+
+// hold returns a command that gives its turn to the test, and returns
+// when the test finishes the turn or the turn's context is done.
+func hold(turns chan held) func(context.Context, Terminal) error {
+	return func(ctx context.Context, t Terminal) error {
+		h := held{ctx, t, make(chan error, 1)}
+		turns <- h
+		select {
+		case err := <-h.finish:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// next waits for the turn of a command made with hold.
+func next(t *testing.T, turns chan held) held {
+	t.Helper()
+	select {
+	case h := <-turns:
+		return h
+	case <-time.After(longWait):
+		t.Fatal("no command was given the terminal")
+		return held{}
+	}
+}
+
+// startHandover starts a server whose sessions have hv's model, and a
+// session on a terminal of 80 by 24 that has drawn its first frame.
+func startHandover(t *testing.T, hv *handover, opts ...option) (*harness, *term) {
+	t.Helper()
+	h := handoverHarness(t, hv, opts...)
+	tm := openTerm(t, h.dial(h.key("ann", false), "u"))
+	if !hv.atStart {
+		tm.waitFor("LASTLINE")
+	}
+	return h, tm
+}
+
+// The bytes typed in each phase of a cycle of TestHandoverLosesNothing;
+// no byte is in two of them.
+const (
+	bytesDuring  = "klmn"     // right after the key that asks for the hand-over
+	bytesCommand = "ABCDEFGH" // once the command has begun
+	bytesReturn  = "wyzv"     // right after the command's end mark
+	bytesProgram = "01234567" // once the model has been told that the command ended
+)
+
+// handoverVariant is how TestHandoverLosesNothing types.
+type handoverVariant struct {
+	name string
+	// pause is the time between two bytes.
+	pause time.Duration
+	// during types bytesDuring and bytesReturn too, while the terminal
+	// changes hands.
+	during bool
+	// procs, when it is not 0, is GOMAXPROCS for the variant.
+	procs int
+}
+
+// TestHandoverLosesNothing hands the terminal over and takes it back,
+// with the client typing across both seams, one byte per SSH write. In
+// every cycle each byte went to the one it was meant for, once, in the
+// order typed: to the command what was typed once it had begun, the
+// first byte included; to the model what was typed once it knew of the
+// command's end, the first key included. What is typed while the
+// terminal changes hands goes to the program up to some byte and to the
+// other from that byte on, and none of it is lost either.
+func TestHandoverLosesNothing(t *testing.T) {
+	const cycles = 200
+	variants := []handoverVariant{
+		{name: "no pause"},
+		{name: "a millisecond between bytes", pause: time.Millisecond},
+		{name: "typing while the terminal changes hands", during: true},
+		{name: "typing while the terminal changes hands, a millisecond between bytes", during: true, pause: time.Millisecond},
+		{name: "GOMAXPROCS=1", during: true, procs: 1},
+	}
+	for _, v := range variants {
+		t.Run(v.name, func(t *testing.T) {
+			if v.procs != 0 {
+				before := runtime.GOMAXPROCS(v.procs)
+				defer runtime.GOMAXPROCS(before)
+			}
+			hv := newHandover(nil)
+			hv.run = hv.echo
+			_, tm := startHandover(t, hv)
+			typeBytes := func(s string) {
+				for i := range len(s) {
+					tm.press(s[i : i+1])
+					if v.pause > 0 {
+						time.Sleep(v.pause)
+					}
+				}
+			}
+			var (
+				handover, handoverMax time.Duration
+				duringToProgram       int // of bytesDuring
+				returnToCommand       int // of bytesReturn
+			)
+			for i := 1; i <= cycles; i++ {
+				hv.note(func() { hv.keys, hv.cmd = nil, nil })
+				sent := "!"
+				asked := time.Now()
+				tm.press("!")
+				if v.during {
+					typeBytes(bytesDuring)
+					sent += bytesDuring
+				}
+				hv.wait(t, fmt.Sprintf("cycle %d: the command has begun", i), func() bool { return hv.began == i })
+				hv.mu.Lock()
+				d := hv.begins[i-1].Sub(asked)
+				hv.mu.Unlock()
+				handover += d
+				handoverMax = max(handoverMax, d)
+
+				typeBytes(bytesCommand)
+				tm.press(endMark)
+				sent += bytesCommand + endMark
+				if v.during {
+					typeBytes(bytesReturn)
+					sent += bytesReturn
+				}
+				hv.wait(t, fmt.Sprintf("cycle %d: the model knows that the command ended", i), func() bool { return len(hv.ended) == i })
+				typeBytes(bytesProgram)
+				sent += bytesProgram
+
+				// Every byte has arrived, at the program or at the command.
+				hv.wait(t, fmt.Sprintf("cycle %d: every byte of %q has arrived", i, sent), func() bool {
+					return len(hv.keys)+len(hv.cmd) >= len(sent)
+				})
+				hv.mu.Lock()
+				program, command := strings.Join(hv.keys, ""), string(hv.cmd)
+				hv.mu.Unlock()
+
+				// What the program must have: the key that asked; of the
+				// bytes typed during the hand-over the first so many; of
+				// those typed during the return the last so many; all of
+				// those typed after it. The command must have the rest.
+				during, returned := "", ""
+				if v.during {
+					during, returned = bytesDuring, bytesReturn
+				}
+				k := 0
+				for k < len(during) && strings.HasPrefix(program, "!"+during[:k+1]) {
+					k++
+				}
+				j := 0
+				for j < len(returned) && !strings.HasSuffix(program, returned[j:]+bytesProgram) {
+					j++
+				}
+				wantProgram := "!" + during[:k] + returned[j:] + bytesProgram
+				wantCommand := during[k:] + bytesCommand + endMark + returned[:j]
+				if program != wantProgram || command != wantCommand {
+					t.Fatalf("cycle %d: typed %q\nthe program got %q\nthe command got %q\nwhich is not each byte once, in order, where it was meant to go", i, sent, program, command)
+				}
+				duringToProgram += k
+				returnToCommand += j
+			}
+			t.Logf("%d cycles, %d bytes each: none lost, none twice, none out of order", cycles, len("!")+len(bytesCommand)+len(endMark)+len(bytesProgram)+map[bool]int{true: len(bytesDuring) + len(bytesReturn)}[v.during])
+			if v.during {
+				n := cycles * len(bytesDuring)
+				t.Logf("typed during the hand-over: %d bytes, %d to the program, %d to the command", n, duringToProgram, n-duringToProgram)
+				n = cycles * len(bytesReturn)
+				t.Logf("typed during the return: %d bytes, %d to the command, %d to the program", n, returnToCommand, n-returnToCommand)
+				t.Logf("from the key to the command's beginning, the typing included: mean %v, at most %v",
+					(handover / cycles).Round(time.Microsecond), handoverMax.Round(time.Microsecond))
+			} else {
+				t.Logf("from the key to the command's beginning: mean %v, at most %v",
+					(handover / cycles).Round(time.Microsecond), handoverMax.Round(time.Microsecond))
+			}
+		})
+	}
+}
+
+// TestHandoverIsFast guards against the half second that Bubble Tea
+// waits for a read loop that does not end: the time from the key to the
+// command's beginning.
+func TestHandoverIsFast(t *testing.T) {
+	const cycles = 50
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	_, tm := startHandover(t, hv)
+	var total time.Duration
+	for i := 1; i <= cycles; i++ {
+		asked := time.Now()
+		tm.press("!")
+		hv.wait(t, "the command has begun", func() bool { return hv.began == i })
+		hv.mu.Lock()
+		total += hv.begins[i-1].Sub(asked)
+		hv.mu.Unlock()
+		tm.press(endMark)
+		hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == i })
+	}
+	mean := total / cycles
+	t.Logf("from the key to the command's beginning: mean %v over %d hand-overs", mean.Round(time.Microsecond), cycles)
+	if mean >= 50*time.Millisecond {
+		t.Errorf("a hand-over takes %v on average, want less than 50ms", mean)
+	}
+}
+
+// bareLineFeeds returns how many line feeds of s have no carriage return
+// before them, and how many line feeds s has.
+func bareLineFeeds(s string) (bare, all int) {
+	for i := range len(s) {
+		if s[i] == '\n' {
+			all++
+			if i == 0 || s[i-1] != '\r' {
+				bare++
+			}
+		}
+	}
+	return bare, all
+}
+
+// TestCommandOutputIsRaw writes every byte there is, and bare line
+// feeds, to the command's terminal: the client receives them as they
+// were written. What the program writes before and after still has
+// every line feed made a carriage return and a line feed, which its
+// renderer counts on.
+func TestCommandOutputIsRaw(t *testing.T) {
+	payload := []byte("a\nb\n")
+	for b := range 256 {
+		payload = append(payload, byte(b))
+	}
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+	before := tm.stdout.String()
+
+	tm.press("!")
+	turn := next(t, turns)
+	if n, err := turn.t.Out.Write(payload); n != len(payload) || err != nil {
+		t.Fatalf("writing to the command's terminal: %d, %v", n, err)
+	}
+	tm.waitFor(string(payload))
+	turn.finish <- nil
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.waitFor("done:1")
+	out := tm.stdout.String()
+
+	if n := strings.Count(out, string(payload)); n != 1 {
+		t.Errorf("the client received what the command wrote %d times", n)
+	}
+	at := strings.Index(out, string(payload))
+	after := out[at+len(payload):]
+	for what, s := range map[string]string{"before the command": before, "after the command": after} {
+		bare, all := bareLineFeeds(s)
+		if all == 0 || bare != 0 {
+			t.Errorf("the program's output %s has %d line feeds, %d of them without a carriage return; want some, and none bare", what, all, bare)
+		}
+	}
+}
+
+// screenOf returns the screen of an 80 by 24 terminal that was sent what
+// the session has written.
+func screenOf(tm *term) *screen {
+	return feed(80, 24, tm.stdout.String())
+}
+
+// TestScreenAfterTheReturn lets a command scribble on the terminal:
+// after the return the screen is the model's frame, every row of it, and
+// the model has done nothing for that.
+func TestScreenAfterTheReturn(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+	want := strings.Join(handoverFrame(0, 80, 24), "\n")
+	eventually(t, "the model's first frame is on the screen", func() bool { return screenOf(tm).String() == want })
+
+	tm.press("!")
+	turn := next(t, turns)
+	// On the normal screen, where the command is: lines that scroll,
+	// and a cursor left somewhere.
+	scribble := strings.Repeat("the command was here\r\n", 30) + "\x1b[5;7Hand here"
+	if _, err := io.WriteString(turn.t.Out, scribble); err != nil {
+		t.Fatal(err)
+	}
+	tm.waitFor("and here")
+	if got := screenOf(tm).String(); !strings.Contains(got, "the command was here") || strings.Contains(got, "LASTLINE") {
+		t.Errorf("while the command has the terminal the screen is not the command's:\n%s", got)
+	}
+	turn.finish <- nil
+
+	want = strings.Join(handoverFrame(1, 80, 24), "\n")
+	eventually(t, "the model's frame is on the screen after the return", func() bool { return screenOf(tm).String() == want })
+	if got := screenOf(tm).String(); got != want {
+		t.Errorf("the screen after the return:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestCommandSizes changes the window while a command has the terminal.
+func TestCommandSizes(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	h, tm := startHandover(t, hv)
+	sess := h.onlySession()
+	// windowIs waits until the server knows of a change, without asking
+	// as the command does.
+	windowIs := func(w, hh int) {
+		t.Helper()
+		eventuallyWithin(t, longWait, fmt.Sprintf("the window is %dx%d", w, hh), func() bool {
+			sess.win.mu.Lock()
+			defer sess.win.mu.Unlock()
+			return sess.win.size.Width == w && sess.win.size.Height == hh
+		})
+	}
+	change := func(w, hh int) {
+		t.Helper()
+		if err := tm.sess.WindowChange(hh, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resized := func(turn held) bool {
+		select {
+		case <-turn.t.Resized:
+			return true
+		default:
+			return false
+		}
+	}
+	wantSize := func(turn held, w, hh int) {
+		t.Helper()
+		if gw, gh := turn.t.Size(); gw != w || gh != hh {
+			t.Errorf("Size returns %dx%d, want %dx%d", gw, gh, w, hh)
+		}
+	}
+
+	// A change before the command is not the command's to hear of.
+	change(90, 25)
+	hv.wait(t, "the model has 90x25", func() bool { return hv.w == 90 && hv.h == 25 })
+
+	tm.press("!")
+	turn := next(t, turns)
+	if resized(turn) {
+		t.Error("Resized has a value at the start of the turn")
+	}
+	wantSize(turn, 90, 25)
+
+	// One change: one value, and the new size.
+	change(100, 30)
+	select {
+	case <-turn.t.Resized:
+	case <-time.After(longWait):
+		t.Fatal("Resized has no value after the window changed")
+	}
+	wantSize(turn, 100, 30)
+	if resized(turn) {
+		t.Error("Resized has a second value for one change")
+	}
+
+	// Three changes while the command does not look: one value.
+	change(110, 35)
+	change(120, 40)
+	change(130, 45)
+	windowIs(130, 45)
+	if !resized(turn) {
+		t.Error("Resized has no value after three changes")
+	}
+	if resized(turn) {
+		t.Error("Resized has more than one value after three changes")
+	}
+	wantSize(turn, 130, 45)
+
+	// A change that Size has told the command of already is not news.
+	change(140, 50)
+	windowIs(140, 50)
+	wantSize(turn, 140, 50)
+	if resized(turn) {
+		t.Error("Resized has a value for a size that Size has returned already")
+	}
+
+	// The program is given no size while the command runs, and has the
+	// last one after it.
+	turn.finish <- nil
+	hv.wait(t, "the model has the size that holds after the turn", func() bool { return hv.w == 140 && hv.h == 50 })
+
+	// After the turn the command hears of no change.
+	change(80, 24)
+	hv.wait(t, "the model has 80x24", func() bool { return hv.w == 80 && hv.h == 24 })
+	if resized(turn) {
+		t.Error("Resized has a value for a change after the turn")
+	}
+}
+
+// TestReaderThatOutlivesItsTurn leaves a goroutine of the command in
+// In.Read when the command returns, as a copier of a stream is left: it
+// is told io.EOF, and takes nothing of what the client types then. What
+// the command writes after its turn is refused.
+func TestReaderThatOutlivesItsTurn(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+
+	tm.press("!")
+	turn := next(t, turns)
+	left := readOnce(turn.t.In)
+	select {
+	case got := <-left:
+		t.Fatalf("the command read %q, %v when the client had sent nothing", got.data, got.err)
+	default:
+	}
+	turn.finish <- nil
+	wantRead(t, "the reader that outlived its turn", left, "", io.EOF)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+
+	tm.press("x")
+	hv.wait(t, "the model has the key typed after the return", func() bool { return strings.HasSuffix(strings.Join(hv.keys, ""), "x") })
+	wantRead(t, "the command's reader after the client typed", readOnce(turn.t.In), "", io.EOF)
+
+	before := tm.stdout.String()
+	if n, err := io.WriteString(turn.t.Out, "LATEWRITE"); n != 0 || err != io.ErrClosedPipe {
+		t.Errorf("a write after the turn: %d, %v; want 0, io.ErrClosedPipe", n, err)
+	}
+	// Something of the program's, after which the late write would be
+	// there if it had been let through.
+	if err := tm.sess.WindowChange(30, 100); err != nil {
+		t.Fatal(err)
+	}
+	tm.waitFor("size:100x30")
+	if out := tm.stdout.String()[len(before):]; strings.Contains(out, "LATEWRITE") {
+		t.Error("the client received what the command wrote after its turn")
+	}
+}
+
+// TestTheMarkIsSwallowed has a client send the mark that ends the
+// program's reading before a hand-over: the model is not given it, the
+// keys around it arrive, and a hand-over after it works.
+func TestTheMarkIsSwallowed(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	_, tm := startHandover(t, hv)
+
+	// A report of another mode is the model's, as it was.
+	tm.press("\x1b[?2026;2$y")
+	hv.wait(t, "the model has the report of a mode that is not the mark's", func() bool { return hv.marks == 1 })
+
+	tm.press("a" + drainMark + "b")
+	hv.wait(t, "the model has the keys around the mark", func() bool { return strings.Join(hv.keys, "") == "ab" })
+	if hv.marks != 1 {
+		t.Errorf("the model was given the mark")
+	}
+
+	tm.press("!")
+	hv.wait(t, "the command has begun", func() bool { return hv.began == 1 })
+	tm.press("A" + endMark)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.press("c")
+	hv.wait(t, "the model has the key typed after the return", func() bool { return strings.Join(hv.keys, "") == "ab!c" })
+	hv.mu.Lock()
+	defer hv.mu.Unlock()
+	if string(hv.cmd) != "A"+endMark || hv.marks != 1 || hv.ended[0] != nil {
+		t.Errorf("the command read %q and returned %v, the model was given %d mode reports", hv.cmd, hv.ended[0], hv.marks)
+	}
+}
+
+// TestHandoverAtTheStart asks for the hand-over in the model's Init,
+// before the client's terminal has answered what Bubble Tea asks it at
+// the start. Nothing special is done for that: an answer that arrives
+// after the hand-over is the command's, like every byte, and the program
+// goes without it.
+func TestHandoverAtTheStart(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	hv.atStart = true
+	_, tm := startHandover(t, hv)
+	hv.wait(t, "the command has begun", func() bool { return hv.began == 1 })
+	// What the program asked the terminal: whether it has the mode of
+	// synchronized output.
+	const query, reply = "\x1b[?2026$p", "\x1b[?2026;2$y"
+	tm.waitFor(query)
+	tm.press(reply)
+	tm.press(endMark)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.press("x")
+	hv.wait(t, "the model has the key typed after the return", func() bool { return len(hv.keys) > 0 })
+	tm.waitFor("done:1")
+
+	hv.mu.Lock()
+	defer hv.mu.Unlock()
+	if string(hv.cmd) != reply+endMark {
+		t.Errorf("the command read %q, want the terminal's answer and the end mark, %q", hv.cmd, reply+endMark)
+	}
+	if strings.Join(hv.keys, "") != "x" || hv.marks != 0 {
+		t.Errorf("the model was given the keys %q and %d mode reports, want the key x and no report", hv.keys, hv.marks)
+	}
+}
+
+// TestHandoverInTheMiddleOfAPaste asks for the hand-over when the
+// program's reader has the start of a paste and not its end: the mark
+// cannot come out of that reader, and the hand-over goes on without it
+// after drainWait. From then on the client's bytes are the command's.
+func TestHandoverInTheMiddleOfAPaste(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	hv.ask = make(chan struct{}, 1)
+	_, tm := startHandover(t, hv)
+
+	// One SSH write, so one read of the program's reader: when the model
+	// has the key, the reader has the start of the paste.
+	tm.press("z\x1b[200~pasted")
+	hv.wait(t, "the model has the key before the paste", func() bool { return len(hv.keys) == 1 })
+
+	asked := time.Now()
+	hv.ask <- struct{}{}
+	hv.wait(t, "the command has begun", func() bool { return hv.began == 1 })
+	hv.mu.Lock()
+	took := hv.begins[0].Sub(asked)
+	hv.mu.Unlock()
+	if took < drainWait {
+		t.Errorf("the hand-over took %v: it did not wait %v for the mark, so the mark came out", took, drainWait)
+	}
+	tm.press("AB" + endMark)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.press("c")
+	hv.wait(t, "the model has the key typed after the return", func() bool { return strings.HasSuffix(strings.Join(hv.keys, ""), "c") })
+
+	hv.mu.Lock()
+	defer hv.mu.Unlock()
+	if string(hv.cmd) != "AB"+endMark || hv.marks != 0 {
+		t.Errorf("the command read %q, the model was given %d mode reports", hv.cmd, hv.marks)
+	}
+	t.Logf("the hand-over took %v; of the paste that did not end the model was given the keys %q and the pastes %q", took.Round(time.Millisecond), hv.keys, hv.pastes)
 }
