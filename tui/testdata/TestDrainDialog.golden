@@ -1,0 +1,30 @@
+Key:     alice@laptop   <shift-n> Sort Name     </> Filter        <e> Edit
+Cluster: v1.33.1        <shift-a> Sort Age      <space> Mark      <c> Cordon
+kosh:    v0.1.0         <shift-o> Sort Column   <shift-j> Owner   <u> Uncordon
+                        <ctrl-w> Wide           <?> Help          <r> Drain
+                        <ctrl-z> Faults         <ctrl-d> Delete
+
+┌───────────────────────────────────────── Nodes(all)[2] ──────────────────────────────────────────┐
+│NAME↑  AGE                                                                                        │
+│n1      1h                                                                                        │
+│n2      1h                                                                                        │
+│                 ╭──────────────────────────────────────────────────────────────╮                 │
+│                 │                                                              │                 │
+│                 │ Drain nodes/n1?                                              │                 │
+│                 │                                                              │                 │
+│                 │ ▸ Grace Period          -1                                   │                 │
+│                 │   Timeout               5s                                   │                 │
+│                 │   Ignore DaemonSets     [ ]                                  │                 │
+│                 │   Delete EmptyDir Data  [ ]                                  │                 │
+│                 │   Force                 [ ]                                  │                 │
+│                 │   Disable Eviction      [ ]                                  │                 │
+│                 │                                                              │                 │
+│                 │                      Cancel      Drain                       │                 │
+│                 │                                                              │                 │
+│                 ╰──────────────────────────────────────────────────────────────╯                 │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+<nodes>
+

@@ -18,9 +18,9 @@ kosh:    v0.1.0
 │<?>       Help            <ctrl-c> Quit                                                           │
 │<l>       Logs                                                                                    │
 │<p>       Logs Previous                                                                           │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
+│<ctrl-d>  Delete                                                                                  │
+│<e>       Edit                                                                                    │
+│<ctrl-k>  Kill                                                                                    │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
