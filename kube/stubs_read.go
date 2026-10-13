@@ -5,16 +5,8 @@ import (
 	"errors"
 )
 
-func (s *session) YAML(ctx context.Context, ref ObjectRef, managedFields bool) (string, error) {
-	return "", errors.New("not implemented")
-}
-
 func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
 	return "", errors.New("not implemented")
-}
-
-func (s *session) SecretData(ctx context.Context, ref ObjectRef) ([]SecretEntry, error) {
-	return nil, errors.New("not implemented")
 }
 
 func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (LogStream, error) {
