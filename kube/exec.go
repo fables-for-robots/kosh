@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unicode"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,25 +23,96 @@ import (
 	"k8s.io/streaming/pkg/httpstream"
 )
 
-// execMaxReason is the longest reason, in bytes, that ErrExecNotStarted
-// is wrapped around.
-const execMaxReason = 1 << 10
+const (
+	// execMaxReason is the longest reason, in bytes, that
+	// ErrExecNotStarted is wrapped around.
+	execMaxReason = 1 << 10
+	// execMaxLogged is the most the log holds, in bytes, of the
+	// container's name and of the command's words together.
+	execMaxLogged = 1 << 10
+)
 
 // Exec begins as every action does; checks the pod's reference, the
 // container's name and the command; and runs the command on the API's
 // exec stream with a terminal, over WebSocket alone: kubectl's fallback
 // to SPDY would turn the API's typed refusals into plain text.
-func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (res ExecResult, err error) {
+//
+// It is logged twice: when it starts, with the container and the
+// command, and when it ends, with how. Nothing of what passes on the
+// terminal is logged. A call that the checks refuse is logged once, as
+// the action's failure.
+func (s *session) Exec(ctx context.Context, pod ObjectRef, opts ExecOptions) (ExecResult, error) {
 	ctx, release, err := s.begin(ctx, actExec, pod)
 	if err != nil {
 		return ExecResult{}, err
 	}
 	defer release()
+	container := slog.String("container", logText(opts.Container, execMaxLogged))
 	if err := s.checkExec(pod, opts); err != nil {
-		s.logAction(ctx, actExec, pod, err, slog.String("phase", "end"))
+		s.logAction(ctx, actExec, pod, err, slog.String("phase", "end"), container, slog.Bool("started", false))
 		return ExecResult{}, err
 	}
-	return s.exec(ctx, pod, opts)
+	s.logAction(ctx, actExec, pod, nil, slog.String("phase", "start"), container,
+		slog.Any("command", logWords(opts.Command, execMaxLogged)))
+	began := time.Now()
+	res, err := s.exec(ctx, pod, opts)
+	attrs := []slog.Attr{slog.String("phase", "end"), container,
+		slog.Duration("duration", time.Since(began)), slog.Bool("started", res.Started)}
+	if err == nil {
+		attrs = append(attrs, slog.Int("status", res.Status))
+	}
+	s.logAction(ctx, actExec, pod, nil, append(attrs, execLogged(err)...)...)
+	return res, err
+}
+
+// execLogged is how the end of an Exec logs its error, in words that
+// hold nothing of the error's text, which may be a webhook's or the
+// runtime's and quote the command: the session's end as
+// ended="the session ended"; ErrExecNotStarted as itself, without the
+// runtime's reason; the caller's context's end as its error; an API
+// error as its reason and code; any other as "exec failed".
+func execLogged(err error) []slog.Attr {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errSessionEnded):
+		return []slog.Attr{slog.String("ended", "the session ended")}
+	case errors.Is(err, ErrExecNotStarted):
+		return []slog.Attr{slog.String("error", ErrExecNotStarted.Error())}
+	case errors.Is(err, context.Canceled):
+		return []slog.Attr{slog.String("error", context.Canceled.Error())}
+	case errors.Is(err, context.DeadlineExceeded):
+		return []slog.Attr{slog.String("error", context.DeadlineExceeded.Error())}
+	}
+	return []slog.Attr{slog.String("error", loggableError(actExec, err).Error())}
+}
+
+// logWords returns words as the log holds them: each cleaned by
+// logText, and all of them cut to max bytes together.
+func logWords(words []string, max int) []string {
+	out := make([]string, 0, len(words))
+	for _, w := range words {
+		if max <= 0 {
+			break
+		}
+		w = logText(w, max)
+		out = append(out, w)
+		max -= len(w)
+	}
+	return out
+}
+
+// logText returns s as the log holds it: without control characters,
+// with U+FFFD for what is not UTF-8, cut to max bytes after a whole
+// character.
+func logText(s string, max int) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+	return cutText(s, max)
 }
 
 // checkExec refuses what Exec cannot ask the API for: a reference that

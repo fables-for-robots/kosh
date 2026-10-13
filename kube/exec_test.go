@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -87,7 +89,6 @@ func (f *execFixture) pod(name string) ObjectRef {
 // execStreams are the server's ends of an exec stream, as the kubelet
 // has them.
 type execStreams struct {
-	req    *http.Request
 	stdin  io.Reader
 	stdout io.Writer
 	// sizes has every size that came on the resize channel.
@@ -105,10 +106,8 @@ func (st *execStreams) exit(status metav1.Status) error {
 	return err
 }
 
-// The statuses of the error channel, as the API sends them.
-var (
-	execSuccess = metav1.Status{Status: metav1.StatusSuccess}
-)
+// execSuccess is the status of a command that ended with 0.
+var execSuccess = metav1.Status{Status: metav1.StatusSuccess}
 
 // execExitCode is the status of a command that ended with code.
 func execExitCode(code string) metav1.Status {
@@ -164,7 +163,7 @@ func serveExec(t *testing.T, run func(st *execStreams)) http.HandlerFunc {
 			t.Errorf("writing the first message: %v", err)
 			return
 		}
-		run(&execStreams{req: r, stdin: streams[0], stdout: streams[1], sizes: sizes, errors: streams[3]})
+		run(&execStreams{stdin: streams[0], stdout: streams[1], sizes: sizes, errors: streams[3]})
 	}
 }
 
@@ -252,6 +251,11 @@ func TestExecChecksBeforeItSends(t *testing.T) {
 			}
 			if o, _ := recs[0].attr("object"); o != ref.String() {
 				t.Errorf("object %q, want %q", o, ref.String())
+			}
+			for k, v := range map[string]string{"phase": "end", "started": "false", "container": tt.opts.Container} {
+				if got, _ := recs[0].attr(k); got != v {
+					t.Errorf("%s = %q, want %q", k, got, v)
+				}
 			}
 		})
 	}
@@ -918,6 +922,210 @@ func TestExecTerminalIsLetGoWhenExecReturns(t *testing.T) {
 		in.letGo()
 		if n, err := in.Read(b); n != 0 || err != io.EOF {
 			t.Errorf("a read after Exec returned: %d, %v", n, err)
+		}
+	})
+}
+
+// execRecords returns the start and the end record of the one Exec that
+// was logged, and fails the test unless there are just these two, at
+// info level, with the action's attributes.
+func execRecords(t *testing.T, f *execFixture) (start, end auditRecord) {
+	t.Helper()
+	all := f.log.all()
+	if len(all) != 2 {
+		t.Fatalf("records %+v, want two", all)
+	}
+	for i, phase := range []string{"start", "end"} {
+		r := all[i]
+		if r.Message != "action" || r.Level != slog.LevelInfo {
+			t.Errorf("record %d: %q at %v", i, r.Message, r.Level)
+		}
+		want := map[string]string{
+			"key":         fullGrant.Name,
+			"fingerprint": fullGrant.Fingerprint,
+			"action":      "exec",
+			"object":      "pods/default/web",
+			"phase":       phase,
+			"container":   "web",
+		}
+		for k, v := range want {
+			if got, _ := r.attr(k); got != v {
+				t.Errorf("%s record: %s = %q, want %q", phase, k, got, v)
+			}
+		}
+	}
+	return all[0], all[1]
+}
+
+// command returns the command of a start record.
+func (r auditRecord) command(t *testing.T) []string {
+	t.Helper()
+	v, ok := r.Attrs["command"]
+	if !ok {
+		t.Fatalf("no command in %+v", r)
+	}
+	words, ok := v.Any().([]string)
+	if !ok {
+		t.Fatalf("command %v is a %T", v, v.Any())
+	}
+	return words
+}
+
+// wantAttrs fails the test unless r has each of want, and none of
+// absent.
+func wantAttrs(t *testing.T, r auditRecord, want map[string]string, absent ...string) {
+	t.Helper()
+	for k, v := range want {
+		if got, ok := r.attr(k); !ok || got != v {
+			t.Errorf("%s = %q, want %q", k, got, v)
+		}
+	}
+	for _, k := range absent {
+		if got, ok := r.attr(k); ok {
+			t.Errorf("%s = %q, want none", k, got)
+		}
+	}
+}
+
+// noneHolds fails the test when a record holds one of the texts.
+func noneHolds(t *testing.T, f *execFixture, texts ...string) {
+	t.Helper()
+	for _, r := range f.log.all() {
+		for k, v := range r.Attrs {
+			for _, text := range texts {
+				if strings.Contains(fmt.Sprint(v.Any()), text) || strings.Contains(r.Message, text) {
+					t.Errorf("%s = %q holds %q", k, v.String(), text)
+				}
+			}
+		}
+	}
+}
+
+func TestExecLog(t *testing.T) {
+	const typed, printed = "typed-4f1e-marker\r", "printed-9c2b-marker\r\n"
+
+	t.Run("a shell that ran and ended with 0", func(t *testing.T) {
+		f := execEnv(t, serveExec(t, func(st *execStreams) {
+			b := make([]byte, len(typed))
+			if _, err := io.ReadFull(st.stdin, b); err != nil {
+				t.Errorf("reading stdin: %v", err)
+				return
+			}
+			if _, err := st.stdout.Write(append(b, printed...)); err != nil {
+				t.Errorf("writing stdout: %v", err)
+				return
+			}
+			_ = st.exit(execSuccess)
+		}))
+		term := newExecTerminal(t, 80, 24)
+		done := execStart(context.Background(), f.s, f.pod("web"), term.options("sh", "-c", "exec sh"))
+		if _, err := term.type_.Write([]byte(typed)); err != nil {
+			t.Fatal(err)
+		}
+		if out := receive(t, "Exec returns", done); out.err != nil || out.res != (ExecResult{Started: true}) {
+			t.Fatalf("Exec: %+v, %v", out.res, out.err)
+		}
+		start, end := execRecords(t, f)
+		if c := start.command(t); !slices.Equal(c, []string{"sh", "-c", "exec sh"}) {
+			t.Errorf("command %q", c)
+		}
+		wantAttrs(t, start, nil, "duration", "started", "status", "error", "ended")
+		wantAttrs(t, end, map[string]string{"started": "true", "status": "0"}, "command", "error", "ended")
+		if _, ok := end.Attrs["duration"]; !ok {
+			t.Error("the end has no duration")
+		}
+		noneHolds(t, f, "typed-4f1e-marker", "printed-9c2b-marker")
+	})
+
+	t.Run("a shell that ended with 7", func(t *testing.T) {
+		f := execEnv(t, serveExec(t, func(st *execStreams) { _ = st.exit(execExitCode("7")) }))
+		term := newExecTerminal(t, 80, 24)
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh")); err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		_, end := execRecords(t, f)
+		wantAttrs(t, end, map[string]string{"started": "true", "status": "7"}, "error", "ended")
+	})
+
+	t.Run("a command that did not start", func(t *testing.T) {
+		f := execEnv(t, serveExec(t, func(st *execStreams) { _ = st.exit(execInternal(execNoShell)) }))
+		term := newExecTerminal(t, 80, 24)
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh")); !errors.Is(err, ErrExecNotStarted) {
+			t.Fatalf("Exec: %v", err)
+		}
+		_, end := execRecords(t, f)
+		wantAttrs(t, end, map[string]string{"started": "false", "error": "the command could not be started"}, "status", "ended")
+		noneHolds(t, f, "executable", "$PATH", "80c33c691f99", "Internal error")
+	})
+
+	t.Run("an error after output", func(t *testing.T) {
+		f := execEnv(t, serveExec(t, func(st *execStreams) {
+			_, _ = st.stdout.Write([]byte(printed))
+			_ = st.exit(execInternal("the runtime says " + printed))
+		}))
+		term := newExecTerminal(t, 80, 24)
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh")); err == nil {
+			t.Fatal("no error")
+		}
+		_, end := execRecords(t, f)
+		wantAttrs(t, end, map[string]string{"started": "true", "error": "exec failed"}, "status", "ended")
+		noneHolds(t, f, "printed-9c2b-marker")
+	})
+
+	t.Run("refused by the API", func(t *testing.T) {
+		f := execEnv(t, apiRefuses(t, apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "web", errors.New("a webhook says printed-9c2b-marker"))))
+		term := newExecTerminal(t, 80, 24)
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh")); !apierrors.IsForbidden(err) {
+			t.Fatalf("Exec: %v", err)
+		}
+		_, end := execRecords(t, f)
+		wantAttrs(t, end, map[string]string{"started": "false", "error": "the API answered Forbidden (403)"}, "status", "ended")
+		noneHolds(t, f, "printed-9c2b-marker")
+	})
+
+	for _, by := range []string{"the caller", "the session"} {
+		t.Run("ended by "+by, func(t *testing.T) {
+			open := make(chan struct{}, 1)
+			f := execEnv(t, execHolds(t, open))
+			term := newExecTerminal(t, 80, 24)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := execStart(ctx, f.s, f.pod("web"), term.options("sh"))
+			receive(t, "the stream is open", open)
+			term.out.waitFor(t, "$ ")
+			if by == "the caller" {
+				cancel()
+			} else {
+				f.end()
+			}
+			receive(t, "Exec returns", done)
+			_, end := execRecords(t, f)
+			if by == "the caller" {
+				wantAttrs(t, end, map[string]string{"started": "true", "error": "context canceled"}, "status", "ended")
+			} else {
+				wantAttrs(t, end, map[string]string{"started": "true", "ended": "the session ended"}, "status", "error")
+			}
+		})
+	}
+
+	t.Run("the command is cleaned and cut", func(t *testing.T) {
+		f := execEnv(t, execSucceeds(t))
+		term := newExecTerminal(t, 80, 24)
+		long := strings.Repeat("x", 4096)
+		if _, err := execRun(t, context.Background(), f.s, f.pod("web"), term.options("sh", "-c", "echo \x1b[31mred\x07\r\n\u009b2J\xff", long, "after")); err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		start, _ := execRecords(t, f)
+		c := start.command(t)
+		if len(c) != 4 || c[0] != "sh" || c[1] != "-c" || c[2] != "echo [31mred2J\ufffd" {
+			t.Fatalf("command %q", c)
+		}
+		total := 0
+		for _, w := range c {
+			total += len(w)
+		}
+		if total != 1024 || c[3] != long[:1024-len(c[0])-len(c[1])-len(c[2])] {
+			t.Errorf("the command's words are %d bytes, want 1024: %q", total, c)
 		}
 	})
 }
