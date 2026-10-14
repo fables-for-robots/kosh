@@ -182,10 +182,11 @@ type Server struct {
 	// repairTurn is how long the turn lasts that repairs a session's
 	// screen: minTurn, but for a test.
 	repairTurn time.Duration
-	// slowInput, when it is not zero, is how long the filter sleeps on
+	// onInput, when it is not nil, is called by a session's filter with
 	// each event the library makes of the program's input: a test makes
-	// the event loop slow, to reproduce a reader left behind.
-	slowInput time.Duration
+	// the event loop slow with it, to have a session end with events in
+	// its reader's hand.
+	onInput func()
 
 	handshakes atomic.Int64 // connections in the handshake, over every listener
 

@@ -110,6 +110,9 @@ type session struct {
 	windOnce sync.Once
 	winding  atomic.Bool
 	wound    atomic.Bool
+	// ran is closed when the program has returned: nothing takes an
+	// event of its reader's from then on.
+	ran chan struct{}
 	// lastEvent is when the filter last saw an event of the library's
 	// reader, or when that reader was told its end if that was later, in
 	// Unix nanoseconds: see wind.
@@ -126,7 +129,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	defer cancel()
 	// The session ends when the client closes its channel, even if the
 	// connection stays: nothing would end the program then.
-	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput(), out: &countingWriter{w: ss}}
+	sess := &session{srv: s, conn: c, ss: ss, key: ss.PublicKey(), ctx: ctx, in: newInput(), out: &countingWriter{w: ss}, ran: make(chan struct{})}
 	win := s.windowOf(ss)
 	sess.win, sess.raw = win, rawWriter(ss)
 	go func() {
@@ -192,12 +195,14 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 
 			go win.forward(ctx, p)
 			_, err := p.Run()
+			close(sess.ran)
 			// A reader that Bubble Tea left in Read is told the end, and
 			// gets nothing of what waits; the pump ends with the channel.
 			sess.in.close()
-			// One goroutine of Bubble Tea's can be left, with the keys
-			// that were queued behind the one that ended the program: it
-			// holds the guard, and not the model with all it has.
+			// One goroutine of Bubble Tea's can be left, with what it had
+			// to hand to the program, when the program took no message at
+			// its end or ended by a panic (see wind): it holds the guard,
+			// and not the model with all it has.
 			if g, ok := m.(*guard); ok {
 				g.release()
 			}

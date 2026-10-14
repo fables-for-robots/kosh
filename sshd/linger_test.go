@@ -47,6 +47,17 @@ func (h *harness) keyRemovedLines() int {
 	return n
 }
 
+// keyRemovedLine waits for that line, which Close writes when it has
+// closed the connection and let go of it, and fails the test when the
+// log has more than one.
+func (h *harness) keyRemovedLine(t *testing.T) {
+	t.Helper()
+	eventually(t, "the log says that the connection was closed for its key", func() bool { return h.keyRemovedLines() > 0 })
+	if n := h.keyRemovedLines(); n != 1 {
+		t.Errorf("the log has %d lines of a connection closed for its key, want 1:\n%s", n, h.log.dump())
+	}
+}
+
 // connections returns how many connections the server knows of.
 func (h *harness) connections() int {
 	h.srv.mu.Lock()
@@ -101,9 +112,7 @@ func TestRemovedKeysClientMayStillWrite(t *testing.T) {
 		t.Errorf("writes of the client failed on its connection: %v", errs)
 	}
 	eventually(t, "the server has forgotten the connection", func() bool { return h.connections() == 0 })
-	if n := h.keyRemovedLines(); n != 1 {
-		t.Errorf("the log has %d lines of a connection closed for its key, want 1:\n%s", n, h.log.dump())
-	}
+	h.keyRemovedLine(t)
 }
 
 // onlyConn returns the server's one connection.
@@ -144,9 +153,7 @@ func TestRemovedKeysClientCloses(t *testing.T) {
 	eventually(t, "the server has forgotten the connection", func() bool { return h.connections() == 0 })
 	t.Logf("the server forgot the connection %v after the client closed it", time.Since(began).Round(time.Millisecond))
 	noLinger(t, c)
-	if n := h.keyRemovedLines(); n != 1 {
-		t.Errorf("the log has %d lines of a connection closed for its key, want 1:\n%s", n, h.log.dump())
-	}
+	h.keyRemovedLine(t)
 }
 
 // TestRemovedKeysConnectionIsClosedAfterTheLinger has a client keep its
@@ -185,9 +192,7 @@ func TestRemovedKeysConnectionIsClosedAfterTheLinger(t *testing.T) {
 	}
 	eventually(t, "the server has forgotten the connection", func() bool { return h.connections() == 0 })
 	noLinger(t, c)
-	if n := h.keyRemovedLines(); n != 1 {
-		t.Errorf("the log has %d lines of a connection closed for its key, want 1:\n%s", n, h.log.dump())
-	}
+	h.keyRemovedLine(t)
 	if errs := w.failed(); len(errs) != 0 {
 		t.Errorf("writes of the client failed on its connection: %v", errs)
 	}
@@ -211,9 +216,7 @@ func TestShutdownDoesNotWaitALinger(t *testing.T) {
 	}
 	closedByTheServer(t, cl, "at the shutdown")
 	noLinger(t, c)
-	if n := h.keyRemovedLines(); n != 1 {
-		t.Errorf("the log has %d lines of a connection closed for its key, want 1:\n%s", n, h.log.dump())
-	}
+	h.keyRemovedLine(t)
 }
 
 // TestCutOffConnectionHasNoLinger removes the key of a session that does
@@ -242,9 +245,7 @@ func TestCutOffConnectionHasNoLinger(t *testing.T) {
 	h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" })
 	eventually(t, "the server has forgotten the connection", func() bool { return h.connections() == 0 })
 	noLinger(t, c)
-	if n := h.keyRemovedLines(); n != 1 {
-		t.Errorf("the log has %d lines of a connection closed for its key, want 1:\n%s", n, h.log.dump())
-	}
+	h.keyRemovedLine(t)
 }
 
 // TestKeyRemovedJustAfterASession removes a key when its connection's
@@ -282,7 +283,5 @@ func TestKeyRemovedJustAfterASession(t *testing.T) {
 		t.Errorf("writes of the client failed on its connection: %v", errs)
 	}
 	eventually(t, "the server has forgotten the connection", func() bool { return h.connections() == 0 })
-	if n := h.keyRemovedLines(); n != 1 {
-		t.Errorf("the log has %d lines of a connection closed for its key, want 1", n)
-	}
+	h.keyRemovedLine(t)
 }

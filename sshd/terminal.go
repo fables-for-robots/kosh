@@ -308,12 +308,8 @@ func (sess *session) filter(_ tea.Model, msg tea.Msg) tea.Msg {
 		// The time of the last event of the reader's, for wind: a reader
 		// that has just had an event taken from it may have another.
 		sess.lastEvent.Store(time.Now().UnixNano())
-		if sess.srv.slowInput > 0 {
-			// A test makes the event loop slow to take the reader's
-			// events, as the race detector does on a loaded machine: the
-			// program then may be asked to end while its reader has
-			// events in hand.
-			time.Sleep(sess.srv.slowInput)
+		if sess.srv.onInput != nil {
+			sess.srv.onInput()
 		}
 	}
 	switch msg := msg.(type) {
@@ -380,10 +376,13 @@ func fromInput(msg tea.Msg) bool {
 //     them, and has been given io.EOF (see endProgram).
 //   - Then the reader hands over what it had gathered unfinished, which
 //     nothing tells the end of: wind waits until no event has come for
-//     windQuiet. It was one event in every state that was tried, handed
-//     over at once.
+//     windQuiet, anew after each event. An unfinished string or
+//     sequence is one event; what the library kept back behind a
+//     sequence it does not know is one for each key.
 //
-// Only then does quit end the program.
+// Only then does quit end the program. A program that has returned
+// already, after a panic in a command, takes nothing: wind does not
+// wait for its reader.
 //
 // The reader is not given the mark here: the mark's escape, appended to
 // an unfinished string, is read as the string's content, and the library
@@ -406,6 +405,8 @@ func (sess *session) wind() {
 		}
 		select {
 		case <-told:
+		case <-sess.ran:
+			return
 		case <-deadline.C:
 			gaveUp()
 			return
@@ -421,6 +422,8 @@ func (sess *session) wind() {
 			}
 			select {
 			case <-tick.C:
+			case <-sess.ran:
+				return
 			case <-deadline.C:
 				gaveUp()
 				return

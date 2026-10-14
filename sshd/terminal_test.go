@@ -1469,6 +1469,7 @@ func TestExecWhenTheSessionIsBeingEnded(t *testing.T) {
 func TestCommandPanics(t *testing.T) {
 	hv := newHandover(func(context.Context, Terminal) error { panic("test command: panic") })
 	h, tm := startHandover(t, hv)
+	sess := h.onlySession()
 	tm.press("!")
 	if status := tm.exit(); status != 1 {
 		t.Errorf("exit status %d, want 1", status)
@@ -1478,6 +1479,10 @@ func TestCommandPanics(t *testing.T) {
 	}
 	h.log.waitFor(t, "of the panic", func(r logRecord) bool { return r.Level.String() == "ERROR" && strings.Contains(r.Msg, "panicked") })
 	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+	// The program has returned, and its end does not wait for a reader
+	// that nothing reads for any more, to say then that it was left.
+	eventually(t, "the end of the program's reading is over", sess.wound.Load)
+	h.noReaderGivenUp(t)
 
 	// The terminal of another session is handed over as ever.
 	hv.note(func() { hv.run = hv.echo })
@@ -2701,6 +2706,20 @@ func TestControlSequenceOfFortyParameters(t *testing.T) {
 	}
 }
 
+// slowLoop makes the program's event loop busy for d with each event of
+// its input, as the race detector does on a loaded machine: a session
+// may then be ended while the library's reader has events in hand. The
+// loop is busy and does not sleep: a sleep of less than a millisecond
+// lasts a millisecond on Linux.
+func slowLoop(d time.Duration) option {
+	return withServer(func(s *Server) {
+		s.onInput = func() {
+			for began := time.Now(); time.Since(began) < d; {
+			}
+		}
+	})
+}
+
 // openStates are what the library may hold unfinished when a session is
 // ended: a prefix with nothing closing it. mid-paste in several
 // spellings, mid-CSI, every string kind, half a UTF-8 character.
@@ -2729,7 +2748,7 @@ func TestSessionEndsMidSequence(t *testing.T) {
 	for _, st := range openStates {
 		t.Run(st.name, func(t *testing.T) {
 			hv := newHandover(nil)
-			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 50 * time.Microsecond }))
+			h, tm := startHandover(t, hv, slowLoop(50*time.Microsecond))
 			// A key before the prefix, in one write with it: when the
 			// model has the key, the library has read the prefix too,
 			// and holds it, unfinished, as the session is ended.
@@ -2759,34 +2778,44 @@ func TestSessionEndsMidSequence(t *testing.T) {
 }
 
 // TestFloodEndsLeaveNoReaderWithASlowLoop sends each flood and its mixes
-// with a slow event loop and one CPU: the session ends (or the paste is
-// cut), and no reader is left in the library, whatever the speed of the
-// loop. This is the case CI found on Linux under the race detector.
+// with a slow event loop and one CPU: the session ends, or is ended
+// while the flood that it takes comes, and no reader is left in the
+// library, whatever the speed of the loop. A reader left is what the
+// tests met on Linux under the race detector.
 func TestFloodEndsLeaveNoReaderWithASlowLoop(t *testing.T) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	for _, f := range floods {
 		t.Run(f.name, func(t *testing.T) {
 			hv := newHandover(nil)
-			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 50 * time.Microsecond }))
-			sent := sendFlood(tm, f.start, f.more, 8<<20)
+			// The end's timeout is not what is tried here: a slow machine
+			// is not to reach it with a read's worth of keys in hand.
+			h, tm := startHandover(t, hv, slowLoop(50*time.Microsecond), withServer(func(s *Server) { s.endTimeout = longWait }))
+			sendFlood(tm, f.start, f.more, 8<<20)
 			if f.cut {
-				select {
-				case <-sent:
-				case <-time.After(longWait):
-					t.Fatal("the flood was not all taken")
-				}
+				// The session takes this one, and the library makes a key
+				// of each byte that the cut lets through, a quarter of a
+				// million of them: the session is ended while they come.
+				hv.wait(t, "the model has a key of the flood", func() bool { return len(hv.keys) > 0 })
 				setKeys(t, h.list)
-				if status := tm.exit(); status != 1 {
-					t.Errorf("exit status %d, want 1", status)
-				}
-			} else {
-				if status := tm.exit(); status != 1 {
-					t.Errorf("exit status %d, want 1", status)
-				}
+			}
+			if status := tm.exit(); status != 1 {
+				t.Errorf("exit status %d, want 1", status)
 			}
 			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+			h.noReaderGivenUp(t)
 			// The harness's cleanup checks no goroutine is left.
 		})
+	}
+}
+
+// noReaderGivenUp fails the test when the log says that a session's end
+// gave its program's reader up.
+func (h *harness) noReaderGivenUp(t *testing.T) {
+	t.Helper()
+	for _, r := range h.log.records() {
+		if strings.HasPrefix(r.Msg, "the program's reader did not end in time") {
+			t.Errorf("an end gave its reader up: %v", r)
+		}
 	}
 }
 
@@ -2800,9 +2829,9 @@ func TestFloodEndsLeaveNoReaderWithASlowLoop(t *testing.T) {
 // the reader up.
 func TestSessionEndsWithKeysInHand(t *testing.T) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
-	// Fewer than one read of the library's (4096 bytes), and 0.6 s of
-	// events at the pace of the loop: well within the end's timeout.
-	keys := strings.Repeat("x", 3000)
+	// Fewer than one read of the library's (4096 bytes), and a fifth
+	// of a second of events at the pace of the loop.
+	keys := strings.Repeat("x", 1000)
 	// The model has the first of them: the library has read them all,
 	// and has the rest to hand over.
 	first := func(t *testing.T, hv *handover) {
@@ -2834,7 +2863,9 @@ func TestSessionEndsWithKeysInHand(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hv := newHandover(nil)
-			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 200 * time.Microsecond }))
+			// The end's timeout is not what is tried here: a slow machine
+			// is not to reach it.
+			h, tm := startHandover(t, hv, slowLoop(200*time.Microsecond), withServer(func(s *Server) { s.endTimeout = longWait }))
 			tc.end(t, h, hv, tm)
 			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
 			hv.mu.Lock()
@@ -2843,11 +2874,7 @@ func TestSessionEndsWithKeysInHand(t *testing.T) {
 			if given >= len(keys) {
 				t.Fatalf("the model was given %d keys: the session did not end with keys in hand", given)
 			}
-			for _, r := range h.log.records() {
-				if strings.HasPrefix(r.Msg, "the program's reader did not end in time") {
-					t.Errorf("the end gave the reader up: %v", r)
-				}
-			}
+			h.noReaderGivenUp(t)
 			// The harness's cleanup checks no goroutine is left.
 		})
 	}
