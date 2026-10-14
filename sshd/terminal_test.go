@@ -2639,3 +2639,139 @@ func TestControlSequenceOfFortyParameters(t *testing.T) {
 		t.Error("the session was ended for control sequences of forty parameters")
 	}
 }
+
+// openStates are what the library may hold unfinished when a session is
+// ended: a prefix with nothing closing it. mid-paste in several
+// spellings, mid-CSI, every string kind, half a UTF-8 character.
+var openStates = []struct{ name, prefix string }{
+	{"mid-paste", "\x1b[200~pasted text that never ends"},
+	{"mid-paste, a zero in the mark", "\x1b[0200~pasted"},
+	{"mid-paste, the 8-bit introducer", "\x9b200~pasted"},
+	{"mid-CSI", "\x1b[1;2;3;4;5"},
+	{"mid-OSC", "\x1b]0;a title with no terminator"},
+	{"mid-OSC, 8-bit", "\x9d0;a title"},
+	{"mid-DCS", "\x1bP1;2qsixel-ish data"},
+	{"mid-APC", "\x1b_application program command"},
+	{"mid-SOS", "\x1bXstart of string"},
+	{"mid-PM", "\x1b^privacy message"},
+	{"half a UTF-8 character", "ok\xc3"},
+	{"an escape pending", "\x1b"},
+}
+
+// TestSessionEndsMidSequence ends a session, by removing its key, while
+// the library holds each open state: with a slow event loop and one CPU,
+// which is where a reader is left when the program ends before it has
+// handed over what it had. Nothing of the server is left (the harness
+// checks), and the model was given no key of what was open.
+func TestSessionEndsMidSequence(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for _, st := range openStates {
+		t.Run(st.name, func(t *testing.T) {
+			hv := newHandover(nil)
+			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 50 * time.Microsecond }))
+			sess := h.onlySession()
+			tm.press(st.prefix)
+			// The pump has handed the prefix to the library's reader: the
+			// library holds it, unfinished, as the session is ended.
+			eventually(t, "the server has handed the prefix on", func() bool {
+				sess.in.mu.Lock()
+				defer sess.in.mu.Unlock()
+				return len(sess.in.buf) == 0
+			})
+			hv.mu.Lock()
+			before := strings.Join(hv.keys, "")
+			hv.mu.Unlock()
+			setKeys(t, h.list)
+			if status := tm.exit(); status != 1 {
+				t.Errorf("exit status %d, want 1", status)
+			}
+			if out := tm.stdout.String(); !strings.HasSuffix(out, MsgKeyRemoved+"\r\n") {
+				t.Errorf("the session did not end with %q", MsgKeyRemoved)
+			}
+			// The mark's bytes and the closer's are never the model's.
+			hv.mu.Lock()
+			after := strings.Join(hv.keys, "")
+			hv.mu.Unlock()
+			if after != before {
+				t.Errorf("the model was given keys after the session was ended: %q then %q", before, after)
+			}
+			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+			// The harness's cleanup checks no goroutine is left.
+		})
+	}
+}
+
+// TestFloodEndsLeaveNoReaderWithASlowLoop sends each flood and its mixes
+// with a slow event loop and one CPU: the session ends (or the paste is
+// cut), and no reader is left in the library, whatever the speed of the
+// loop. This is the case CI found on Linux under the race detector.
+func TestFloodEndsLeaveNoReaderWithASlowLoop(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for _, f := range floods {
+		t.Run(f.name, func(t *testing.T) {
+			hv := newHandover(nil)
+			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 50 * time.Microsecond }))
+			sent := sendFlood(tm, f.start, f.more, 8<<20)
+			if f.cut {
+				select {
+				case <-sent:
+				case <-time.After(longWait):
+					t.Fatal("the flood was not all taken")
+				}
+				setKeys(t, h.list)
+				if status := tm.exit(); status != 1 {
+					t.Errorf("exit status %d, want 1", status)
+				}
+			} else {
+				if status := tm.exit(); status != 1 {
+					t.Errorf("exit status %d, want 1", status)
+				}
+			}
+			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+			// The harness's cleanup checks no goroutine is left.
+		})
+	}
+}
+
+// TestEndsAreStillFast times an ordinary quit and an end at the table,
+// so a change that made winding wait is seen. One harness, a session
+// opened and ended at a time, so the harness's goroutine check does not
+// see many servers at once.
+func TestEndsAreStillFast(t *testing.T) {
+	const n = 10
+	hv := newHandover(nil)
+	h := handoverHarness(t, hv)
+	var quitTotal, endTotal time.Duration
+	for i := range n {
+		cl := h.dial(h.key(fmt.Sprintf("q%d", i), false), "u")
+		tm := openTerm(t, cl)
+		tm.waitFor("LASTLINE")
+		began := time.Now()
+		tm.press("q")
+		if tm.exit() != 0 {
+			t.Fatal("the model did not quit")
+		}
+		quitTotal += time.Since(began)
+		_ = cl
+	}
+	// An end at the table: a key of its own, removed, over a list that
+	// keeps the quit keys so their connections are not disturbed.
+	lines := append([]string(nil), h.lines...)
+	for i := range n {
+		e := newSigner(t)
+		setKeys(t, h.list, append(lines, keyLine(e, fmt.Sprintf("e%d", i), false))...)
+		tm := openTerm(t, h.dial(e, "u"))
+		tm.waitFor("LASTLINE")
+		began := time.Now()
+		setKeys(t, h.list, lines...)
+		if tm.exit() != 1 {
+			t.Fatal("the session did not end")
+		}
+		endTotal += time.Since(began)
+	}
+	quit, end := quitTotal/n, endTotal/n
+	t.Logf("an ordinary quit took %v on average, an end at the table %v, over %d each", quit.Round(time.Microsecond), end.Round(time.Microsecond), n)
+	if quit > 500*time.Millisecond || end > 500*time.Millisecond {
+		t.Errorf("an end is slow: quit %v, end %v", quit, end)
+	}
+}

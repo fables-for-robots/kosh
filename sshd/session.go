@@ -110,6 +110,9 @@ type session struct {
 	windOnce sync.Once
 	winding  atomic.Bool
 	wound    atomic.Bool
+	// lastEvent, while the session winds, is when the filter last saw an
+	// event of the library's reader, in Unix nanoseconds: see wind.
+	lastEvent atomic.Int64
 
 	// screenTimer looks, after a command's turn, whether the program
 	// writes again: see watchScreen. It is nil before the first turn.
