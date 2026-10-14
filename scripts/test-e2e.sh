@@ -10,6 +10,10 @@
 # KOSH_E2E_IMAGE=<image> uses an image that is already loaded instead of
 # building one. KOSH_E2E_NO_NETWORK=1 skips the tests over the relays.
 # KOSH_E2E_CACHE is where iroh-ssh is kept between runs (.cache/e2e).
+# KOSH_E2E_SLOW=1 runs the tests that wait for kosh's discovery too
+# (TestMetricsColumnsFollowTheAPI, up to 12 minutes), with the tests'
+# deadline 40 minutes instead of 20. KOSH_E2E_RUN=<regexp> runs only the
+# tests it matches, as go test -run does.
 #
 # It touches nothing it did not make: the image gets a tag of its own,
 # kosh-e2e:<random>, right after it is loaded, and only that tag is used
@@ -49,6 +53,10 @@ IROH_SSH_SHA256=6e39a6b22f14d683598600350ca642d3b67fd0b0a2f2a7b29928ad6cdf032826
 # built with Nix's cargo.
 IROH_SSH_REPO=https://github.com/rustonbsd/iroh-ssh
 IROH_SSH_COMMIT=82e99719f8b4e44c69622140f4acb25e5ae54184
+
+# metrics-server, the released manifest of the version pinned here.
+METRICS_SERVER_VERSION=v0.7.2
+METRICS_SERVER=https://github.com/kubernetes-sigs/metrics-server/releases/download/$METRICS_SERVER_VERSION/components.yaml
 
 NAMESPACE=kosh
 RELEASE=kosh
@@ -153,6 +161,17 @@ sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml | while read -r image; do
   done
   echo "ok   $image is in the node"
 done
+
+# metrics-server, as a cluster that has it: the released manifest, with
+# --kubelet-insecure-tls since kind's kubelets serve certificates of
+# their own signing, as kind's docs have it. Before kosh, whose
+# discovery at start then finds the metrics API.
+step "metrics-server $METRICS_SERVER_VERSION"
+kubectl apply -f "$METRICS_SERVER" >/dev/null
+kubectl --namespace kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=180s
+kubectl --namespace kube-system wait --for=condition=Available deployment/metrics-server --timeout=180s
 
 # 3. The keys and the state.
 step "the keys and the state"
@@ -261,12 +280,15 @@ echo "ok   $iroh_ssh"
 
 # 8. The tests.
 step "the tests"
+deadline=20m
+[ "${KOSH_E2E_SLOW:-}" != 1 ] || deadline=40m
 KOSH_E2E_SSH=127.0.0.1:$port \
   KOSH_E2E_FULL_KEY=$WORK/full \
   KOSH_E2E_READONLY_KEY=$WORK/readonly \
   KOSH_E2E_HOST_KEY=$WORK/host_key.pub \
   KOSH_E2E_ENDPOINT=$ENDPOINT \
   KOSH_E2E_IROH_SSH=$iroh_ssh \
-  go test -tags e2e -count=1 -timeout 20m -v ./e2e/
+  KOSH_E2E_METRICS_SERVER=$METRICS_SERVER \
+  go test -tags e2e -count=1 -timeout "$deadline" -v ${KOSH_E2E_RUN:+-run "$KOSH_E2E_RUN"} ./e2e/
 
 echo "all checks passed"
