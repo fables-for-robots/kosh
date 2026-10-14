@@ -341,7 +341,7 @@ func TestServeEndToEnd(t *testing.T) {
 	for _, r := range k.log.records() {
 		if name, ok := r.Attrs["key"]; ok {
 			named++
-			if name != "alice@laptop" || r.Attrs["fingerprint"] != fp {
+			if name != "alice@laptop"+keys.AdminSuffix || r.Attrs["fingerprint"] != fp {
 				t.Errorf("%v: a key without its fingerprint %s", r, fp)
 			}
 		}
