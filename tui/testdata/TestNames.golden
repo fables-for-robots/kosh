@@ -1,8 +1,8 @@
 Key:     alice@laptop   <shift-n> Sort Name     <space> Mark
-Cluster: v1.33.1        <shift-o> Sort Column   <?> Help
-kosh:    v0.1.0         <ctrl-w> Wide
-                        <ctrl-z> Faults
-                        </> Filter
+Cluster: v1.33.1        <shift-o> Sort Column   <?>     Help
+kosh:    v0.1.0         <ctrl-w>  Wide
+                        <ctrl-z>  Faults
+                        </>       Filter
 
 ┌────────────────────────────────────────── Aliases[27] ───────────────────────────────────────────┐
 │NAME↑                      SHORTNAMES  KIND                      GROUP                      NAMES…│

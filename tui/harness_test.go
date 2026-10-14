@@ -380,6 +380,15 @@ func (hs *harness) wantFrame(texts ...string) {
 	}
 }
 
+// wantHint fails the test unless the plain frame shows the hint of key
+// with text after it, however the padding of its column spaces them.
+func (hs *harness) wantHint(key, text string) {
+	hs.t.Helper()
+	if f := hs.frame(); !showsHint(f, key, text) {
+		hs.t.Errorf("the frame does not show the hint <%s> %s:\n%s", key, text, f)
+	}
+}
+
 // notFrame fails the test when the plain frame holds one of texts.
 func (hs *harness) notFrame(texts ...string) {
 	hs.t.Helper()

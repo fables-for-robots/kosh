@@ -1,6 +1,6 @@
 Key:     alice@laptop   <c> Copy                <shift-n> Prev Match
-Cluster: v1.33.1        <f> Toggle FullScreen   <r> Toggle Auto-Refresh
-kosh:    v0.1.0         <w> Toggle Wrap         <m> Toggle ManagedFields
+Cluster: v1.33.1        <f> Toggle FullScreen   <r>       Toggle Auto-Refresh
+kosh:    v0.1.0         <w> Toggle Wrap         <m>       Toggle ManagedFields
                         </> Search
                         <n> Next Match
 

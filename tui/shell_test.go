@@ -225,7 +225,7 @@ func TestShellBinding(t *testing.T) {
 		if !shellHints(hs) {
 			t.Errorf("the pods have no <s> Shell: %v", hs.root().top().Hints())
 		}
-		hs.wantFrame("<s> Shell")
+		hs.wantHint("s", "Shell")
 		// Beside the logs in the header's hints.
 		var order []string
 		for _, h := range hs.root().top().Hints() {
