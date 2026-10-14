@@ -32,10 +32,13 @@ func TestContainersOfAPod(t *testing.T) {
 	tab := rowsWhen(t, w, "default/init", "default/app", "default/sidecar")
 	now := time.Now()
 	tab = w.Table(now)
-	if want := render.ContainerRows(p, now); !reflect.DeepEqual(tab.Rows, want) {
-		t.Errorf("rows\n%+v\nwant render.ContainerRows\n%+v", tab.Rows, want)
+	// Without the metrics API: the rows and columns of render, without
+	// the metric ones.
+	wantCols, wantRows := render.StripMetrics(render.ContainerColumns(), render.ContainerRows(p, now))
+	if !reflect.DeepEqual(tab.Rows, wantRows) {
+		t.Errorf("rows\n%+v\nwant render.ContainerRows, stripped\n%+v", tab.Rows, wantRows)
 	}
-	if !reflect.DeepEqual(tab.Columns, render.ContainerColumns()) || tab.Namespaced || tab.Stale || tab.Err != nil {
+	if !reflect.DeepEqual(tab.Columns, wantCols) || tab.Namespaced || tab.Stale || tab.Err != nil {
 		t.Errorf("table: columns %v, namespaced %v, stale %v, err %v", tab.Columns, tab.Namespaced, tab.Stale, tab.Err)
 	}
 

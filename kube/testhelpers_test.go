@@ -310,6 +310,9 @@ type envConfig struct {
 	failGroup string                    // a group version whose discovery fails
 	renderers func(*testRenderers)      // adds to the renderers
 	before    func(*env)                // runs before the Cluster is made: reactors
+	// real: the renderers and types of render, whose pods and nodes are
+	// metered, instead of the tests' own.
+	real bool
 }
 
 // newEnv makes a Cluster on fakes that hold objs, with the test
@@ -341,9 +344,14 @@ func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 		opts.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	opts.Renderers = e.renderers.For
+	if cfg.real {
+		opts.Renderers = render.For
+	}
 	e.c = newCluster(nil, e.typed, e.dyn, e.disc, nil, opts)
 	e.c.meta = metadataFake(objs)
-	e.c.zeroOf = testZero
+	if !cfg.real {
+		e.c.zeroOf = testZero
+	}
 	t.Cleanup(e.c.Close)
 	return e
 }

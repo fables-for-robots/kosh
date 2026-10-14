@@ -39,15 +39,17 @@ func (s *session) watchPseudo(q Query) (Watch, error) {
 }
 
 // containersWatch is the table of a pod's containers, as the pods' cache
-// has the pod.
+// has the pod, metered while the API serves the metrics of pods.
 type containersWatch struct {
 	c         *Cluster
 	cache     *kindCache
 	namespace string
 	name      string
-	changed   <-chan struct{}
+	changed   changes
+	metrics   *metricsHold
 
 	unsubscribe func()
+	stopCache   func() // ends the forwarding of the cache's signals
 	closeOnce   sync.Once
 
 	mu        sync.Mutex
@@ -60,13 +62,17 @@ func (s *session) watchContainers(pod ObjectRef) (Watch, error) {
 		return nil, err
 	}
 	changed, unsubscribe := k.subscribe()
+	// The cache's signals and the poller's are one Changed.
+	ch := newChanges()
 	w := &containersWatch{
 		c:           s.c,
 		cache:       k,
 		namespace:   pod.Namespace,
 		name:        pod.Name,
-		changed:     changed,
+		changed:     ch,
+		metrics:     &metricsHold{c: s.c, gvr: PodMetrics, changed: ch},
 		unsubscribe: unsubscribe,
+		stopCache:   ch.forward(changed, s.c.ctx.Done()),
 	}
 	w.mu.Lock()
 	w.stopAfter = context.AfterFunc(s.ctx, w.Close)
@@ -76,21 +82,30 @@ func (s *session) watchContainers(pod ObjectRef) (Watch, error) {
 
 // Table returns the rows of the pod's containers; none when the pod is
 // gone. As the tables of the typed kinds: Err when the cache's first
-// list failed, and the last rows, Stale, when a later one did.
+// list failed, and the last rows, Stale, when a later one did; the
+// metric columns while the API serves the metrics of pods, and not
+// without.
 func (w *containersWatch) Table(now time.Time) Table {
+	poller := w.metrics.follow()
 	synced, stale, err := w.cache.status()
 	if err != nil && !synced {
 		return Table{Err: err}
 	}
 	t := Table{Columns: render.ContainerColumns(), Stale: stale || err != nil}
-	if !synced {
-		t.Stale = true
-		return t
-	}
-	if o, ok := w.cache.get(w.namespace, w.name); ok {
-		if p, ok := o.(*corev1.Pod); ok {
-			t.Rows = render.ContainerRows(p, now)
+	if synced {
+		if o, ok := w.cache.get(w.namespace, w.name); ok {
+			if p, ok := o.(*corev1.Pod); ok {
+				t.Rows = render.ContainerRows(p, now)
+				if usage := readingOf(poller); usage != nil {
+					render.MeterContainers(t.Rows, p, usage[metricsKey(p)])
+				}
+			}
 		}
+	} else {
+		t.Stale = true
+	}
+	if poller == nil {
+		t.Columns, t.Rows = render.StripMetrics(t.Columns, t.Rows)
 	}
 	return t
 }
@@ -103,6 +118,8 @@ func (w *containersWatch) Close() {
 		stop := w.stopAfter
 		w.mu.Unlock()
 		stop()
+		w.metrics.close()
+		w.stopCache()
 		w.unsubscribe()
 		w.c.release(w.cache)
 	})
