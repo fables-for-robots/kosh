@@ -200,8 +200,10 @@ level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=sca
 A shell in a pod is an action: admins only, into whatever container
 the ServiceAccount's role allows. A narrower role needs `get` and
 `create` on `pods/exec` for it; without them the API refuses, and kosh
-says so. kosh logs who opened a shell in what, with which command, and
-how and when it ended:
+says so. For the CPU and memory of [Metrics](#metrics) it needs `get`
+and `list` on `pods` and `nodes` in the group `metrics.k8s.io`. kosh logs
+who opened a shell in what, with which command, and how and when it
+ended:
 
 ```
 level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=exec object=pods/default/marker phase=start container=marker command="\"sh\" \"-c\" \"command -v bash >/dev/null && exec bash || exec sh\""
@@ -267,6 +269,62 @@ object changed meanwhile), close the editor and open the object again.
 Marks and actions go by namespace and name. The PODS column of the nodes'
 table is a node's capacity.
 
+## Metrics
+
+When the cluster has
+[metrics-server](https://github.com/kubernetes-sigs/metrics-server),
+kosh shows the CPU and memory it measures, as k9s does, read every 15
+seconds:
+
+```
+Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <d> Describe
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter        <y> YAML
+kosh:    v0.4.0                       <shift-s> Sort Status   <space> Mark      <l> Logs
+CPU:     12% ↑                        <shift-o> Sort Column   <shift-j> Owner   <p> Logs Previous
+MEM:     47%                          <ctrl-w> Wide           <?> Help          <s> Shell
+```
+
+- **The header** has the lines `CPU:` and `MEM:`: what the nodes use
+  over what they can give (their allocatable), summed over the nodes, in
+  whole percents, with `↑` or `↓` when it rose or fell since the last reading
+  that worked.
+- **The pods table** and **a pod's containers** have `CPU` (millicores),
+  `%CPU/R` and `%CPU/L` (that in percent of the requests and of the
+  limits), `MEM` (mebibytes), `%MEM/R` and `%MEM/L`, in k9s's places.
+  The wide view of pods (`ctrl-w`) shows the requests and limits
+  themselves, `CPU/RL` and `MEM/RL`, as before.
+- **The nodes table** has `CPU` and `MEM`, what is used; `CPU/A` and
+  `MEM/A`, what is allocatable; and `%CPU` and `%MEM`, the one in percent
+  of the other.
+
+They sort as numbers with `shift-o`, as every numeric column does.
+
+The columns and the lines are there only while the cluster serves the
+metrics API (`metrics.k8s.io`); without metrics-server, the tables and
+the header have none of them. kosh looks for the API at start
+and every 5 minutes, so the columns and the lines appear within 5 minutes
+of metrics-server's installation, and go within 5 minutes of its
+removal, in sessions already open.
+
+`n/a` where there is no number to show:
+
+- in all six cells of a pod or a container that the last reading did not
+  cover: a pod that is new or pending, an init container that ended, an
+  ephemeral container; in `CPU`, `%CPU`, `MEM` and `%MEM` of a node it
+  did not cover (`CPU/A` and `MEM/A` are the node's own);
+- in a percentage of requests or limits that are 0;
+- in every cell and in both lines while the API is served and the
+  reading fails: metrics-server is down, its APIService is not
+  available, or kosh's ServiceAccount may not read it. kosh's log says
+  `metrics could not be read` once, with why, and `metrics can be read
+  again` when a reading works again;
+- in the lines until the first reading has come.
+
+kosh reads the metrics with its ServiceAccount: a role narrower than
+`cluster-admin` needs `get` and `list` on `pods` and `nodes` in the group
+`metrics.k8s.io`. metrics-server's own manifest adds those to `view`,
+`edit` and `admin`.
+
 ## Values
 
 | Value | Default | |
@@ -300,7 +358,8 @@ The chart refuses to install without state (`state.existingSecret` or
 
 - Attach, copying files.
 - Port-forward.
-- Metrics: the CPU and memory columns.
+- Pulses and xray; k9s's warnings when the cluster's CPU or memory passes
+  a level.
 
 ## Known issues
 
@@ -359,7 +418,10 @@ KUBEBUILDER_ASSETS="$(scripts/envtest-assets.sh)" go test ./...
 `scripts/test-chart.sh` checks the chart. `scripts/test-e2e.sh` builds the
 image and tests it in a kind cluster of its own, with `ssh` and
 `iroh-ssh`; `scripts/test-mdns.sh` shows `iroh-ssh` finding kosh by mDNS
-alone. Both need Linux, Docker, Nix and the network.
+alone. Both need Linux, Docker, Nix and the network. `scripts/test-e2e.sh`
+installs metrics-server in its cluster; `KOSH_E2E_SLOW=1` adds the test
+that takes the metrics API away and back, up to 12 minutes, and
+`KOSH_E2E_RUN=<regexp>` runs only the tests it matches.
 
 The design is in [`docs/superpowers/specs/`](docs/superpowers/specs/),
 the plan of the first stage in [`docs/superpowers/plans/`](docs/superpowers/plans/).

@@ -66,7 +66,10 @@ rbac:
   # Bind the ServiceAccount to a ClusterRole.
   create: true
   # The ClusterRole. An admin of kosh can do whatever this role can;
-  # cluster-admin says that plainly.
+  # cluster-admin says that plainly. Besides what kosh reads, a narrower
+  # role needs get and create on pods/exec for a shell, and get and list on
+  # pods and nodes in the group metrics.k8s.io for the CPU and memory
+  # columns and the header's CPU and MEM.
   clusterRole: cluster-admin
 
 serviceAccount:
