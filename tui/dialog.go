@@ -24,6 +24,11 @@ const dialogWidth = 64
 // counted. A screen with fewer lines lists fewer.
 const dialogNames = 10
 
+// dialogWhyLines is how many lines the reason a dialog gives is drawn on
+// at most: the last one ends in "…" when there were more. A reason worded
+// by the cluster may be of any length.
+const dialogWhyLines = flashMaxLines
+
 // dialogCancel is the label of the button that changes nothing.
 const dialogCancel = "Cancel"
 
@@ -39,6 +44,7 @@ const (
 	formIsNumber                 // a whole number
 	formIsChoice                 // one of several options
 	formIsCheck                  // a checkbox
+	formIsFixed                  // a value shown that cannot be changed
 )
 
 // formField is one field of a form dialog.
@@ -54,6 +60,22 @@ type formField struct {
 	at      int
 	// on is a checkbox's state.
 	on bool
+	// pick: a choice drawn as the option chosen alone, ‹ like this ›,
+	// which left and right change as space does.
+	pick bool
+	// fixed is a fixed field's value. The focus passes such a field by.
+	fixed string
+	// presses is the label of the button that enter presses in a text
+	// field. Empty, enter moves the focus to what follows.
+	presses string
+	// scrolls: a text field longer than its width shows the part about
+	// its cursor from the first frame on, and not only after a key.
+	scrolls bool
+	// pasteRefused, when set, is the reason the dialog gives for a paste
+	// into the field that holds a line break or another control
+	// character but the tab: such a paste is not taken, rather than put
+	// on one line, and the field keeps its text.
+	pasteRefused string
 }
 
 // formTextField returns a field of a line of text, filled with value.
@@ -70,6 +92,18 @@ func formNumberField(label, value string, signed bool) *formField {
 // formChoiceField returns a choice of options, the first one chosen.
 func formChoiceField(label string, options ...string) *formField {
 	return &formField{kind: formIsChoice, label: label, options: options}
+}
+
+// formPickField returns a choice of options, the one at at chosen,
+// drawn as the option chosen alone and changed with left and right.
+func formPickField(label string, at int, options ...string) *formField {
+	return &formField{kind: formIsChoice, label: label, options: options, at: at, pick: true}
+}
+
+// formFixedField returns a field that shows value and cannot be
+// changed; the focus passes it by.
+func formFixedField(label, value string) *formField {
+	return &formField{kind: formIsFixed, label: label, fixed: value}
 }
 
 // formCheckField returns a checkbox.
@@ -106,6 +140,8 @@ func (f *formField) value() string {
 		return ""
 	case formIsCheck:
 		return strconv.FormatBool(f.on)
+	case formIsFixed:
+		return f.fixed
 	}
 	return f.in.Value()
 }
@@ -137,6 +173,12 @@ func (f *formField) input(msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
+// formControl reports whether r is a control character other than the
+// tab: C0, DEL or C1.
+func formControl(r rune) bool {
+	return (r < 0x20 && r != '\t') || (r >= 0x7f && r <= 0x9f)
+}
+
 // formButton is a button of a dialog.
 type formButton struct {
 	label string
@@ -144,10 +186,16 @@ type formButton struct {
 	// closes, or why the form's values are not good, which the dialog
 	// shows and stays open. Nil changes nothing and closes the dialog.
 	press func(d *formDialog) (tea.Cmd, string)
+	// after: the command runs once the dialog has closed, rather than
+	// beside the closing: a command after which the dialog may be opened
+	// again needs the close to have been taken first.
+	after bool
 }
 
 // formDialog is a dialog with fields: the confirm dialog is one without.
 type formDialog struct {
+	// title, when there is one, is drawn in the box's top line.
+	title    string
 	question string
 	// names are all the names the dialog is about, cleaned; View lists
 	// as many as fit and counts the others.
@@ -184,6 +232,9 @@ func dialogForm(question string, names []string, fields []*formField, buttons ..
 		d.names = append(d.names, cleanLine(n))
 	}
 	d.setFocus(0)
+	if !d.focusable(0) {
+		d.moveFocus(1)
+	}
 	return d
 }
 
@@ -224,6 +275,26 @@ func (d *formDialog) setFocus(i int) {
 	}
 }
 
+// focusable reports whether the focus may stop at i: at a button, or at
+// a field that is not fixed.
+func (d *formDialog) focusable(i int) bool {
+	return i >= len(d.fields) || d.fields[i].kind != formIsFixed
+}
+
+// moveFocus moves the focus by step, around the ends, past the fields
+// that are fixed.
+func (d *formDialog) moveFocus(step int) {
+	n := len(d.fields) + len(d.buttons)
+	i := d.focus
+	for range n {
+		i = ((i+step)%n + n) % n
+		if d.focusable(i) {
+			break
+		}
+	}
+	d.setFocus(i)
+}
+
 // Init calls onOpen.
 func (d *formDialog) Init() tea.Cmd {
 	d.Drop()
@@ -247,6 +318,10 @@ func (d *formDialog) Update(msg tea.Msg) (dialog, tea.Cmd) {
 		return d, d.key(msg)
 	case tea.PasteMsg:
 		if f := d.focused(); f != nil {
+			if f.pasteRefused != "" && strings.ContainsFunc(msg.Content, formControl) {
+				d.why = f.pasteRefused
+				return d, nil
+			}
 			// Cleaned, on one line, and cut to what a field takes.
 			return d, f.input(tea.PasteMsg{Content: inputCut(cleanLine(msg.Content))})
 		}
@@ -262,18 +337,34 @@ func (d *formDialog) key(k tea.KeyPressMsg) tea.Cmd {
 	case "esc":
 		return closeDialog()
 	case "tab", "down":
-		d.setFocus(d.focus + 1)
+		d.moveFocus(1)
 		return nil
 	case "shift+tab", "up":
-		d.setFocus(d.focus - 1)
+		d.moveFocus(-1)
 		return nil
 	case "enter":
+		if f != nil && f.presses != "" {
+			for _, b := range d.buttons {
+				if b.label == f.presses {
+					return d.press(b)
+				}
+			}
+		}
 		if f != nil {
-			d.setFocus(d.focus + 1)
+			d.moveFocus(1)
 			return nil
 		}
 		return d.press(d.buttons[d.focus-len(d.fields)])
 	case "left", "right":
+		if f != nil && f.pick {
+			step := 1
+			if k.String() == "left" {
+				step = -1
+			}
+			n := max(len(f.options), 1)
+			f.at = ((f.at+step)%n + n) % n
+			return nil
+		}
 		if f == nil {
 			step := 1
 			if k.String() == "left" {
@@ -312,6 +403,9 @@ func (d *formDialog) press(b formButton) tea.Cmd {
 		d.why = why
 		return nil
 	}
+	if b.after {
+		return tea.Sequence(closeDialog(), cmd)
+	}
 	return tea.Batch(closeDialog(), cmd)
 }
 
@@ -334,7 +428,7 @@ func (d *formDialog) View(width, height int) string {
 		body = body[len(body)-room:]
 	}
 	side := styleBorder.Render("│")
-	lines := []string{styleBorder.Render("╭" + strings.Repeat("─", bw-2) + "╮")}
+	lines := []string{d.topLine(bw)}
 	for _, l := range body {
 		lines = append(lines, side+" "+fit(l, iw)+" "+side)
 	}
@@ -343,6 +437,19 @@ func (d *formDialog) View(width, height int) string {
 		lines = lines[len(lines)-height:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// topLine is the box's top line, bw cells wide, with the title in its
+// middle when the dialog has one.
+func (d *formDialog) topLine(bw int) string {
+	if d.title == "" {
+		return styleBorder.Render("╭" + strings.Repeat("─", bw-2) + "╮")
+	}
+	text := " " + ansi.Truncate(d.title, max(bw-6, 1), "…") + " "
+	tw := ansi.StringWidth(text)
+	left := max((bw-2-tw)/2, 0)
+	right := max(bw-2-tw-left, 0)
+	return styleBorder.Render("╭"+strings.Repeat("─", left)) + styleTitle.Render(text) + styleBorder.Render(strings.Repeat("─", right)+"╮")
 }
 
 // Fits reports whether the dialog, drawn at most width cells wide, shows
@@ -387,7 +494,12 @@ func (d *formDialog) body(iw, room int, blanks bool) (lines []string, ok bool) {
 		bottom = blank(bottom)
 	}
 	if d.why != "" {
-		for _, l := range dialogWrap(d.why, iw) {
+		why := dialogWrap(d.why, iw)
+		if len(why) > dialogWhyLines {
+			why = why[:dialogWhyLines]
+			why[dialogWhyLines-1] = fit(strings.TrimRight(why[dialogWhyLines-1], " ")+" …", iw)
+		}
+		for _, l := range why {
 			bottom = append(bottom, styleError.Render(l))
 		}
 		bottom = blank(bottom)
@@ -421,8 +533,12 @@ func (d *formDialog) fieldLine(f *formField, focused bool, lw, iw int) string {
 	label := styleHint.Render(fit(f.label, lw))
 	vw := max(iw-2-lw-2, 1)
 	var value string
-	switch f.kind {
-	case formIsChoice:
+	switch {
+	case f.kind == formIsFixed:
+		value = stylePromptText.Render(f.fixed)
+	case f.kind == formIsChoice && f.pick:
+		value = stylePromptText.Render("‹ " + f.value() + " ›")
+	case f.kind == formIsChoice:
 		var opts []string
 		for i, o := range f.options {
 			box := "( ) "
@@ -432,13 +548,17 @@ func (d *formDialog) fieldLine(f *formField, focused bool, lw, iw int) string {
 			opts = append(opts, box+o)
 		}
 		value = stylePromptText.Render(strings.Join(opts, "  "))
-	case formIsCheck:
+	case f.kind == formIsCheck:
 		value = stylePromptText.Render("[ ]")
 		if f.on {
 			value = stylePromptText.Render("[x]")
 		}
 	default:
 		f.in.SetWidth(max(vw-1, 1))
+		if f.scrolls {
+			// The text is scrolled to the cursor for this width.
+			f.in.SetCursor(f.in.Position())
+		}
 		value = f.in.View()
 	}
 	return mark + label + "  " + fit(value, vw)

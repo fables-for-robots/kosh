@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"sort"
 	"time"
 
@@ -118,6 +119,9 @@ func refresh() tea.Cmd            { return func() tea.Msg { return refreshMsg{} 
 type env struct {
 	sess kube.Session
 	now  func() time.Time
+	// handover gives the session's terminal to a shell (Options.Handover);
+	// nil when the session has none to give.
+	handover func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
 }
 
 // apiTimeout bounds every call a view makes to the session. No call to
@@ -145,6 +149,11 @@ type binding struct {
 	// the marked rows, or the row under the cursor when none is marked.
 	// It is not called for a table without rows.
 	Run func(e env, q kube.Query, refs []kube.ObjectRef) tea.Cmd
+	// Handover: the binding needs the session's terminal to hand over,
+	// and is not there without one (env.handover nil). It is for one
+	// row: Run is called with the row under the cursor alone, whatever
+	// rows are marked.
+	Handover bool
 }
 
 var bindings []binding

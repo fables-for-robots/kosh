@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -34,6 +35,7 @@ const (
 	MsgGrantChanged  = "kosh: what this key may do has changed; connect again"
 	MsgShuttingDown  = "kosh is shutting down"
 	MsgCrashed       = "kosh: this session has failed and was closed"
+	MsgInputFlood    = "kosh: the terminal sent what is no key, no paste and no report, and too much of it; this session was closed"
 )
 
 // Session is what the server tells the maker of a session's program.
@@ -49,7 +51,72 @@ type Session struct {
 	// Remote is the client's address: an IP address and port, or an
 	// endpoint ID.
 	Remote string
+
+	// Exec returns a command for the session's program that gives the
+	// session's terminal to run: the program leaves its screen, run is
+	// called with the terminal, and when run has returned the program
+	// has the terminal again, draws its screen, and is given done's
+	// message with what run returned. The program takes no message
+	// while run has not returned.
+	//
+	// run must return when its context is done, which it is when the
+	// session ends: the client gone, the channel closed, the key removed
+	// or changed, kosh shutting down. A run that waits then for a write
+	// to Terminal.Out that the client does not take is released with
+	// the connection: see there. done is told ErrTerminalBusy, and
+	// run is not called, when a command has the terminal already and
+	// still has it 200 ms later; it is told ErrSessionEnded when the
+	// session ended before run began.
+	//
+	// When run has returned the terminal is reset to its normal state,
+	// whatever run left it in: screen, colours, character set, margins,
+	// the modes of keys, mouse and paste. The program has the terminal
+	// back no sooner than 10 ms after run was called, however soon run
+	// returns. A panic in run ends the
+	// session as a crash of its program does: the client is told
+	// MsgCrashed, and done is not called.
+	Exec func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
 }
+
+// Terminal is a session's terminal for the time a command has it.
+type Terminal struct {
+	// In is what the client sends, from the hand-over on, the first
+	// byte included. It ends with io.EOF when the command's turn ends:
+	// nothing of what the client sends after that is lost to a reader
+	// that is still in Read. It ends so, too, when the session ends
+	// during the turn, which is when run's context is done.
+	In io.Reader
+	// Out is the client's terminal, byte for byte: the translation of
+	// line feeds that the program's own output gets is not applied. A
+	// write after the turn, or after the session's end during it, fails
+	// with io.ErrClosedPipe.
+	//
+	// A write that waits because the client is not reading cannot be
+	// ended from here: it is released when the client reads again or
+	// closes the channel, or when the connection is closed, and fails
+	// then with the channel's error. At the session's end the connection
+	// is closed after the end's timeout at the latest: a command that
+	// waits for such a write before it returns, and a turn that waits
+	// for one after its command has returned (it does, so that nothing
+	// of the command's is written after it), are cut off with the
+	// connection then, the client is not told why the session ended,
+	// and the log says that the write was what was waited for.
+	Out io.Writer
+	// Size returns the window's size now, in cells.
+	Size func() (width, height int)
+	// Resized has a value when the size has changed since Size was last
+	// asked.
+	Resized <-chan struct{}
+}
+
+var (
+	// ErrTerminalBusy is what Session.Exec's done is told when a command
+	// has the terminal already.
+	ErrTerminalBusy = errors.New("sshd: a command has the terminal")
+	// ErrSessionEnded is what Session.Exec's done is told when the
+	// session ended before the command began.
+	ErrSessionEnded = errors.New("sshd: the session has ended")
+)
 
 // Config configures a Server.
 type Config struct {
@@ -105,6 +172,21 @@ type Server struct {
 	// its program and say why. Then its connection is closed: a client
 	// that does not read cannot keep a session kosh has ended.
 	endTimeout time.Duration
+	// keyLinger is how long the connection of a key that has left the
+	// list stays open after its last session has ended, for its client
+	// to close it: see conn.lingerForKey.
+	keyLinger time.Duration
+	// minTurn is how long a command's turn with a session's terminal
+	// lasts at least: minTurn, but for a test.
+	minTurn time.Duration
+	// repairTurn is how long the turn lasts that repairs a session's
+	// screen: minTurn, but for a test.
+	repairTurn time.Duration
+	// onInput, when it is not nil, is called by a session's filter with
+	// each event the library makes of the program's input: a test makes
+	// the event loop slow with it, to have a session end with events in
+	// its reader's hand.
+	onInput func()
 
 	handshakes atomic.Int64 // connections in the handshake, over every listener
 
@@ -152,6 +234,9 @@ func New(cfg Config) (*Server, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		endTimeout: 2 * time.Second,
+		keyLinger:  time.Second,
+		minTurn:    minTurn,
+		repairTurn: minTurn,
 		listeners:  map[net.Listener]string{},
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},
@@ -204,7 +289,10 @@ func (s *Server) sessionChannel(srv *ssh.Server, sc *gossh.ServerConn, nc gossh.
 		return
 	}
 	defer c.closeChannel()
-	ssh.DefaultSessionHandler(srv, sc, filteredChannel{nc}, ctx)
+	// The session finds the channel the library accepts in its context:
+	// see rawWriter.
+	a := &accepted{}
+	ssh.DefaultSessionHandler(srv, sc, filteredChannel{nc, a}, channelContext{ctx, a})
 }
 
 // keyAccepted is the public key handler: a key is accepted when the key

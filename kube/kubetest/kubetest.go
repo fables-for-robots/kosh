@@ -50,6 +50,13 @@ type Session struct {
 	Errs map[string]error
 	// TriggerName is the job name Trigger returns.
 	TriggerName string
+	// ExecResult is what Exec returns when Errs has no error for it and
+	// ExecDo is nil.
+	ExecResult kube.ExecResult
+	// ExecDo, when set, is what Exec does after its call was recorded,
+	// with the options it was given: a test that types into a shell
+	// and reads what it prints sets it.
+	ExecDo func(ctx context.Context, pod kube.ObjectRef, opts kube.ExecOptions) (kube.ExecResult, error)
 
 	mu      sync.Mutex
 	watches map[string]*Watch
@@ -393,6 +400,16 @@ func (s *Session) Cordon(_ context.Context, node kube.ObjectRef, on bool) error 
 
 func (s *Session) Drain(_ context.Context, node kube.ObjectRef, opts kube.DrainOptions) error {
 	return s.action("Drain", node, opts)
+}
+
+func (s *Session) Exec(ctx context.Context, pod kube.ObjectRef, opts kube.ExecOptions) (kube.ExecResult, error) {
+	if err := s.action("Exec", pod, opts); err != nil {
+		return kube.ExecResult{}, err
+	}
+	if s.ExecDo != nil {
+		return s.ExecDo(ctx, pod, opts)
+	}
+	return s.ExecResult, nil
 }
 
 // Watch is the watch of a query of a Session.

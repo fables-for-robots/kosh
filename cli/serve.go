@@ -256,7 +256,7 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		Version:    Version,
 		Log:        log,
 		Model: func(s sshd.Session) tea.Model {
-			return tui.New(cluster.Session(s.Context, s.Grant), tui.Options{Version: Version})
+			return tui.New(cluster.Session(s.Context, s.Grant), uiOptions(s))
 		},
 	})
 	if err != nil {
@@ -311,6 +311,23 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		o.started(s)
 	}
 	return nil
+}
+
+// uiOptions are the options of a session's program. A full key's session
+// is given the session's terminal, for a shell in a pod; a read-only
+// key's is not, so that no shell is reachable from it whatever the UI
+// binds. tui does not know sshd: its Terminal is sshd's, field for
+// field.
+func uiOptions(s sshd.Session) tui.Options {
+	opts := tui.Options{Version: Version}
+	if !s.Grant.ReadOnly {
+		opts.Handover = func(run func(context.Context, tui.Terminal) error, done func(error) tea.Msg) tea.Cmd {
+			return s.Exec(func(ctx context.Context, t sshd.Terminal) error {
+				return run(ctx, tui.Terminal(t))
+			}, done)
+		}
+	}
+	return opts
 }
 
 // serve runs the server's Serve for l, the transport transport, in a

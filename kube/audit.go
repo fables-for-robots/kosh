@@ -28,6 +28,7 @@ const (
 	actCordon    = "cordon"
 	actUncordon  = "uncordon"
 	actDrain     = "drain"
+	actExec      = "exec"
 )
 
 // The words of the reads that the grant decides, as the log names them.

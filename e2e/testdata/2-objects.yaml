@@ -21,6 +21,33 @@ spec:
         - -c
         - 'i=0; while true; do echo "kosh-e2e-marker $i"; i=$((i+1)); sleep 1; done'
 ---
+# pair has two containers, and names the second as the one a shell goes
+# into first. Each writes into its own /tmp which container it is.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pair
+  namespace: default
+  annotations:
+    kubectl.kubernetes.io/default-container: second
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: first
+      image: registry.k8s.io/e2e-test-images/busybox:1.37.0-2@sha256:690925c6f3493b235eb590113f8c481564dcd4f1962cf7d5b321f185980721ef
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - 'echo kosh-e2e-in-first >/tmp/kosh-e2e-container; while true; do sleep 3600; done'
+    - name: second
+      image: registry.k8s.io/e2e-test-images/busybox:1.37.0-2@sha256:690925c6f3493b235eb590113f8c481564dcd4f1962cf7d5b321f185980721ef
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - 'echo kosh-e2e-in-second >/tmp/kosh-e2e-container; while true; do sleep 3600; done'
+---
 # web is scaled and its pod killed.
 apiVersion: apps/v1
 kind: Deployment

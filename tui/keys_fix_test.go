@@ -78,6 +78,11 @@ func TestHelpListsEveryKey(t *testing.T) {
 	hs := newHarness(t, sess, 120, 40)
 	keysOf := append([]string(nil), tableKeys...)
 	for _, b := range bindingsFor(kubetest.Resource("pods"), keys.Grant{Name: "alice@laptop"}) {
+		if b.Handover {
+			// This program has no terminal to hand over, and so not the
+			// key (TestShellBinding has the help with one).
+			continue
+		}
 		keysOf = append(keysOf, b.Key)
 	}
 	hs.press("?")

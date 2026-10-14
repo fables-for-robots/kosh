@@ -114,7 +114,7 @@ func (v *tableView) runBinding(key string) tea.Cmd {
 			refs = append(refs, v.ref(r))
 		}
 	}
-	if len(refs) == 0 {
+	if len(refs) == 0 || b.Handover {
 		refs = []kube.ObjectRef{v.ref(&v.data.rows[v.shown[v.cursor]])}
 	}
 	return b.Run(v.e, v.q, refs)
@@ -122,10 +122,7 @@ func (v *tableView) runBinding(key string) tea.Cmd {
 
 // bindingOf returns the table's binding of key.
 func (v *tableView) bindingOf(key string) (binding, bool) {
-	if v.plain {
-		return binding{}, false
-	}
-	for _, b := range bindingsFor(v.q.Resource, v.grant) {
+	for _, b := range v.bindings() {
 		if b.Key == key && b.Run != nil {
 			return b, true
 		}
@@ -231,10 +228,25 @@ func (v *tableView) ownHints() []hint {
 // bindingHints are the hints of the table's bindings.
 func (v *tableView) bindingHints() []hint {
 	var hs []hint
-	if !v.plain {
-		for _, b := range bindingsFor(v.q.Resource, v.grant) {
-			hs = append(hs, b.Hint)
-		}
+	for _, b := range v.bindings() {
+		hs = append(hs, b.Hint)
 	}
 	return hs
+}
+
+// bindings are the table's bindings: none for a plain table, and none
+// that hands the terminal over when the session has no terminal to hand
+// over.
+func (v *tableView) bindings() []binding {
+	if v.plain {
+		return nil
+	}
+	var out []binding
+	for _, b := range bindingsFor(v.q.Resource, v.grant) {
+		if b.Handover && v.e.handover == nil {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
