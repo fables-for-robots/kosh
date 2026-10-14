@@ -305,9 +305,8 @@ func (sess *session) filter(_ tea.Model, msg tea.Msg) tea.Msg {
 	input := fromInput(msg)
 	if input {
 		sess.in.eventSeen()
-		// The time of the last event of the reader's, for wind: an event
-		// just taken from the reader means the reader was sending it a
-		// moment ago, so the reader is not done.
+		// The time of the last event of the reader's, for wind: a reader
+		// that has just had an event taken from it may have another.
 		sess.lastEvent.Store(time.Now().UnixNano())
 		if sess.srv.slowInput > 0 {
 			// A test makes the event loop slow to take the reader's
@@ -369,31 +368,34 @@ func fromInput(msg tea.Msg) bool {
 // The library's reader gives the program what it has made of the input
 // one event at a time, and waits with each for the program to take it;
 // on its way out — the context, an error, its escape timeout, or the
-// io.EOF given here (endProgram) — it hands over, in events, whatever it
-// had gathered but not finished (an unfinished control sequence, or a
-// string of any kind, is one event). A program that has ended takes none
-// of it, and the reader is left for good on that last send. So the
-// program is kept running, its event loop taking the reader's events,
-// which the filter drops, until the reader has given its end (told) and
-// then gone quiet: an event taken means the reader was sending a moment
-// ago, so "told, and no event for windQuiet" is the reader done. Only
-// then does quit end the program.
+// io.EOF given here — it hands over, in events, whatever it had gathered
+// but not finished (an unfinished control sequence, or a string of any
+// kind, is one event). A program that has ended takes none of it, and
+// the reader is left for good on that send. So the program is kept
+// running, its event loop taking the reader's events, which the filter
+// drops, until the reader has ended. That is known in two steps:
 //
-// This does not give the reader the mark: the mark's escape, appended to
+//   - told: the reader has every event of what it had read taken from
+//     it, however many they are and however slow the program is to take
+//     them, and has been given io.EOF (see endProgram).
+//   - Then the reader hands over what it had gathered unfinished, which
+//     nothing tells the end of: wind waits until no event has come for
+//     windQuiet. It was one event in every state that was tried, handed
+//     over at once.
+//
+// Only then does quit end the program.
+//
+// The reader is not given the mark here: the mark's escape, appended to
 // an unfinished string, is read as the string's content, and the library
-// then makes the string into a key for each of its bytes, as many events
-// as it has bytes. A plain io.EOF makes the unfinished thing one event,
-// and the end rests on the reader falling quiet, not on a fixed wait: it
-// waits as long as the reader keeps handing events over. The cap is the
-// session's end timeout, which a program that takes nothing (its client
-// does not read) would reach whatever is done here; a wind that reaches
-// it says so.
+// then makes the string into a key for each of its bytes. The cap on
+// both steps is the session's end timeout, which a program that takes
+// nothing (its client does not read) would reach whatever is done here;
+// a wind that reaches it says so.
 func (sess *session) wind() {
 	sess.windOnce.Do(func() {
 		defer sess.wound.Store(true)
 		sess.winding.Store(true)
-		sess.lastEvent.Store(time.Now().UnixNano())
-		told, gathered := sess.in.endProgram()
+		told := sess.in.endProgram()
 
 		deadline := time.NewTimer(sess.srv.endTimeout)
 		defer deadline.Stop()
@@ -402,19 +404,15 @@ func (sess *session) wind() {
 				"transport", sess.conn.transport, "remote", sess.conn.remote,
 				"key", sess.grant.Name, "fingerprint", fingerprint(sess.key))
 		}
-		// Wait for the reader to be told its end.
 		select {
 		case <-told:
 		case <-deadline.C:
 			gaveUp()
 			return
 		}
-		// When the library held nothing unfinished, the reader's io.EOF
-		// hands nothing over: it is done now. Otherwise wait until it has
-		// gone quiet: an event taken means it was sending a moment ago.
-		if !gathered {
-			return
-		}
+		// What the reader hands over on its way out comes now, or does
+		// not come.
+		sess.lastEvent.Store(time.Now().UnixNano())
 		tick := time.NewTicker(windQuiet / 2)
 		defer tick.Stop()
 		for {
@@ -540,9 +538,9 @@ const (
 	drainMark = "\x1b[?28657;0$y"
 	// drainWait is how long a hand-over waits for the mark to arrive.
 	drainWait = 250 * time.Millisecond
-	// windQuiet is how long the program's reader must have had no event
-	// taken from it, after it has been told its end, for wind to count it
-	// done: see wind.
+	// windQuiet is how long no event must have come from the program's
+	// reader, after it has been told its end, for wind to count it gone.
+	// Every session's end lasts this long: see wind.
 	windQuiet = 50 * time.Millisecond
 )
 
@@ -825,9 +823,11 @@ type input struct {
 	// ended is set when the program's reader is to return io.EOF, and so
 	// is any reader after it. endTold is what endProgram returns and wind
 	// waits on, kept across calls.
-	ended       bool
-	endTold     chan struct{}
-	endGathered bool
+	ended   bool
+	endTold chan struct{}
+	// synced is set when the program's reader has been given the read of
+	// no bytes that comes before its end: see sync.
+	synced bool
 
 	// turn is the reader of the command that has the terminal, or nil
 	// when the program has it.
@@ -908,13 +908,17 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 			// The program's reader while a command has the terminal: the
 			// mark once (so the model has every key read before the
 			// hand-over), then io.EOF, and no byte of the client's. At
-			// the program's end (in.ended): io.EOF at once, no mark (see
-			// wind), and the library hands the program whatever it had.
+			// the program's end (in.ended): no mark (see wind), a read
+			// of no bytes (see sync), and then io.EOF, at which the
+			// library hands the program whatever it had gathered.
 			if in.mark && in.turn != nil && len(p) >= len(drainMark) {
 				in.mark = false
 				return copy(p, drainMark), nil
 			}
 			in.mark = false
+			if in.turn == nil && in.sync() {
+				return 0, nil
+			}
 			if in.told != nil {
 				close(in.told)
 				in.told = nil
@@ -958,6 +962,9 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 		case in.err != nil:
 			if c != nil {
 				return 0, io.EOF
+			}
+			if in.sync() {
+				return 0, nil
 			}
 			in.gone = true
 			return 0, in.err
@@ -1005,21 +1012,19 @@ func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan
 	return c, d, t
 }
 
-// endProgram ends the program's reading: its reader returns io.EOF from
-// now on, and so does a reader Bubble Tea starts later. It returns told,
-// closed when that io.EOF has been given — closed already when no reader
-// of the program is waiting: a command has the terminal, or the reader
-// was told the channel's end. A second call returns the same told. It
-// also returns gathered, whether the library may hold something
-// unfinished to hand over at the reader's io.EOF (bytes were given it
-// that no event has answered, or wait unread): see wind. The library
-// hands the program whatever it had gathered when the reader reaches
-// io.EOF; wind keeps the program taking it.
-func (in *input) endProgram() (told <-chan struct{}, gathered bool) {
+// endProgram ends the program's reading: its reader is given a read of
+// no bytes (see sync) and then io.EOF, and a reader that Bubble Tea
+// starts later the same. It returns told, closed when that io.EOF has
+// been given, which is when the program has taken every event of what
+// the reader had read — closed already when no reader of the program is
+// to come for it: a command has the terminal, or the reader was told the
+// channel's end. A second call returns the same told. What the library
+// had gathered unfinished it hands the program after told: wind keeps
+// the program taking it.
+func (in *input) endProgram() (told <-chan struct{}) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	if in.endTold == nil {
-		in.endGathered = in.unanswered > 0 || len(in.buf) > 0 || in.paste.in
 		in.endTold = make(chan struct{})
 		in.told = in.endTold
 		if in.ended || in.turn != nil || in.gone {
@@ -1030,7 +1035,26 @@ func (in *input) endProgram() (told <-chan struct{}, gathered bool) {
 		in.ended = true
 		in.cond.Broadcast()
 	}
-	return in.endTold, in.endGathered
+	return in.endTold
+}
+
+// sync reports, once, that the program's reader is to be given a read of
+// no bytes before it is told its end. It is called with mu held.
+//
+// The library reads in one goroutine and makes events, and hands them to
+// the program, in another, which takes a read only when it has handed
+// over every event of the reads before it. A read of no bytes makes no
+// event and changes nothing of what the library has gathered; when the
+// reader comes back for the read after it, the program has taken every
+// event of what was read before. So the end that is told then is told a
+// reader that has nothing in hand but what it had gathered unfinished,
+// whatever the speed of the program's event loop.
+func (in *input) sync() bool {
+	if in.synced {
+		return false
+	}
+	in.synced = true
+	return true
 }
 
 // eventSeen is called when the library has made an event of what the

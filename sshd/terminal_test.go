@@ -341,8 +341,10 @@ func TestInputIsTheOneReadersWhoseTurnItIs(t *testing.T) {
 	in.takeBack(command)
 	wantRead(t, "the program after the turn that was cut short", readOnce(program), "gh", nil)
 
-	// The end of the channel is every reader's end, and the pump's.
+	// The end of the channel is every reader's end, and the pump's. The
+	// program's reader is given a read of no bytes before it.
 	_ = client.Close()
+	wantRead(t, "the program before the channel's end", readOnce(program), "", nil)
 	wantRead(t, "the program at the channel's end", readOnce(program), "", io.EOF)
 	select {
 	case <-pumped:
@@ -355,6 +357,63 @@ func TestInputIsTheOneReadersWhoseTurnItIs(t *testing.T) {
 		t.Error("a hand-over after the program's reader has ended waits for that reader")
 	}
 	wantRead(t, "the command at the channel's end", readOnce(command), "", io.EOF)
+}
+
+// TestProgramsReaderIsToldItsEndAfterAReadOfNoBytes ends the program's
+// reading, as a session's end does: a reader that waits is given a read
+// of no bytes, and its end with the read after that, which is when the
+// end counts as told. No byte of the client's is the reader's from then
+// on, a later reader of the program is told the end at once, and no
+// command is given the terminal.
+func TestProgramsReaderIsToldItsEndAfterAReadOfNoBytes(t *testing.T) {
+	channel, client := io.Pipe()
+	in := newInput()
+	go in.pump(channel)
+	defer func() { _ = client.Close() }()
+	program := programInput{in}
+
+	waiting := readOnce(program)
+	told := in.endProgram()
+	wantRead(t, "the reader that waited", waiting, "", nil)
+	if isClosed(told) {
+		t.Fatal("the end counts as told with the read of no bytes: the library may still have events of the reads before it")
+	}
+	if _, err := io.WriteString(client, "late"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the bytes are in", func() bool {
+		in.mu.Lock()
+		defer in.mu.Unlock()
+		return len(in.buf) == 4
+	})
+	wantRead(t, "the reader's next read", readOnce(program), "", io.EOF)
+	if !isClosed(told) {
+		t.Error("the reader was told its end, and the end does not count as told")
+	}
+	if again := in.endProgram(); again != told {
+		t.Error("a second end of the program's reading has another told")
+	}
+	wantRead(t, "a later reader of the program", readOnce(program), "", io.EOF)
+	if command, _, _ := in.give(0); command != nil {
+		t.Error("a command was given the terminal after the program's reading had ended")
+	}
+
+	// While a command has the terminal no reader of the program is to
+	// come for its end: it counts as told at once. The reader that
+	// Bubble Tea starts after the turn is given the same two reads.
+	in = newInput()
+	command, _, _ := in.give(0)
+	if command == nil {
+		t.Fatal("no command was given the terminal")
+	}
+	wantRead(t, "the program's reader at the hand-over", readOnce(programInput{in}), drainMark, nil)
+	wantRead(t, "the program's reader after the mark", readOnce(programInput{in}), "", io.EOF)
+	if told := in.endProgram(); !isClosed(told) {
+		t.Error("the end of the program's reading waits for a reader while a command has the terminal")
+	}
+	in.takeBack(command)
+	wantRead(t, "the reader after the turn", readOnce(programInput{in}), "", nil)
+	wantRead(t, "the reader after the turn, again", readOnce(programInput{in}), "", io.EOF)
 }
 
 // TestInputEndsWhenItIsClosed closes an input whose channel stays open,
@@ -370,7 +429,8 @@ func TestInputEndsWhenItIsClosed(t *testing.T) {
 	}()
 	waiting := readOnce(programInput{in})
 	in.close()
-	wantRead(t, "the program's reader of a closed input", waiting, "", io.EOF)
+	wantRead(t, "the program's reader before the end of a closed input", waiting, "", nil)
+	wantRead(t, "the program's reader of a closed input", readOnce(programInput{in}), "", io.EOF)
 	_ = client.Close()
 	select {
 	case <-pumped:
@@ -395,6 +455,7 @@ func TestInputEndsWhenItIsClosed(t *testing.T) {
 		return len(in.buf) == 4
 	})
 	in.close()
+	wantRead(t, "the program's reader before the end of an input closed with bytes waiting", readOnce(programInput{in}), "", nil)
 	wantRead(t, "the program's reader of an input closed with bytes waiting", readOnce(programInput{in}), "", io.EOF)
 	_ = client.Close()
 	select {
@@ -2654,7 +2715,7 @@ var openStates = []struct{ name, prefix string }{
 	{"mid-APC", "\x1b_application program command"},
 	{"mid-SOS", "\x1bXstart of string"},
 	{"mid-PM", "\x1b^privacy message"},
-	{"half a UTF-8 character", "ok\xc3"},
+	{"half a UTF-8 character", "\xc3"},
 	{"an escape pending", "\x1b"},
 }
 
@@ -2669,15 +2730,11 @@ func TestSessionEndsMidSequence(t *testing.T) {
 		t.Run(st.name, func(t *testing.T) {
 			hv := newHandover(nil)
 			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 50 * time.Microsecond }))
-			sess := h.onlySession()
-			tm.press(st.prefix)
-			// The pump has handed the prefix to the library's reader: the
-			// library holds it, unfinished, as the session is ended.
-			eventually(t, "the server has handed the prefix on", func() bool {
-				sess.in.mu.Lock()
-				defer sess.in.mu.Unlock()
-				return len(sess.in.buf) == 0
-			})
+			// A key before the prefix, in one write with it: when the
+			// model has the key, the library has read the prefix too,
+			// and holds it, unfinished, as the session is ended.
+			tm.press("z" + st.prefix)
+			hv.wait(t, "the model has the key before the prefix", func() bool { return len(hv.keys) > 0 })
 			hv.mu.Lock()
 			before := strings.Join(hv.keys, "")
 			hv.mu.Unlock()
@@ -2733,10 +2790,74 @@ func TestFloodEndsLeaveNoReaderWithASlowLoop(t *testing.T) {
 	}
 }
 
+// TestSessionEndsWithKeysInHand ends a session while the library's
+// reader has thousands of keys to hand over, all of one read, of which
+// the program has taken the first: with a slow event loop and one CPU.
+// The keys are complete, so nothing says that the library has anything
+// gathered, and the end has to wait for the reader all the same: the
+// reader is left behind a program that ends before it has taken them.
+// Nothing of the server is left (the harness checks), and no end gave
+// the reader up.
+func TestSessionEndsWithKeysInHand(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	// Fewer than one read of the library's (4096 bytes), and 0.6 s of
+	// events at the pace of the loop: well within the end's timeout.
+	keys := strings.Repeat("x", 3000)
+	// The model has the first of them: the library has read them all,
+	// and has the rest to hand over.
+	first := func(t *testing.T, hv *handover) {
+		hv.wait(t, "the model has the first key", func() bool { return len(hv.keys) > 0 })
+	}
+	for _, tc := range []struct {
+		name string
+		end  func(t *testing.T, h *harness, hv *handover, tm *term)
+	}{
+		{"the model quits", func(t *testing.T, _ *harness, _ *handover, tm *term) {
+			tm.press("q" + keys)
+			if status := tm.exit(); status != 0 {
+				t.Errorf("exit status %d, want 0", status)
+			}
+		}},
+		{"the key is removed", func(t *testing.T, h *harness, hv *handover, tm *term) {
+			tm.press(keys)
+			first(t, hv)
+			setKeys(t, h.list)
+			if status := tm.exit(); status != 1 {
+				t.Errorf("exit status %d, want 1", status)
+			}
+		}},
+		{"the client closes the channel", func(t *testing.T, _ *harness, hv *handover, tm *term) {
+			tm.press(keys)
+			first(t, hv)
+			_ = tm.sess.Close()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hv := newHandover(nil)
+			h, tm := startHandover(t, hv, withServer(func(s *Server) { s.slowInput = 200 * time.Microsecond }))
+			tc.end(t, h, hv, tm)
+			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+			hv.mu.Lock()
+			given := len(hv.keys)
+			hv.mu.Unlock()
+			if given >= len(keys) {
+				t.Fatalf("the model was given %d keys: the session did not end with keys in hand", given)
+			}
+			for _, r := range h.log.records() {
+				if strings.HasPrefix(r.Msg, "the program's reader did not end in time") {
+					t.Errorf("the end gave the reader up: %v", r)
+				}
+			}
+			// The harness's cleanup checks no goroutine is left.
+		})
+	}
+}
+
 // TestEndsAreStillFast times an ordinary quit and an end at the table,
-// so a change that made winding wait is seen. One harness, a session
-// opened and ended at a time, so the harness's goroutine check does not
-// see many servers at once.
+// so a change that made winding wait long is seen: an end waits
+// windQuiet for its reader, and no more when the reader had nothing in
+// hand. One harness, a session opened and ended at a time, so the
+// harness's goroutine check does not see many servers at once.
 func TestEndsAreStillFast(t *testing.T) {
 	const n = 10
 	hv := newHandover(nil)
