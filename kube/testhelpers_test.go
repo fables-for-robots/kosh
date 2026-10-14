@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -245,6 +246,51 @@ func testScheme() *runtime.Scheme {
 	return s
 }
 
+// newDynamicFake is dynamicfake.NewSimpleDynamicClient over testScheme,
+// holding objs, which also lists the metrics API: the fake panics on a
+// list of a resource whose list kind it does not know, and it cannot
+// guess pods.metrics.k8s.io from the kind PodMetrics. What the metrics
+// lists hold is served by a test's reactor.
+func newDynamicFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	typed := testScheme()
+	s := runtime.NewScheme()
+	for gvk := range typed.AllKnownTypes() {
+		if strings.HasSuffix(gvk.Kind, "List") {
+			s.AddKnownTypeWithName(gvk, &unstructured.UnstructuredList{})
+		} else {
+			s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		}
+	}
+	us := make([]runtime.Object, 0, len(objs))
+	for _, o := range objs {
+		m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
+		if err != nil {
+			panic(err)
+		}
+		u := &unstructured.Unstructured{Object: m}
+		gvk := u.GroupVersionKind()
+		if gvk.Group == "" || gvk.Kind == "" {
+			gvks, _, err := typed.ObjectKinds(o)
+			if err != nil {
+				panic(err)
+			}
+			gvk = gvks[0]
+			u.SetGroupVersionKind(gvk)
+		}
+		if !s.Recognizes(gvk) {
+			s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		}
+		if list := gvk.GroupVersion().WithKind(gvk.Kind + "List"); !s.Recognizes(list) {
+			s.AddKnownTypeWithName(list, &unstructured.UnstructuredList{})
+		}
+		us = append(us, u)
+	}
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(s, map[schema.GroupVersionResource]string{
+		PodMetrics:  "PodMetricsList",
+		NodeMetrics: "NodeMetricsList",
+	}, us...)
+}
+
 // env is a Cluster on client-go's fakes, and the fakes.
 type env struct {
 	c         *Cluster
@@ -268,7 +314,7 @@ type envConfig struct {
 func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 	t.Helper()
 	e := &env{
-		dyn:       dynamicfake.NewSimpleDynamicClient(testScheme(), objs...),
+		dyn:       newDynamicFake(objs...),
 		typed:     fake.NewSimpleClientset(objs...),
 		renderers: newTestRenderers(),
 	}

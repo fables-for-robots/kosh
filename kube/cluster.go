@@ -39,6 +39,9 @@ type Options struct {
 	// DiscoveryEvery is how often the API's resources are read again.
 	// Zero means 5 minutes.
 	DiscoveryEvery time.Duration
+	// MetricsPoll is how often the metrics of a kind are read while a
+	// watch shows them. Zero means 15 seconds.
+	MetricsPoll time.Duration
 	// Renderers returns the renderer of a resource. Nil means
 	// render.For. Tests give their own.
 	Renderers func(schema.GroupVersionResource) (render.Renderer, bool)
@@ -82,9 +85,10 @@ type Cluster struct {
 	missMu   sync.Mutex
 	lastMiss time.Time // of the last discovery that Resolve asked for
 
-	mu     sync.Mutex
-	caches map[schema.GroupVersionResource]*kindCache
-	closed bool
+	mu      sync.Mutex
+	caches  map[schema.GroupVersionResource]*kindCache
+	pollers map[schema.GroupVersionResource]*metricsPoller
+	closed  bool
 }
 
 type noCopy struct{}
@@ -94,6 +98,7 @@ const (
 	defaultIdleStop       = 10 * time.Minute
 	defaultTablePoll      = 2 * time.Second
 	defaultDiscoveryEvery = 5 * time.Minute
+	defaultMetricsPoll    = 15 * time.Second
 	defaultUserAgent      = "kosh"
 )
 
@@ -109,6 +114,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.DiscoveryEvery <= 0 {
 		o.DiscoveryEvery = defaultDiscoveryEvery
+	}
+	if o.MetricsPoll <= 0 {
+		o.MetricsPoll = defaultMetricsPoll
 	}
 	if o.Renderers == nil {
 		o.Renderers = render.For
@@ -137,9 +145,10 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 		openLog: func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
 			return typed.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
 		},
-		ctx:    ctx,
-		cancel: cancel,
-		caches: map[schema.GroupVersionResource]*kindCache{},
+		ctx:     ctx,
+		cancel:  cancel,
+		caches:  map[schema.GroupVersionResource]*kindCache{},
+		pollers: map[schema.GroupVersionResource]*metricsPoller{},
 	}
 	if cfg != nil {
 		tables, err := newRESTTables(cfg)
