@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
@@ -735,4 +738,55 @@ func TestCellsFromTheClusterAreCleaned(t *testing.T) {
 		}
 	}
 	hs.wantFrame("denied")
+}
+
+// A pods table with the metric columns, as kube serves it while the
+// cluster has metrics-server, sorts by CPU through Sort Column: by the
+// number, with n/a as 0.
+func TestSortByCPU(t *testing.T) {
+	r, _ := render.For(render.Pods)
+	m := r.(render.Metered)
+	tb := kube.Table{Columns: r.Columns(), Namespaced: true}
+	for _, p := range []struct {
+		name string
+		cpu  string // empty: the reading did not cover the pod
+	}{{"pod-a", "250m"}, {"pod-b", ""}, {"pod-c", "9m"}} {
+		obj := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: p.name, CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c1", Image: "busybox"}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		row, err := r.Row(obj, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.cpu != "" {
+			q := resource.MustParse(p.cpu)
+			m.Meter(&row, obj, map[string]render.Usage{"c1": {CPU: q.MilliValue(), Mem: 1 << 20}})
+		}
+		tb.Rows = append(tb.Rows, row)
+	}
+	sess := newSession()
+	sess.SetTable(query("pods", "default"), tb)
+	hs := newHarness(t, sess, 200, 30)
+	hs.awaitFrame("pod-c")
+	for range len(tb.Columns) {
+		v := hs.table()
+		if v.data.cols[v.vis[v.colAt]].Name == "CPU" {
+			break
+		}
+		hs.press("right")
+	}
+	hs.press("O")
+	if !strings.Contains(hs.tableHeader(), "CPU↑") {
+		t.Fatalf("the header is %q", hs.tableHeader())
+	}
+	// As text the order would be 250, 9, n/a.
+	if got, want := hs.order("pod-a", "pod-b", "pod-c"), []string{"pod-b", "pod-c", "pod-a"}; !slices.Equal(got, want) {
+		t.Errorf("by CPU: the order is %q, want %q", got, want)
+	}
+	hs.press("O")
+	if got, want := hs.order("pod-a", "pod-b", "pod-c"), []string{"pod-a", "pod-c", "pod-b"}; !slices.Equal(got, want) {
+		t.Errorf("by CPU again: the order is %q, want %q", got, want)
+	}
 }
