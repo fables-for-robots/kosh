@@ -2,6 +2,14 @@
 // of the hand-over read the screen a terminal would show, and the e2e
 // package cannot be imported (it is a test file, behind a build tag).
 // Change the original, and copy it again.
+//
+// This copy knows more than the original, for the tests of what is
+// written when a command gives the terminal back: the normal screen and
+// the alternate one each keep what they show and each have a saved
+// cursor, as xterm has them (DECSC and DECRC use the one of the screen
+// that is shown; mode 1049 saves and restores the normal screen's); and
+// setting or resetting origin mode homes the cursor. Origin mode itself,
+// positions counted from the scroll region, is not modelled.
 
 package sshd
 
@@ -47,10 +55,15 @@ type screen struct {
 	insert   bool
 	top, bot int // the scroll region, rows inclusive
 	saved    [2]int
-	last     rune // for REP
-	all      bytes.Buffer
-	watched  []string          // texts to look for after every write
-	seenAt   map[string]string // where each watched text was first seen
+	// alt is set while the alternate screen is shown; other is what the
+	// screen that is not shown holds, and otherSaved its saved cursor.
+	alt        bool
+	other      [][]rune
+	otherSaved [2]int
+	last       rune // for REP
+	all        bytes.Buffer
+	watched    []string          // texts to look for after every write
+	seenAt     map[string]string // where each watched text was first seen
 }
 
 // newScreen returns a blank screen of w by h.
@@ -191,7 +204,14 @@ func (s *screen) resizeLocked(w, h int) {
 			copy(cells[y], s.cells[y])
 		}
 	}
-	s.cells, s.w, s.h = cells, w, h
+	other := make([][]rune, h)
+	for y := range other {
+		other[y] = blankRow(w)
+		if y < len(s.other) {
+			copy(other[y], s.other[y])
+		}
+	}
+	s.cells, s.other, s.w, s.h = cells, other, w, h
 	s.top, s.bot = 0, h-1
 	s.x, s.y = min(s.x, w-1), min(s.y, h-1)
 	s.wrapNext = false
@@ -367,15 +387,29 @@ func (s *screen) csi(cmd ansi.Cmd, params ansi.Params) {
 			switch mode {
 			case 7:
 				s.autowrap = on
-			case 47, 1047, 1049: // the alternate screen, or back: blank either way
-				if mode == 1049 && on {
+			case 6: // origin mode: not modelled, but for its homing
+				s.x, s.y, s.wrapNext = 0, 0, false
+			case 47, 1047, 1049:
+				// The alternate screen, or back. Each screen keeps what
+				// it shows; the alternate one is blank when it is entered.
+				// 1049 saves the cursor before it leaves the normal screen
+				// and restores it when it is back there, also when it was
+				// there already.
+				if mode == 1049 && on && !s.alt {
 					s.saved = [2]int{s.x, s.y}
 				}
-				for y := range s.cells {
-					s.cells[y] = blankRow(s.w)
+				if on != s.alt {
+					s.cells, s.other = s.other, s.cells
+					s.saved, s.otherSaved = s.otherSaved, s.saved
+					s.alt = on
+					if on {
+						for y := range s.cells {
+							s.cells[y] = blankRow(s.w)
+						}
+					}
 				}
 				if mode == 1049 && !on {
-					s.x, s.y = s.saved[0], s.saved[1]
+					s.x, s.y, s.wrapNext = s.saved[0], s.saved[1], false
 				}
 			}
 		})

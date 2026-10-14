@@ -415,7 +415,6 @@ func TestInputIsBounded(t *testing.T) {
 	tm.waitFor("LASTLINE")
 	sess := h.onlySession()
 
-	// A paste, so that megabytes are one message for the model.
 	// Pastes, so that megabytes are few messages for the model; each of
 	// less than pasteLimit, beyond which a paste is cut.
 	const size, pastes = 16 << 20, 32
@@ -2211,5 +2210,156 @@ func TestPasteMarkAcrossThePumpsBuffer(t *testing.T) {
 			t.Errorf("split %d: the program read %d bytes of %d, the same: %v; the scanner is in a paste: %v", split, len(got), len(sent), string(got) == sent, inPaste)
 		}
 		_ = client.Close()
+	}
+}
+
+// at returns the screen of an 80 by 24 terminal that was sent what the
+// session has written up to the end of the n-th text among its output,
+// and the place of the cursor then, column and row from 0.
+func at(t *testing.T, tm *term, text string, n int) (scr *screen, x, y int) {
+	t.Helper()
+	out := tm.stdout.String()
+	end := 0
+	for range n {
+		i := strings.Index(out[end:], text)
+		if i < 0 {
+			t.Fatalf("the session has not written %q %d times", text, n)
+		}
+		end += i + len(text)
+	}
+	scr = feed(80, 24, out[:end])
+	scr.mu.Lock()
+	defer scr.mu.Unlock()
+	return scr, scr.x, scr.y
+}
+
+// rowOf returns the row of the screen that is text, or -1.
+func rowOf(scr *screen, text string) int {
+	for y, line := range scr.lines() {
+		if strings.TrimRight(line, " ") == text {
+			return y
+		}
+	}
+	return -1
+}
+
+// TestResetLeavesTheCursor has a command print lines on the normal
+// screen and return: when the reset has been written the cursor is where
+// the command left it, below what it printed, and not at the top of the
+// screen, where the next thing printed would be written over the old.
+func TestResetLeavesTheCursor(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+	tm.press("!")
+	turn := next(t, turns)
+	if _, err := io.WriteString(turn.t.Out, "one\r\ntwo\r\nthree\r\nhalf"); err != nil {
+		t.Fatal(err)
+	}
+	tm.waitFor("half")
+	_, x0, y0 := at(t, tm, "half", 1)
+	turn.finish <- nil
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.waitFor("done:1 ")
+
+	scr, x, y := at(t, tm, terminalReset, 1)
+	if x != x0 || y != y0 || y != rowOf(scr, "half") || x != len("half") {
+		t.Errorf("after the reset the cursor is in column %d of row %d; the command left it in column %d of row %d, after its last word in row %d", x, y, x0, y0, rowOf(scr, "half"))
+	}
+	if scr.alt || scr.top != 0 || scr.bot != 23 {
+		t.Errorf("after the reset the alternate screen is on: %v; the margins are rows %d to %d", scr.alt, scr.top, scr.bot)
+	}
+}
+
+// TestResetAfterAFullScreenProgram has a command print on the normal
+// screen, then go to the alternate screen, set margins and origin mode,
+// and return there, as a full-screen program that was killed: after the
+// reset the terminal shows the normal screen with what was printed, the
+// margins are the screen's, and the cursor is below what was printed.
+func TestResetAfterAFullScreenProgram(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+	tm.press("!")
+	turn := next(t, turns)
+	if _, err := io.WriteString(turn.t.Out, "one\r\ntwo\r\n"+"\x1b[?1049h\x1b[5;10r\x1b[?6h\x1b[41mFULLSCREEN\x1b[3;7H"); err != nil {
+		t.Fatal(err)
+	}
+	tm.waitFor("\x1b[3;7H")
+	turn.finish <- nil
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	tm.waitFor("done:1 ")
+
+	scr, x, y := at(t, tm, terminalReset, 1)
+	if scr.alt || scr.top != 0 || scr.bot != 23 {
+		t.Errorf("after the reset the alternate screen is on: %v; the margins are rows %d to %d", scr.alt, scr.top, scr.bot)
+	}
+	if rowOf(scr, "one") != 0 || rowOf(scr, "two") != 1 || rowOf(scr, "FULLSCREEN") != -1 {
+		t.Errorf("after the reset the screen is not the normal one with what was printed there:\n%s", scr)
+	}
+	if x != 0 || y != 2 {
+		t.Errorf("after the reset the cursor is in column %d of row %d, want column 0 of row 2, below what was printed", x, y)
+	}
+}
+
+// TestTwoShellsInARow has two commands print, one after the other: the
+// second's line is below the first's on the normal screen, not on top
+// of it.
+func TestTwoShellsInARow(t *testing.T) {
+	turns := make(chan held, 1)
+	hv := newHandover(hold(turns))
+	_, tm := startHandover(t, hv)
+	for i, word := range []string{"first", "second"} {
+		tm.press("!")
+		turn := next(t, turns)
+		if _, err := io.WriteString(turn.t.Out, word+"\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		tm.waitFor(word + "\r\n")
+		if word == "second" {
+			scr, _, y := at(t, tm, "second\r\n", 1)
+			if rowOf(scr, "first") != 0 || rowOf(scr, "second") != 1 || y != 2 {
+				t.Errorf("while the second command has the terminal the cursor is in row %d and the screen is:\n%s", y, scr)
+			}
+		}
+		turn.finish <- nil
+		hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == i+1 })
+	}
+}
+
+// TestLastMessageIsBelowTheTranscript ends a session by removing its
+// key, after a command has printed and returned, and while a command
+// that has printed has the terminal: the session's last message is on
+// the line below what the command printed.
+func TestLastMessageIsBelowTheTranscript(t *testing.T) {
+	for _, inside := range []bool{false, true} {
+		name := "after a command"
+		if inside {
+			name = "in a command"
+		}
+		t.Run(name, func(t *testing.T) {
+			turns := make(chan held, 1)
+			hv := newHandover(hold(turns))
+			h, tm := startHandover(t, hv)
+			tm.press("!")
+			turn := next(t, turns)
+			if _, err := io.WriteString(turn.t.Out, "one\r\ntranscript\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			tm.waitFor("transcript\r\n")
+			if !inside {
+				turn.finish <- nil
+				hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+				tm.waitFor("done:1 ")
+			}
+			setKeys(t, h.list)
+			if status := tm.exit(); status != 1 {
+				t.Errorf("exit status %d, want 1", status)
+			}
+			scr := screenOf(tm)
+			if rowOf(scr, "transcript") != 1 || rowOf(scr, MsgKeyRemoved) != 2 {
+				t.Errorf("the session's last message is not on the line below what the command printed:\n%s", scr)
+			}
+		})
 	}
 }

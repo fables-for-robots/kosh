@@ -115,15 +115,40 @@ const minTurn = 10 * time.Millisecond
 // leaves is its own business: a full-screen program that was killed, or
 // a binary file printed, leaves modes that Bubble Tea, which sets only
 // what the program needs, would draw the program in for the rest of the
-// session. Each part undoes one thing; none clears the screen or moves
-// the cursor.
+// session.
+//
+// The screen is not cleared, and the cursor stays where the command left
+// it on the normal screen, so that what is printed next, the next
+// command's output or the session's last message, comes below what is
+// there. Three of the things to undo move the cursor by themselves, and
+// are written so that they do not:
+//
+//   - Leaving the alternate screen restores the cursor that was saved
+//     for the normal screen. When the command left the terminal on the
+//     normal screen, that is a cursor Bubble Tea saved long ago: so the
+//     cursor is saved first, and restored to where it is. (When the
+//     command left the alternate screen on, the cursor saved here is
+//     that screen's, and the one restored is where the command was on
+//     the normal screen when it left it: terminals that keep one saved
+//     cursor for both screens put it where it was on the alternate one.)
+//   - Setting the margins homes the cursor: so it is done between a
+//     save and a restore.
+//   - Resetting origin mode homes the cursor too, and the restore before
+//     would bring the mode back as it brings back everything saved with
+//     the cursor: so origin mode is left as it is. With the margins at
+//     the screen's edges it changes nothing.
+//
+// What a restore of the cursor brings back with it, attributes, the
+// character set and autowrap, is undone after the last restore.
 const terminalReset = "" +
+	"\x1b7" + // save the cursor, for the restore that leaving the alternate screen does
 	"\x1b[?1049l" + // the normal screen, not the alternate one
+	"\x1b7" + // save the cursor,
+	"\x1b[r" + // no scroll region: the margins are the screen's,
+	"\x1b8" + // and the cursor back from the home that puts it in
 	"\x1b[0m" + // no colour, no attribute
 	"\x1b(B" + // G0 is ASCII, not the line-drawing set
 	"\x0f" + // and G0 is the set in use (SI)
-	"\x1b[r" + // no scroll region: the margins are the screen's
-	"\x1b[?6l" + // positions count from the screen's corner, not the region's
 	"\x1b[?7h" + // a line that is full wraps
 	"\x1b[4l" + // characters replace, they are not inserted
 	"\x1b[?1l" + // the cursor keys send their normal sequences
