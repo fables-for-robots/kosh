@@ -17,7 +17,7 @@ package e2e
 // cluster and one kosh: TestRoleCanBeChanged, TestKeyRemovedEndsTheSession
 // and TestShellEndsWithItsKey change kosh's role and its key list, and
 // put them back; TestStopTellsTheSessions restarts kosh and comes last.
-// The tests of a shell come before them.
+// The other tests of a shell come before them.
 
 import (
 	"bufio"
@@ -1689,9 +1689,17 @@ func TestShellReadOnlyKey(t *testing.T) {
 	// The frame is as it was: the header, the table's title, the crumbs
 	// and the flash. (The table's ages may have moved on.)
 	same := func(a, b []string) bool { return strings.Join(a, "\n") == strings.Join(b, "\n") }
+	// The table's top line, with its title: the first line after the
+	// header, which fills found in before.
+	top := func(lines []string) string {
+		if n := len(headerLines(lines)); n < len(lines) {
+			return lines[n]
+		}
+		t.Fatalf("after s the frame has no table:\n%s", c.scr)
+		return ""
+	}
 	h := len(after)
-	if !same(headerLines(after), headerLines(before)) || !same(after[h-2:], before[h-2:]) ||
-		!same(after[len(headerLines(after)):][:1], before[len(headerLines(before)):][:1]) {
+	if !same(headerLines(after), headerLines(before)) || !same(after[h-2:], before[h-2:]) || top(after) != top(before) {
 		t.Errorf("the frame changed after s.\nbefore:\n%s\nafter:\n%s", strings.Join(before, "\n"), c.scr)
 	}
 	if lines := logLines(t, "action", "key", k.name, "action", "exec"); len(lines) > 0 {
@@ -1765,7 +1773,7 @@ func TestShellSurvivesNothing(t *testing.T) {
 	}
 	killed := time.Now()
 	var ended []string
-	eventually(t, 15*time.Second, "kosh's log has the end of the session of "+remote[1]+" and of its shell", func() bool {
+	eventually(t, wait, "kosh's log has the end of the session of "+remote[1]+" and of its shell", func() bool {
 		ended = logLines(t, "action", end...)
 		return len(logLines(t, "session end", "remote", remote[1])) > 0 && len(ended) > shells
 	}, func() string { return "kosh's log:\n" + koshLog(t) })
@@ -1959,15 +1967,41 @@ func newKey(t *testing.T, name string) key {
 	return loadKey(t, file)
 }
 
-// accepted reports whether k opens a session.
+// accepted reports whether kosh accepts k: whether the SSH handshake
+// as k succeeds, which is where kosh checks the key; no session is
+// opened. A handshake that fails for another reason than the key's
+// refusal fails the test.
 func accepted(t *testing.T, k key) bool {
 	t.Helper()
-	c, err := dialSSH(t, k, 120, 40)
-	if err != nil {
+	client, err := ssh.Dial("tcp", cfg.sshAddr, &ssh.ClientConfig{
+		User:            "kosh",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(k.signer)},
+		HostKeyCallback: ssh.FixedHostKey(hostKey(t)),
+		Timeout:         wait,
+	})
+	switch {
+	case err == nil:
+		_ = client.Close()
+		return true
+	case strings.Contains(err.Error(), "unable to authenticate"):
 		return false
 	}
-	_ = c.client.Close()
-	return true
+	t.Fatalf("connecting as %s: %v, which is not a refusal of the key", k.name, err)
+	return false
+}
+
+// waitAccepted asks kosh once a second whether it accepts k, until the
+// answer is want, for within at most: the kubelet updates the mounted
+// key list in its own time.
+func waitAccepted(t *testing.T, k key, want bool, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for accepted(t, k) != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: accepted is not %v after %v", k.name, want, within)
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // A shell ends with its session when its key leaves the list. What it
@@ -1981,12 +2015,9 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	t.Cleanup(func() {
 		// The list as it was, and waited for.
 		setKeys(t, full.line, "read-only "+ro.line)
-		eventually(t, 150*time.Second, "the key of the test is refused again", func() bool { return !accepted(t, k) },
-			func() string { return "it is still accepted" })
+		waitAccepted(t, k, false, 150*time.Second)
 	})
-	// The kubelet updates a mounted ConfigMap in its own time.
-	eventually(t, 150*time.Second, "the key of the test is accepted", func() bool { return accepted(t, k) },
-		func() string { return "it is not" })
+	waitAccepted(t, k, true, 150*time.Second)
 
 	// A session of another key, which the removal leaves alone.
 	f := connect(t, full, 120, 40)
