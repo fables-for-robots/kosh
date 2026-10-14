@@ -417,7 +417,7 @@ func TestInputIsBounded(t *testing.T) {
 
 	// Pastes, so that megabytes are few messages for the model; each of
 	// less than pasteLimit, beyond which a paste is cut.
-	const size, pastes = 16 << 20, 32
+	const size, pastes = 16 << 20, 128
 	body := bytes.Repeat([]byte("0123456789abcdef"), size/pastes/16)
 	var payload []byte
 	for range pastes {
@@ -2019,16 +2019,16 @@ func TestPasteToTheProgramIsBounded(t *testing.T) {
 	if len(pastes[0]) > pasteLimit || len(pastes[0]) < pasteLimit-len(pasteEnd) || pastes[0] != string(body[:len(pastes[0])]) {
 		t.Errorf("the model was given a paste of %d bytes, want the first %d of what was sent", len(pastes[0]), pasteLimit)
 	}
-	// The library makes of the megabyte it is given a slice of runes, a
-	// string, and an event for every piece on the way: tens of megabytes
-	// for a moment, as measured, and the same however much the client
-	// sends. Without the limit this paste took 146 MB.
-	if most > 64<<20 {
+	// The library makes of the paste it is given a slice of runes, a
+	// string, and an event for every piece on the way: several times the
+	// limit for a moment, as measured, and the same however much the
+	// client sends. Without the limit this paste took 146 MB.
+	if most > 16<<20 {
 		t.Errorf("the heap grew by %d bytes while a paste of %d was sent", most, size)
 	}
 
-	// A paste within the limit, and what follows it.
-	small := strings.Repeat("0123456789abcdef", 64)
+	// A paste of the limit exactly, and what follows it.
+	small := strings.Repeat("0123456789abcdef", pasteLimit/16)
 	tm.press(pasteStart + small + pasteEnd + "b")
 	hv.wait(t, "the model has the second paste and the key after it", func() bool { return len(hv.pastes) == 2 && strings.Join(hv.keys, "") == "axyzb" })
 	if hv.pastes[1] != small {
@@ -2361,5 +2361,223 @@ func TestLastMessageIsBelowTheTranscript(t *testing.T) {
 				t.Errorf("the session's last message is not on the line below what the command printed:\n%s", scr)
 			}
 		})
+	}
+}
+
+// floods are beginnings of input that the library gathers, and makes no
+// event of, for as long as the client goes on sending: pastes spelled as
+// the scanner does not know them and the library does, and sequences and
+// strings that do not end. more is what is sent after the beginning,
+// again and again. cut is set for one that the session does not end
+// for: the scanner takes what follows for a paste, and drops what is
+// beyond a paste's limit.
+var floods = []struct {
+	name, start, more string
+	cut               bool
+}{
+	{"a paste with a zero before its number", "\x1b[0200~", "x", false},
+	{"a paste with the 8-bit introducer", "\x9b200~", "x", false},
+	{"a paste with a second parameter", "\x1b[200;1~", "x", false},
+	{"a control sequence that does not end", "\x1b[", "1;", false},
+	{"a control sequence that does not end, 8-bit", "\x9b", "1;", false},
+	{"an operating system command that does not end", "\x1b]", "x", false},
+	{"an operating system command, 8-bit", "\x9d", "x", false},
+	{"a device control string that does not end", "\x1bP", "x", false},
+	{"a device control string, 8-bit", "\x90", "x", false},
+	{"an application program command that does not end", "\x1b_", "x", false},
+	{"an application program command, 8-bit", "\x9f", "x", false},
+	{"a start of string that does not end", "\x1bX", "x", false},
+	{"a privacy message that does not end", "\x1b^", "x", false},
+	{"a string in a paste the scanner does not know", "\x1b[0200~" + "pasted" + "\x1b]", "x", false},
+	{"a paste in a string", "\x1b]" + "0;title" + pasteStart, "x", true},
+	{"a control sequence after keys and a paste", "keys" + pasteStart + "pasted" + pasteEnd + "\x1b[", "1;", false},
+}
+
+// sendFlood sends start, one byte to a write so that it is cut at every
+// place, and then size bytes of more, until the session takes no more.
+func sendFlood(tm *term, start, more string, size int) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range len(start) {
+			if _, err := io.WriteString(tm.stdin, start[i:i+1]); err != nil {
+				return
+			}
+		}
+		piece := []byte(strings.Repeat(more, (16<<10)/len(more)))
+		for sent := 0; sent < size; sent += len(piece) {
+			if _, err := tm.stdin.Write(piece); err != nil {
+				return
+			}
+		}
+	}()
+	return done
+}
+
+// floodLines returns how many times the log says that a session was
+// ended for input that the library made no event of.
+func (h *harness) floodLines() int {
+	n := 0
+	for _, r := range h.log.records() {
+		if strings.HasPrefix(r.Msg, "session's input") {
+			if r.Level.String() != "WARN" || r.Attrs["key"] == "" || r.Attrs["fingerprint"] == "" {
+				h.t.Errorf("the line %v is not a warning that names the session's key and its fingerprint", r)
+			}
+			n++
+		}
+	}
+	return n
+}
+
+// floodedSessionBound bounds one session sent a flood, by the whole
+// process heap's growth. It is loose: the first flooded session pays
+// one-time costs (the library's parser tables and buffers, grown to
+// hold what it gathers before an event, and a copy of that buffer it
+// makes each read), and the number is the growth of the whole heap, not
+// of the session alone. What a flood makes a session hold does not grow
+// with the session: TestTwentyFloodedSessions, with floodedResidueBound,
+// is the measure of that, and is where a per-session leak would show.
+const floodedSessionBound = 16 << 20
+
+// floodedResidueBound is how much the heap may hold after a flooded
+// session has ended and been forgotten: nothing of it should be left,
+// and twenty do not leave more than one. What the library gathers is
+// eventlessLimit bytes outside a paste, or pasteLimit in one, which it
+// turns into events, at most one per byte at some tens of bytes each,
+// for the moment before the session ends: a few megabytes, freed with
+// the session.
+const floodedResidueBound = 8 << 20
+
+// TestInputWithoutAnEventEndsTheSession sends megabytes of each flood:
+// the session is ended, with a message of its own and a line in the log,
+// when it has taken eventlessLimit bytes of it; what it holds until then
+// is bounded, and nothing of it is left.
+func TestInputWithoutAnEventEndsTheSession(t *testing.T) {
+	for _, f := range floods {
+		t.Run(f.name, func(t *testing.T) {
+			hv := newHandover(nil)
+			h, tm := startHandover(t, hv)
+			before := heapNow()
+			sent := sendFlood(tm, f.start, f.more, 16<<20)
+			var most int64
+			for deadline := time.Now().Add(longWait); !tm.ended(); {
+				if time.Now().After(deadline) {
+					t.Fatalf("waited %v: the session that is sent %q and no end of it has not ended; the heap has grown by %d bytes", longWait, f.start, heapNow()-before)
+				}
+				most = max(most, heapNow()-before)
+				if f.cut {
+					select {
+					case <-sent:
+						// All of it was taken, and the session goes on,
+						// holding no more than a paste's limit of it. The
+						// live heap once it has settled, not the peak
+						// while the stream and the client's own buffers
+						// were in flight, is what the server holds.
+						left := heapNow() - before
+						t.Logf("the session took the flood and cut it; the heap then held %d bytes more (the peak while it streamed was %d)", left, most)
+						if left > floodedSessionBound {
+							t.Errorf("the session that cut the flood holds %d bytes, want at most %d", left, floodedSessionBound)
+						}
+						if n := h.floodLines(); n != 0 {
+							t.Errorf("the session was ended for input that it cut")
+						}
+						setKeys(t, h.list)
+						if status := tm.exit(); status != 1 {
+							t.Errorf("exit status %d, want 1", status)
+						}
+						eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+						return
+					default:
+					}
+				}
+			}
+			if status := tm.exit(); status != 1 {
+				t.Errorf("exit status %d, want 1", status)
+			}
+			if out := tm.stdout.String(); !strings.HasSuffix(out, MsgInputFlood+"\r\n") {
+				t.Errorf("the client was not told %q at the end; the session's last bytes are %q", MsgInputFlood, out[max(0, len(out)-100):])
+			}
+			if n := h.floodLines(); n != 1 {
+				t.Errorf("the log has %d lines of a session ended for its input, want 1", n)
+			}
+			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+			left := heapNow() - before
+			t.Logf("the heap grew by %d bytes at most while the session was flooded, and by %d when it had ended", most, left)
+			if most > floodedSessionBound {
+				t.Errorf("the heap grew by %d bytes while the session was flooded, want at most %d", most, floodedSessionBound)
+			}
+		})
+	}
+}
+
+// TestTwentyFloodedSessions floods twenty sessions, one after the other,
+// on one connection: each is ended, and when all have ended the heap has
+// not grown by what one of them may hold, and no goroutine is left (the
+// harness looks, also for the library's reader, which is left for good
+// when the program ends before it has taken what the reader made).
+func TestTwentyFloodedSessions(t *testing.T) {
+	hv := newHandover(nil)
+	h := handoverHarness(t, hv)
+	cl := h.dial(h.key("ann", false), "u")
+	before := heapNow()
+	var ending []int
+	for i, f := range floods {
+		if !f.cut {
+			ending = append(ending, i)
+		}
+	}
+	for i := range 20 {
+		f := floods[ending[i%len(ending)]]
+		tm := openTerm(t, cl)
+		tm.waitFor("LASTLINE")
+		sendFlood(tm, f.start, f.more, 16<<20)
+		select {
+		case <-tm.done:
+		case <-time.After(longWait):
+			t.Fatalf("session %d, sent %s, has not ended", i, f.name)
+		}
+		_ = tm.sess.Close()
+	}
+	eventually(t, "the sessions are gone", func() bool { return h.srv.Sessions() == 0 })
+	if n := h.floodLines(); n != 20 {
+		t.Errorf("the log has %d lines of a session ended for its input, want 20", n)
+	}
+	left := heapNow() - before
+	t.Logf("after twenty flooded sessions the heap has grown by %d bytes", left)
+	if left > floodedResidueBound {
+		t.Errorf("after twenty flooded sessions the heap has grown by %d bytes, more than one may hold (%d)", left, floodedResidueBound)
+	}
+}
+
+// TestInputOfATerminalIsNotAFlood sends what terminals do send in
+// quantity, more of each than eventlessLimit: a key held down, mouse
+// reports, and the replies to the program's questions at its start. The
+// library makes events of all of it, and the session goes on.
+func TestInputOfATerminalIsNotAFlood(t *testing.T) {
+	hv := newHandover(nil)
+	h, tm := startHandover(t, hv)
+	const mouse = "\x1b[<35;10;10M"
+	replies := "\x1b[?2026;2$y\x1b[?2027;0$y\x1b[?1u\x1b[>1;10;0c\x1b]11;rgb:0000/0000/0000\x1b\\"
+	sent := []string{
+		strings.Repeat(replies, 2),
+		strings.Repeat("j", eventlessLimit+eventlessLimit/4),
+		strings.Repeat(mouse, (eventlessLimit+eventlessLimit/4)/len(mouse)),
+		strings.Repeat(replies, eventlessLimit/len(replies)+1),
+		"k",
+	}
+	wrote, _ := sendAll(tm, []byte(strings.Join(sent, "")))
+	keys := eventlessLimit + eventlessLimit/4 + 1
+	hv.wait(t, "the model has every key", func() bool { return len(hv.keys) >= keys })
+	if err := <-wrote; err != nil {
+		t.Fatalf("sending: %v", err)
+	}
+	hv.mu.Lock()
+	n, last := len(hv.keys), hv.keys[len(hv.keys)-1]
+	hv.mu.Unlock()
+	if n != keys || last != "k" {
+		t.Errorf("the model was given %d keys, the last of them %q; want %d and k", n, last, keys)
+	}
+	if tm.ended() || h.floodLines() != 0 {
+		t.Errorf("the session was ended for the input of a terminal")
 	}
 }

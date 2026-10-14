@@ -105,6 +105,12 @@ type session struct {
 	raw io.Writer
 	// out is the program's output, which is ss, with its writes counted.
 	out *countingWriter
+	// windOnce, winding and wound are the end of the program's reading,
+	// which comes before the program's end: see wind.
+	windOnce sync.Once
+	winding  atomic.Bool
+	wound    atomic.Bool
+
 	// screenTimer looks, after a command's turn, whether the program
 	// writes again: see watchScreen. It is nil before the first turn.
 	screenTimer *time.Timer
@@ -145,9 +151,13 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 		}, &sess.stopped, panicked)
 	}
 	if m != nil {
+		// The program's own context, which is done after the session's.
+		pctx, endProgram := context.WithCancel(context.Background())
+		defer endProgram()
 		opts := append(bm.MakeOptions(ss),
-			// The program ends with the session, however it ends.
-			tea.WithContext(ctx),
+			// The program ends with the session, however it ends: when
+			// the session's context is done, after its reader (below).
+			tea.WithContext(pctx),
 			// SIGINT and SIGTERM are kosh's, not a session's.
 			tea.WithoutSignalHandler(),
 			// The channel is read by the session, and the program is
@@ -160,7 +170,16 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 		)
 		p := tea.NewProgram(m, opts...)
 		if started = sess.start(p); started {
+			sess.in.flood = sess.flooded
 			go sess.in.pump(ss)
+			go func() {
+				select {
+				case <-ctx.Done():
+					sess.wind()
+					endProgram()
+				case <-pctx.Done():
+				}
+			}()
 			s.mu.Lock()
 			s.running++
 			s.mu.Unlock()
@@ -255,10 +274,8 @@ func (sess *session) end(msg string) bool {
 		// that has the terminal has returned.
 		sess.cancelCommand()
 	}
-	if p := sess.program; p != nil {
-		// Quit waits for the program to take it, and the program may be
-		// waiting for a client that does not read.
-		go p.Quit()
+	if sess.program != nil {
+		go sess.quit()
 	}
 	return true
 }
@@ -317,7 +334,7 @@ func (sess *session) over() bool {
 
 // overLocked is over with sess.mu held.
 func (sess *session) overLocked() bool {
-	return sess.reason != "" || sess.finished || sess.ctx.Err() != nil
+	return sess.reason != "" || sess.finished || sess.ctx.Err() != nil || sess.winding.Load()
 }
 
 // beginCommand makes cancel what ends the context of the command that
