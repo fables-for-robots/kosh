@@ -381,6 +381,9 @@ func TestCloseStopsPollers(t *testing.T) {
 	if api.count(PodMetrics) != np || api.count(NodeMetrics) != nn {
 		t.Error("listed after Close")
 	}
+	if e.c.pollerOf(PodMetrics) != nil || e.c.pollerOf(NodeMetrics) != nil {
+		t.Error("a poller is kept after Close")
+	}
 	if _, err := e.c.acquireMetrics(PodMetrics); !errors.Is(err, errClosed) {
 		t.Errorf("acquire after Close: %v, want errClosed", err)
 	}

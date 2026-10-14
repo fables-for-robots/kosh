@@ -126,6 +126,10 @@ func (p *metricsPoller) run(ctx context.Context) {
 // reading or the error, logs a change between the two, and tells the
 // subscribers.
 func (p *metricsPoller) list(ctx context.Context) {
+	// A tick picked after a release or Close: the poller is no one's.
+	if ctx.Err() != nil {
+		return
+	}
 	l, err := p.c.dyn.Resource(p.gvr).List(ctx, metav1.ListOptions{})
 	if ctx.Err() != nil {
 		// Released or closed while it listed: nobody wants the answer.
@@ -285,6 +289,8 @@ func parseUsage(obj map[string]any, field string) (render.Usage, error) {
 	return render.Usage{CPU: cpu.MilliValue(), Mem: mem.Value()}, nil
 }
 
+// quantity parses the string at fields of obj as a resource.Quantity. A
+// field that is missing is an error, as one that does not parse is.
 func quantity(obj map[string]any, fields ...string) (resource.Quantity, error) {
 	s, _, err := unstructured.NestedString(obj, fields...)
 	if err != nil {

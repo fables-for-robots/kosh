@@ -246,11 +246,14 @@ func testScheme() *runtime.Scheme {
 	return s
 }
 
-// newDynamicFake is dynamicfake.NewSimpleDynamicClient over testScheme,
-// holding objs, which also lists the metrics API: the fake panics on a
-// list of a resource whose list kind it does not know, and it cannot
-// guess pods.metrics.k8s.io from the kind PodMetrics. What the metrics
-// lists hold is served by a test's reactor.
+// newDynamicFake is client-go's dynamicfake.NewSimpleDynamicClient over
+// testScheme, holding objs, with the list kinds of the metrics API
+// (PodMetricsList, NodeMetricsList) added. Without them the fake panics
+// on a list of pods.metrics.k8s.io or nodes.metrics.k8s.io before any
+// reactor is asked: it knows only the list kinds it guesses from the
+// scheme, and it cannot guess those resources from the kinds PodMetrics
+// and NodeMetrics. What the metrics lists hold is served by a test's
+// reactor.
 func newDynamicFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	typed := testScheme()
 	s := runtime.NewScheme()
