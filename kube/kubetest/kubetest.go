@@ -490,13 +490,15 @@ func (w *UsageWatch) Current() (kube.ClusterUsage, bool) {
 
 func (w *UsageWatch) Changed() <-chan struct{} { return w.changed }
 
-// Close forgets the watch: SetUsage no longer signals it.
+// Close forgets the watch, so that SetUsage no longer signals it, and
+// closes Changed, as the real watch does.
 func (w *UsageWatch) Close() {
 	w.s.mu.Lock()
 	defer w.s.mu.Unlock()
 	for i, u := range w.s.usages {
 		if u == w {
 			w.s.usages = append(w.s.usages[:i], w.s.usages[i+1:]...)
+			close(w.changed)
 			return
 		}
 	}

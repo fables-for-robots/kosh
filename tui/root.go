@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -56,20 +55,10 @@ type usageReading struct {
 	ok bool
 }
 
-// usageMsg is what the usage watch says after it signalled. read is
-// false when the wait ended without a signal, after usageWaitMax: the
-// root then waits again, and keeps its readings.
+// usageMsg is what the usage watch says after it signalled.
 type usageMsg struct {
 	usageReading
-	read bool
 }
-
-// usageWaitMax bounds a wait on the usage watch. Nothing tells the root
-// that the session ended, and the watch, which the session's end
-// closes, does not end a wait on its Changed: the wait ends by itself
-// instead, so that it outlives the session by no more than this. A wait
-// takes it when it is made; tests may shorten it.
-var usageWaitMax = time.Minute
 
 func newRoot(e env, version string) *root {
 	return &root{
@@ -88,19 +77,18 @@ func (r *root) Init() tea.Cmd {
 	return tea.Batch(r.resolve("pods", "pods", "", false, true, true), r.waitUsage())
 }
 
-// waitUsage waits for the usage watch to signal, and reads it then.
+// waitUsage waits for the usage watch to signal, and reads it then. The
+// session's end closes the watch, and the watch closes its Changed: the
+// wait ends then with nothing, and nothing of the session is left
+// waiting.
 func (r *root) waitUsage() tea.Cmd {
-	w, most := r.usageWatch, usageWaitMax
+	w := r.usageWatch
 	return waitCmd(func() tea.Msg {
-		t := time.NewTimer(most)
-		defer t.Stop()
-		select {
-		case <-w.Changed():
-			u, ok := w.Current()
-			return usageMsg{usageReading: usageReading{u: u, ok: ok}, read: true}
-		case <-t.C:
-			return usageMsg{}
+		if _, open := <-w.Changed(); !open {
+			return nil
 		}
+		u, ok := w.Current()
+		return usageMsg{usageReading{u: u, ok: ok}}
 	})
 }
 
@@ -157,12 +145,10 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.prompt.suggest(msg.names)
 		return r, nil
 	case usageMsg:
-		if msg.read {
-			if r.usage.ok {
-				r.prevUsage = r.usage
-			}
-			r.usage = msg.usageReading
+		if r.usage.ok {
+			r.prevUsage = r.usage
 		}
+		r.usage = msg.usageReading
 		return r, r.waitUsage()
 	}
 	return r, r.broadcast(msg)

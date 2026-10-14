@@ -339,28 +339,33 @@ func TestPromptOverAFullscreenView(t *testing.T) {
 	}
 }
 
-// A wait on the usage watch that ends without a signal is not a
-// reading: the arrows stay, and the root waits again.
-func TestAUsageWaitWithoutASignalKeepsTheReadings(t *testing.T) {
-	was := usageWaitMax
-	usageWaitMax = 20 * time.Millisecond
-	t.Cleanup(func() { usageWaitMax = was })
+// Closing the usage watch, as the session's end does, ends the root's
+// wait on it: the wait returns nothing, the root waits no more, and the
+// header keeps what it last read.
+func TestClosingTheUsageWatchEndsTheWait(t *testing.T) {
 	sess := newSession()
 	hs := newHarness(t, sess, 100, 30)
 	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
 	hs.awaitFrame("CPU:     12%")
-	sess.SetUsage(kube.ClusterUsage{CPU: 14, Mem: 40, Served: true}, true)
-	hs.awaitFrame("CPU:     14% ↑")
 
-	// Waits that end without a signal, one after another: the messages
-	// keep coming only while each wait is made again.
-	start := time.Now()
-	hs.await("waits to end without a signal for 200 ms", func() bool { return time.Since(start) > 200*time.Millisecond })
-	hs.wantFrame("CPU:     14% ↑", "MEM:     40% ↓")
-
-	sess.SetUsage(kube.ClusterUsage{CPU: 9, Mem: 40, Served: true}, true)
-	hs.awaitFrame("CPU:     9% ↓")
-	if l := hs.line("MEM:"); strings.ContainsAny(l, "↑↓") {
-		t.Errorf("a MEM that did not change has an arrow: %q", l)
+	hs.root().usageWatch.Close()
+	// The wait in flight ends with a nil message, which is dropped;
+	// nothing else arrives, so the frame is as it was and no later
+	// reading can be seen.
+	select {
+	case msg := <-hs.async:
+		if msg != nil {
+			t.Fatalf("the wait on a closed watch returned %#v, want nil", msg)
+		}
+	case <-time.After(deadline):
+		t.Fatal("the wait on a closed watch did not end")
 	}
+	hs.wantFrame("CPU:     12%")
+	sess.SetUsage(kube.ClusterUsage{CPU: 50, Mem: 50, Served: true}, true)
+	select {
+	case msg := <-hs.async:
+		t.Fatalf("a message came after the watch was closed: %#v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+	hs.wantFrame("CPU:     12%")
 }

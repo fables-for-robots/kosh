@@ -5,7 +5,8 @@ import "sync"
 // changes is the Changed of a watch whose signals come from more than one
 // source: the cache of its kind, and the metrics poller that it holds for
 // as long as the API serves the metrics. It has room for one signal, as
-// every Changed: many are one. It is never closed.
+// every Changed: many are one. A watch of a table never closes it; the
+// usage watch closes it at Close, once nothing can notify it any more.
 type changes chan struct{}
 
 func newChanges() changes { return make(changes, 1) }

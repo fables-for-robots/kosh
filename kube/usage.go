@@ -159,17 +159,20 @@ func (w *usageWatch) Current() (ClusterUsage, bool) {
 
 func (w *usageWatch) Changed() <-chan struct{} { return w.changed }
 
+// Close ends the watch and closes Changed, once nothing can signal it
+// any more: a consumer waiting on Changed ends with the watch, and does
+// not outlive the session that opened it.
 func (w *usageWatch) Close() {
 	w.closeOnce.Do(func() {
-		if w.cache == nil {
-			return
+		if w.cache != nil {
+			w.mu.Lock()
+			stop := w.stopAfter
+			w.mu.Unlock()
+			stop()
+			w.metrics.close()
+			w.stop()
+			w.c.release(w.cache)
 		}
-		w.mu.Lock()
-		stop := w.stopAfter
-		w.mu.Unlock()
-		stop()
-		w.metrics.close()
-		w.stop()
-		w.c.release(w.cache)
+		close(w.changed)
 	})
 }

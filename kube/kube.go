@@ -176,7 +176,8 @@ type UsageWatch interface {
 	// worked yet, or the last one failed.
 	Current() (u ClusterUsage, ok bool)
 	// Changed receives after Current may answer differently. It has
-	// room for one signal: many changes are one.
+	// room for one signal: many changes are one. Close closes it, so
+	// that a receive which finds it closed says the watch has ended.
 	Changed() <-chan struct{}
 	// Close ends the watch. It may be called more than once.
 	Close()
