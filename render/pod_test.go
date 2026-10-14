@@ -10,7 +10,7 @@ import (
 )
 
 func TestPodColumns(t *testing.T) {
-	wantColumns(t, Pods, "NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "LAST RESTART*", "CPU/RL*", "MEM/RL*", "IP", "NODE", "SERVICE-ACCOUNT*", "NOMINATED NODE*", "READINESS GATES*", "QOS*", "LABELS*", "VALID*", "AGE")
+	wantColumns(t, Pods, "NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "LAST RESTART*", "CPU", "CPU/RL*", "%CPU/R", "%CPU/L", "MEM", "MEM/RL*", "%MEM/R", "%MEM/L", "IP", "NODE", "SERVICE-ACCOUNT*", "NOMINATED NODE*", "READINESS GATES*", "QOS*", "LABELS*", "VALID*", "AGE")
 }
 
 // podTestResources returns the requests and limits of a container.
@@ -191,8 +191,14 @@ func TestPodRows(t *testing.T) {
 				"STATUS":          "Running",
 				"RESTARTS":        "3",
 				"LAST RESTART":    "30m",
+				"CPU":             NAValue,
 				"CPU/RL":          "350:800",
+				"%CPU/R":          NAValue,
+				"%CPU/L":          NAValue,
+				"MEM":             NAValue,
 				"MEM/RL":          "224:384",
+				"%MEM/R":          NAValue,
+				"%MEM/L":          NAValue,
 				"IP":              "10.0.0.7",
 				"NODE":            "node-a",
 				"SERVICE-ACCOUNT": "web",

@@ -10,7 +10,7 @@ import (
 )
 
 func TestNodeColumns(t *testing.T) {
-	wantColumns(t, Nodes, "NAME", "STATUS", "ROLE", "ARCH*", "TAINTS", "VERSION", "OS-IMAGE*", "KERNEL*", "INTERNAL-IP*", "EXTERNAL-IP*", "PODS", "LABELS*", "VALID*", "AGE")
+	wantColumns(t, Nodes, "NAME", "STATUS", "ROLE", "ARCH*", "TAINTS", "VERSION", "OS-IMAGE*", "KERNEL*", "INTERNAL-IP*", "EXTERNAL-IP*", "PODS", "CPU", "CPU/A", "%CPU", "MEM", "MEM/A", "%MEM", "LABELS*", "VALID*", "AGE")
 	r, _ := For(Nodes)
 	for _, c := range r.Columns() {
 		if c.Name == "PODS" && !c.Right {
@@ -34,6 +34,10 @@ func nodeWithReady(status corev1.ConditionStatus) *corev1.Node {
 		Status: corev1.NodeStatus{
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionFalse}, {Type: corev1.NodeReady, Status: status}},
 			Capacity:   corev1.ResourceList{corev1.ResourcePods: resource.MustParse("110")},
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("3500m"),
+				corev1.ResourceMemory: resource.MustParse("7Gi"),
+			},
 			Addresses: []corev1.NodeAddress{
 				{Type: corev1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: corev1.NodeExternalIP, Address: "34.1.1.1"},
@@ -63,7 +67,8 @@ func TestNodeRows(t *testing.T) {
 			want: map[string]string{
 				"NAME": "n1", "STATUS": "Ready", "ROLE": "control-plane,worker", "ARCH": "arm64", "TAINTS": "2",
 				"VERSION": "v1.30.1", "OS-IMAGE": "Ubuntu 24.04", "KERNEL": "6.8.0", "INTERNAL-IP": "10.1.1.1",
-				"EXTERNAL-IP": "34.1.1.1", "PODS": "110",
+				"EXTERNAL-IP": "34.1.1.1", "PODS": "110", "CPU": NAValue, "CPU/A": "3500", "%CPU": NAValue,
+				"MEM": NAValue, "MEM/A": "7168", "%MEM": NAValue,
 				"LABELS": "kubernetes.io/hostname=n1,node-role.kubernetes.io/control-plane=,node-role.kubernetes.io/worker=",
 				"VALID":  "", "AGE": "50d",
 			},
@@ -105,7 +110,7 @@ func TestNodeRows(t *testing.T) {
 			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "bare"}},
 			want: map[string]string{
 				"NAME": "bare", "STATUS": "Unknown", "ROLE": MissingValue, "TAINTS": "0", "INTERNAL-IP": MissingValue,
-				"EXTERNAL-IP": MissingValue, "PODS": NAValue, "LABELS": MissingValue, "VALID": "node is not ready", "AGE": UnknownValue,
+				"EXTERNAL-IP": MissingValue, "PODS": NAValue, "CPU/A": NAValue, "MEM/A": NAValue, "LABELS": MissingValue, "VALID": "node is not ready", "AGE": UnknownValue,
 			},
 			health: Error,
 		},

@@ -63,6 +63,9 @@ type Session struct {
 	tables  map[string]kube.Table
 	logs    map[string]*LogStream
 	calls   []Call
+	usage   kube.ClusterUsage
+	usageOK bool
+	usages  []*UsageWatch
 }
 
 var _ kube.Session = (*Session)(nil)
@@ -174,6 +177,18 @@ func (s *Session) SetTable(q kube.Query, t kube.Table) {
 	}
 }
 
+// SetUsage makes u, with ok, what the usage watches' Current returns,
+// and tells the open ones that it has changed.
+func (s *Session) SetUsage(u kube.ClusterUsage, ok bool) {
+	s.mu.Lock()
+	s.usage, s.usageOK = u, ok
+	ws := append([]*UsageWatch(nil), s.usages...)
+	s.mu.Unlock()
+	for _, w := range ws {
+		w.signal()
+	}
+}
+
 // Calls returns the calls so far, in their order.
 func (s *Session) Calls() []Call {
 	s.mu.Lock()
@@ -264,6 +279,17 @@ func (s *Session) Watch(q kube.Query) (kube.Watch, error) {
 	s.watches[w.key] = w
 	s.mu.Unlock()
 	return w, nil
+}
+
+// ClusterUsage opens a watch of what SetUsage set. It is not recorded:
+// the header opens it, and no test of what a view asked wants it among
+// the calls.
+func (s *Session) ClusterUsage() kube.UsageWatch {
+	w := &UsageWatch{s: s, changed: make(chan struct{}, 1)}
+	s.mu.Lock()
+	s.usages = append(s.usages, w)
+	s.mu.Unlock()
+	return w
 }
 
 func (s *Session) YAML(_ context.Context, ref kube.ObjectRef, managedFields bool) (string, error) {
@@ -443,6 +469,42 @@ func (w *Watch) isClosed() bool {
 }
 
 func (w *Watch) signal() {
+	select {
+	case w.changed <- struct{}{}:
+	default:
+	}
+}
+
+// UsageWatch is the usage watch of a Session: Current is what SetUsage
+// set last, and Changed receives after each SetUsage.
+type UsageWatch struct {
+	s       *Session
+	changed chan struct{}
+}
+
+func (w *UsageWatch) Current() (kube.ClusterUsage, bool) {
+	w.s.mu.Lock()
+	defer w.s.mu.Unlock()
+	return w.s.usage, w.s.usageOK
+}
+
+func (w *UsageWatch) Changed() <-chan struct{} { return w.changed }
+
+// Close forgets the watch, so that SetUsage no longer signals it, and
+// closes Changed, as the real watch does.
+func (w *UsageWatch) Close() {
+	w.s.mu.Lock()
+	defer w.s.mu.Unlock()
+	for i, u := range w.s.usages {
+		if u == w {
+			w.s.usages = append(w.s.usages[:i], w.s.usages[i+1:]...)
+			close(w.changed)
+			return
+		}
+	}
+}
+
+func (w *UsageWatch) signal() {
 	select {
 	case w.changed <- struct{}{}:
 	default:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -245,6 +246,54 @@ func testScheme() *runtime.Scheme {
 	return s
 }
 
+// newDynamicFake is client-go's dynamicfake.NewSimpleDynamicClient over
+// testScheme, holding objs, with the list kinds of the metrics API
+// (PodMetricsList, NodeMetricsList) added. Without them the fake panics
+// on a list of pods.metrics.k8s.io or nodes.metrics.k8s.io before any
+// reactor is asked: it knows only the list kinds it guesses from the
+// scheme, and it cannot guess those resources from the kinds PodMetrics
+// and NodeMetrics. What the metrics lists hold is served by a test's
+// reactor.
+func newDynamicFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	typed := testScheme()
+	s := runtime.NewScheme()
+	for gvk := range typed.AllKnownTypes() {
+		if strings.HasSuffix(gvk.Kind, "List") {
+			s.AddKnownTypeWithName(gvk, &unstructured.UnstructuredList{})
+		} else {
+			s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		}
+	}
+	us := make([]runtime.Object, 0, len(objs))
+	for _, o := range objs {
+		m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
+		if err != nil {
+			panic(err)
+		}
+		u := &unstructured.Unstructured{Object: m}
+		gvk := u.GroupVersionKind()
+		if gvk.Group == "" || gvk.Kind == "" {
+			gvks, _, err := typed.ObjectKinds(o)
+			if err != nil {
+				panic(err)
+			}
+			gvk = gvks[0]
+			u.SetGroupVersionKind(gvk)
+		}
+		if !s.Recognizes(gvk) {
+			s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		}
+		if list := gvk.GroupVersion().WithKind(gvk.Kind + "List"); !s.Recognizes(list) {
+			s.AddKnownTypeWithName(list, &unstructured.UnstructuredList{})
+		}
+		us = append(us, u)
+	}
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(s, map[schema.GroupVersionResource]string{
+		PodMetrics:  "PodMetricsList",
+		NodeMetrics: "NodeMetricsList",
+	}, us...)
+}
+
 // env is a Cluster on client-go's fakes, and the fakes.
 type env struct {
 	c         *Cluster
@@ -261,6 +310,9 @@ type envConfig struct {
 	failGroup string                    // a group version whose discovery fails
 	renderers func(*testRenderers)      // adds to the renderers
 	before    func(*env)                // runs before the Cluster is made: reactors
+	// real: the renderers and types of render, whose pods and nodes are
+	// metered, instead of the tests' own.
+	real bool
 }
 
 // newEnv makes a Cluster on fakes that hold objs, with the test
@@ -268,7 +320,7 @@ type envConfig struct {
 func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 	t.Helper()
 	e := &env{
-		dyn:       dynamicfake.NewSimpleDynamicClient(testScheme(), objs...),
+		dyn:       newDynamicFake(objs...),
 		typed:     fake.NewSimpleClientset(objs...),
 		renderers: newTestRenderers(),
 	}
@@ -292,9 +344,14 @@ func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 		opts.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	opts.Renderers = e.renderers.For
+	if cfg.real {
+		opts.Renderers = render.For
+	}
 	e.c = newCluster(nil, e.typed, e.dyn, e.disc, nil, opts)
 	e.c.meta = metadataFake(objs)
-	e.c.zeroOf = testZero
+	if !cfg.real {
+		e.c.zeroOf = testZero
+	}
 	t.Cleanup(e.c.Close)
 	return e
 }

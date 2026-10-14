@@ -169,6 +169,30 @@ type Watch interface {
 	Close()
 }
 
+// UsageWatch is the cluster's use of its nodes, kept up to date.
+type UsageWatch interface {
+	// Current returns the last reading. ok is false while there is
+	// none: the API does not serve the metrics of nodes, no list has
+	// worked yet, or the last one failed.
+	Current() (u ClusterUsage, ok bool)
+	// Changed receives after Current may answer differently. It has
+	// room for one signal: many changes are one. Close closes it, so
+	// that a receive which finds it closed says the watch has ended.
+	Changed() <-chan struct{}
+	// Close ends the watch. It may be called more than once.
+	Close()
+}
+
+// ClusterUsage is the cluster's use of its nodes, in whole percents of
+// what they can give, as k9s computes it: the sum over the nodes of what
+// metrics-server measured, over the sum of their allocatable, floored.
+type ClusterUsage struct {
+	CPU, Mem int
+	// Served is whether the API serves the metrics of nodes now: the
+	// header's lines exist while it does.
+	Served bool
+}
+
 // LogFrom says where a log starts.
 type LogFrom int
 
@@ -335,6 +359,12 @@ type Reader interface {
 	// Watch opens the table of q. The table of a resource the session
 	// may not list is a Watch whose Table has Err, not an error here.
 	Watch(q Query) (Watch, error)
+	// ClusterUsage opens the cluster's use of its nodes' CPU and memory,
+	// for the header: a reading every Options.MetricsPoll while the API
+	// serves the metrics of nodes. While it does not, Current is not ok
+	// and not Served. It ends when the session's context does, or at
+	// Close.
+	ClusterUsage() UsageWatch
 
 	// YAML returns the object as YAML, read from the API now, without
 	// managedFields unless they are asked for. For a Secret it is

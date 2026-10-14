@@ -10,6 +10,10 @@
 # KOSH_E2E_IMAGE=<image> uses an image that is already loaded instead of
 # building one. KOSH_E2E_NO_NETWORK=1 skips the tests over the relays.
 # KOSH_E2E_CACHE is where iroh-ssh is kept between runs (.cache/e2e).
+# KOSH_E2E_SLOW=1 runs the tests that wait for kosh's discovery too
+# (TestMetricsColumnsFollowTheAPI, up to 12 minutes), with the tests'
+# deadline 40 minutes instead of 20. KOSH_E2E_RUN=<regexp> runs only the
+# tests it matches, as go test -run does.
 #
 # It touches nothing it did not make: the image gets a tag of its own,
 # kosh-e2e:<random>, right after it is loaded, and only that tag is used
@@ -49,6 +53,12 @@ IROH_SSH_SHA256=6e39a6b22f14d683598600350ca642d3b67fd0b0a2f2a7b29928ad6cdf032826
 # built with Nix's cargo.
 IROH_SSH_REPO=https://github.com/rustonbsd/iroh-ssh
 IROH_SSH_COMMIT=82e99719f8b4e44c69622140f4acb25e5ae54184
+
+# metrics-server: the released manifest of the version pinned here,
+# checked against its SHA-256.
+METRICS_SERVER_VERSION=v0.7.2
+METRICS_SERVER=https://github.com/kubernetes-sigs/metrics-server/releases/download/$METRICS_SERVER_VERSION/components.yaml
+METRICS_SERVER_SHA256=f103539a54ed72efe66616afc74a8bfaed651703cb3918797599046af5617441
 
 NAMESPACE=kosh
 RELEASE=kosh
@@ -139,13 +149,16 @@ else
 fi
 
 # 2. A cluster of its own, with the image in it, and the images the
-# test's objects run, so that nothing is pulled while the tests run.
+# test's objects and metrics-server run, so that nothing is pulled while
+# the tests run.
 step "the kind cluster $CLUSTER"
 CREATED_CLUSTER=1
 kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
 kind load docker-image "$TAG" --name "$CLUSTER"
+curl -fsSL --retry 3 -o "$WORK/metrics-server.yaml" "$METRICS_SERVER"
+echo "$METRICS_SERVER_SHA256  $WORK/metrics-server.yaml" | sha256sum -c --quiet - || fail "$METRICS_SERVER is not the one this script knows"
 # A registry that does not answer at once is tried again, three times.
-sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml | while read -r image; do
+sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml "$WORK/metrics-server.yaml" | while read -r image; do
   for try in 1 2 3; do
     docker exec "$CLUSTER-control-plane" crictl pull "$image" >/dev/null && break
     [ "$try" != 3 ] || fail "$image could not be pulled into the node"
@@ -153,6 +166,17 @@ sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml | while read -r image; do
   done
   echo "ok   $image is in the node"
 done
+
+# metrics-server, as a cluster that has it: the released manifest, with
+# --kubelet-insecure-tls since kind's kubelets serve certificates of
+# their own signing, as kind's docs have it. Before kosh, whose
+# discovery at start then finds the metrics API.
+step "metrics-server $METRICS_SERVER_VERSION"
+kubectl apply -f "$WORK/metrics-server.yaml" >/dev/null
+kubectl --namespace kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=180s
+kubectl --namespace kube-system wait --for=condition=Available deployment/metrics-server --timeout=180s
 
 # 3. The keys and the state.
 step "the keys and the state"
@@ -261,12 +285,14 @@ echo "ok   $iroh_ssh"
 
 # 8. The tests.
 step "the tests"
+deadline=20m
+[ "${KOSH_E2E_SLOW:-}" != 1 ] || deadline=40m
 KOSH_E2E_SSH=127.0.0.1:$port \
   KOSH_E2E_FULL_KEY=$WORK/full \
   KOSH_E2E_READONLY_KEY=$WORK/readonly \
   KOSH_E2E_HOST_KEY=$WORK/host_key.pub \
   KOSH_E2E_ENDPOINT=$ENDPOINT \
   KOSH_E2E_IROH_SSH=$iroh_ssh \
-  go test -tags e2e -count=1 -timeout 20m -v ./e2e/
+  go test -tags e2e -count=1 -timeout "$deadline" -v ${KOSH_E2E_RUN:+-run "$KOSH_E2E_RUN"} ./e2e/
 
 echo "all checks passed"

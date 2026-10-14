@@ -24,8 +24,14 @@ var podColumns = []Column{
 	{Name: "STATUS"},
 	{Name: "RESTARTS", Right: true, Numeric: true},
 	{Name: "LAST RESTART", Wide: true, Right: true, Numeric: true},
+	{Name: "CPU", Right: true, Numeric: true, Metric: true},
 	{Name: "CPU/RL", Wide: true, Right: true, Numeric: true},
+	{Name: "%CPU/R", Right: true, Numeric: true, Metric: true},
+	{Name: "%CPU/L", Right: true, Numeric: true, Metric: true},
+	{Name: "MEM", Right: true, Numeric: true, Metric: true},
 	{Name: "MEM/RL", Wide: true, Right: true, Numeric: true},
+	{Name: "%MEM/R", Right: true, Numeric: true, Metric: true},
+	{Name: "%MEM/L", Right: true, Numeric: true, Metric: true},
 	{Name: "IP"},
 	{Name: "NODE"},
 	{Name: "SERVICE-ACCOUNT", Wide: true},
@@ -66,8 +72,15 @@ func (pod) Row(obj runtime.Object, now time.Time) (Row, error) {
 	} else {
 		b.Age(lastRestart, now)
 	}
-	b.Num(workloadCPU(req)+":"+workloadCPU(lim), float64(req.cpu)).
+	// The metric cells are NAValue until Meter fills them.
+	b.Num(NAValue, 0).
+		Num(workloadCPU(req)+":"+workloadCPU(lim), float64(req.cpu)).
+		Num(NAValue, 0).
+		Num(NAValue, 0).
+		Num(NAValue, 0).
 		Num(workloadMem(req)+":"+workloadMem(lim), float64(req.mem)).
+		Num(NAValue, 0).
+		Num(NAValue, 0).
 		Text(workloadOr(st.PodIP, NAValue)).
 		Text(workloadOr(spec.NodeName, NAValue)).
 		Text(workloadOr(spec.ServiceAccountName, NAValue)).
@@ -79,6 +92,42 @@ func (pod) Row(obj runtime.Object, now time.Time) (Row, error) {
 		Age(po.CreationTimestamp.Time, now).
 		Health(podHealth(status, valid))
 	return b.Row(), nil
+}
+
+// Meter sets the pod's metric cells from the usage of its containers,
+// summed: only the init, main and ephemeral containers its spec names,
+// of which metrics-server reports those that run. The percentages are of
+// the requests and limits the CPU/RL and MEM/RL cells show. A usage
+// that names none of the pod's containers leaves the cells NAValue, as
+// a pod the reading did not cover.
+func (pod) Meter(row *Row, obj runtime.Object, usage map[string]Usage) {
+	po, ok := obj.(*corev1.Pod)
+	if !ok || po == nil {
+		return
+	}
+	var sum Usage
+	found := false
+	add := func(name string) {
+		if u, ok := usage[name]; ok {
+			sum.CPU += u.CPU
+			sum.Mem += u.Mem
+			found = true
+		}
+	}
+	for i := range po.Spec.InitContainers {
+		add(po.Spec.InitContainers[i].Name)
+	}
+	for i := range po.Spec.Containers {
+		add(po.Spec.Containers[i].Name)
+	}
+	for i := range po.Spec.EphemeralContainers {
+		add(po.Spec.EphemeralContainers[i].Name)
+	}
+	if !found {
+		return
+	}
+	req, lim := podResources(&po.Spec)
+	metricMeterPod(row, podMetricCells, sum, req, lim)
 }
 
 // podContainerStats counts the pod's containers and those that are

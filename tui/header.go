@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
+
+	"github.com/fables-for-robots/kosh/render"
 )
 
 // hintRows is how many hints, and shortcuts, a column of the header
@@ -31,13 +33,19 @@ func (r *root) header() []string {
 		name += " [read-only]"
 	}
 	info := [][2]string{
-		{"Key:", name},
-		{"Cluster:", cleanLine(r.cluster)},
-		{"kosh:", cleanLine(r.version)},
+		{"Key:", styleInfoValue.Render(name)},
+		{"Cluster:", styleInfoValue.Render(cleanLine(r.cluster))},
+		{"kosh:", styleInfoValue.Render(cleanLine(r.version))},
+	}
+	if now, before := r.usage, r.prevUsage; now.u.Served {
+		info = append(info,
+			[2]string{"CPU:", usageCell(now.u.CPU, now.ok, before.u.CPU, before.ok)},
+			[2]string{"MEM:", usageCell(now.u.Mem, now.ok, before.u.Mem, before.ok)},
+		)
 	}
 	var left []string
 	for _, kv := range info {
-		left = append(left, styleInfoLabel.Render(kv[0]+strings.Repeat(" ", 9-len(kv[0])))+styleInfoValue.Render(kv[1]))
+		left = append(left, styleInfoLabel.Render(kv[0]+strings.Repeat(" ", 9-len(kv[0])))+kv[1])
 	}
 	cols := [][]string{left}
 	widths := []int{min(colWidth(left), max(r.w, 0))}
@@ -96,6 +104,25 @@ func (r *root) header() []string {
 		lines[i] = fit(b.String(), r.w)
 	}
 	return lines
+}
+
+// usageCell draws a percentage of the header's usage lines: "12%", with
+// ↑ when it rose since the last ok reading before and ↓ when it fell,
+// and nothing more when it did not or there was no ok reading before;
+// n/a while there is no reading.
+func usageCell(now int, ok bool, before int, beforeOK bool) string {
+	if !ok {
+		return styleInfoValue.Render(render.NAValue)
+	}
+	cell := styleInfoValue.Render(strconv.Itoa(now) + "%")
+	switch {
+	case !beforeOK:
+	case now > before:
+		cell += " " + styleUp.Render("↑")
+	case now < before:
+		cell += " " + styleDown.Render("↓")
+	}
+	return cell
 }
 
 // hintColumns returns the columns of the top view's hints that fit

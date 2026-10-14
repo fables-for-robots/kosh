@@ -768,7 +768,9 @@ colours and a change of the window's size arrive as over TCP.
   (`2026-10-13-kosh-shell-design.md`, kosh v0.2.0); attach,
   port-forward and copying files are not yet.
 - **Stage 3: what k9s has besides.** The metrics columns and pulses with
-  metrics-server, xray, "used by", and what else of k9s is missed.
+  metrics-server, xray, "used by", and what else of k9s is missed. The
+  metrics columns are built (`2026-10-14-kosh-metrics-design.md`, kosh
+  v0.4.0); pulses, xray and "used by" are not yet.
 
 Each gets a design of its own when its turn comes.
 
@@ -797,6 +799,9 @@ where it differs from them, this section is what is built. The plan's
   reference; no API path is built from an unchecked string. An action
   ends with its session, and is refused once the session has ended.
   AGE of a generic table sorts by the object's creation time.
+- **§9, Appendix A.** With metrics-server
+  (`2026-10-14-kosh-metrics-design.md`, v0.4.0) pods, containers and
+  nodes have the CPU and memory columns, present while the API is served.
 - **§10.** A dialog is laid over the whole screen and always shows its
   buttons; on a screen too small for it the action is refused. An error
   is wrapped onto up to four lines of the flash and stays until a key is
@@ -822,13 +827,16 @@ where it differs from them, this section is what is built. The plan's
 
 ## Appendix A: the columns
 
-A column marked `*` is shown only wide (`ctrl-w`). Namespaced kinds
-drop NAMESPACE when the view is of one namespace.
+A column marked `*` is shown only wide (`ctrl-w`). A column marked `†`
+is in the table only while the cluster serves the metrics API
+(`metrics.k8s.io`), as it does with metrics-server
+(`2026-10-14-kosh-metrics-design.md`). Namespaced kinds drop NAMESPACE
+when the view is of one namespace.
 
 | Kind | Columns |
 |---|---|
-| pods | NAMESPACE, NAME, READY, STATUS, RESTARTS, LAST RESTART\*, CPU/RL\*, MEM/RL\*, IP, NODE, SERVICE-ACCOUNT\*, NOMINATED NODE\*, READINESS GATES\*, QOS\*, LABELS\*, VALID\*, AGE |
-| containers | IDX, NAME, IMAGE, READY, STATE, RESTARTS, PROBES(L:R:S), CPU/RL, MEM/RL, PORTS, VALID\*, AGE |
+| pods | NAMESPACE, NAME, READY, STATUS, RESTARTS, LAST RESTART\*, CPU†, CPU/RL\*, %CPU/R†, %CPU/L†, MEM†, MEM/RL\*, %MEM/R†, %MEM/L†, IP, NODE, SERVICE-ACCOUNT\*, NOMINATED NODE\*, READINESS GATES\*, QOS\*, LABELS\*, VALID\*, AGE |
+| containers | IDX, NAME, IMAGE, READY, STATE, RESTARTS, PROBES(L:R:S), CPU†, CPU/RL, %CPU/R†, %CPU/L†, MEM†, MEM/RL, %MEM/R†, %MEM/L†, PORTS, VALID\*, AGE |
 | deployments | NAMESPACE, NAME, READY, UP-TO-DATE, AVAILABLE, LABELS\*, VALID\*, AGE |
 | replicasets | NAMESPACE, NAME, DESIRED, CURRENT, READY, CONTAINERS\*, IMAGES\*, SELECTOR\*, VALID\*, AGE |
 | statefulsets | NAMESPACE, NAME, READY, SELECTOR\*, SERVICE, CONTAINERS\*, IMAGES\*, LABELS\*, VALID\*, AGE |
@@ -836,7 +844,7 @@ drop NAMESPACE when the view is of one namespace.
 | jobs | NAMESPACE, NAME, COMPLETIONS, DURATION, SELECTOR\*, CONTAINERS\*, IMAGES\*, VALID\*, AGE |
 | cronjobs | NAMESPACE, NAME, SCHEDULE, SUSPEND, ACTIVE, LAST_SCHEDULE, SELECTOR\*, CONTAINERS\*, IMAGES\*, LABELS\*, VALID\*, AGE |
 | services | NAMESPACE, NAME, TYPE, CLUSTER-IP, EXTERNAL-IP, SELECTOR\*, PORTS, LABELS\*, VALID\*, AGE |
-| nodes | NAME, STATUS, ROLE, ARCH\*, TAINTS, VERSION, OS-IMAGE\*, KERNEL\*, INTERNAL-IP\*, EXTERNAL-IP\*, PODS, LABELS\*, VALID\*, AGE |
+| nodes | NAME, STATUS, ROLE, ARCH\*, TAINTS, VERSION, OS-IMAGE\*, KERNEL\*, INTERNAL-IP\*, EXTERNAL-IP\*, PODS, CPU†, CPU/A†, %CPU†, MEM†, MEM/A†, %MEM†, LABELS\*, VALID\*, AGE |
 | namespaces | NAME, STATUS, LABELS\*, VALID\*, AGE |
 | events | NAMESPACE, LAST SEEN, TYPE, REASON, OBJECT, MESSAGE, SUBOBJECT\*, SOURCE\*, FIRST SEEN\*, COUNT\*, NAME\* |
 | ingresses | NAMESPACE, NAME, CLASS, HOSTS, ADDRESS, PORTS, AGE |

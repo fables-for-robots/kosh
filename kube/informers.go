@@ -107,7 +107,7 @@ func (c *Cluster) stopIdle(k *kindCache, gen int) {
 	k.cancel()
 }
 
-// stopCaches stops every cache, for Close.
+// stopCaches stops every cache and every metrics poller, for Close.
 func (c *Cluster) stopCaches() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -117,6 +117,7 @@ func (c *Cluster) stopCaches() {
 		k.cancel()
 		delete(c.caches, gvr)
 	}
+	c.stopPollers()
 }
 
 // listWatch is a cache.ListWatch that always lists, then watches: the

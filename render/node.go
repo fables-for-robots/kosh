@@ -23,23 +23,39 @@ func init() {
 	Register(Nodes, node{}, func() runtime.Object { return &corev1.Node{} })
 }
 
+var nodeColumns = []Column{
+	{Name: "NAME"},
+	{Name: "STATUS"},
+	{Name: "ROLE"},
+	{Name: "ARCH", Wide: true},
+	{Name: "TAINTS", Numeric: true},
+	{Name: "VERSION"},
+	{Name: "OS-IMAGE", Wide: true},
+	{Name: "KERNEL", Wide: true},
+	{Name: "INTERNAL-IP", Wide: true},
+	{Name: "EXTERNAL-IP", Wide: true},
+	{Name: "PODS", Right: true, Numeric: true},
+	{Name: "CPU", Right: true, Numeric: true, Metric: true},
+	{Name: "CPU/A", Right: true, Numeric: true, Metric: true},
+	{Name: "%CPU", Right: true, Numeric: true, Metric: true},
+	{Name: "MEM", Right: true, Numeric: true, Metric: true},
+	{Name: "MEM/A", Right: true, Numeric: true, Metric: true},
+	{Name: "%MEM", Right: true, Numeric: true, Metric: true},
+	{Name: "LABELS", Wide: true},
+	{Name: "VALID", Wide: true},
+	{Name: "AGE", Numeric: true},
+}
+
+// The indexes of the node's metric cells that Meter sets.
+var (
+	nodeCPU     = metricIndex(nodeColumns, "CPU")
+	nodePercCPU = metricIndex(nodeColumns, "%CPU")
+	nodeMem     = metricIndex(nodeColumns, "MEM")
+	nodePercMem = metricIndex(nodeColumns, "%MEM")
+)
+
 func (node) Columns() []Column {
-	return []Column{
-		{Name: "NAME"},
-		{Name: "STATUS"},
-		{Name: "ROLE"},
-		{Name: "ARCH", Wide: true},
-		{Name: "TAINTS", Numeric: true},
-		{Name: "VERSION"},
-		{Name: "OS-IMAGE", Wide: true},
-		{Name: "KERNEL", Wide: true},
-		{Name: "INTERNAL-IP", Wide: true},
-		{Name: "EXTERNAL-IP", Wide: true},
-		{Name: "PODS", Right: true, Numeric: true},
-		{Name: "LABELS", Wide: true},
-		{Name: "VALID", Wide: true},
-		{Name: "AGE", Numeric: true},
-	}
+	return append([]Column(nil), nodeColumns...)
 }
 
 func (node) Row(obj runtime.Object, now time.Time) (Row, error) {
@@ -71,6 +87,26 @@ func (node) Row(obj runtime.Object, now time.Time) (Row, error) {
 		b.Num(NAValue, 0)
 	}
 
+	// CPU, %CPU, MEM and %MEM are NAValue until Meter fills them. CPU/A
+	// and MEM/A are the node's own, so a row has them without a reading;
+	// they are NAValue when the node does not say them.
+	allocCPU, cpuOK := n.Status.Allocatable[corev1.ResourceCPU]
+	allocMem, memOK := n.Status.Allocatable[corev1.ResourceMemory]
+	b.Num(NAValue, 0)
+	if cpuOK {
+		b.Num(metricMc(allocCPU.MilliValue()), float64(allocCPU.MilliValue()))
+	} else {
+		b.Num(NAValue, 0)
+	}
+	b.Num(NAValue, 0).
+		Num(NAValue, 0)
+	if memOK {
+		b.Num(metricMi(allocMem.Value()), float64(allocMem.Value()))
+	} else {
+		b.Num(NAValue, 0)
+	}
+	b.Num(NAValue, 0)
+
 	// As k9s: VALID says why the node is not as it should be. A node
 	// that is ready and cordoned is only on its way (Pending), so
 	// Health is set after Valid, which would make the row an Error.
@@ -88,6 +124,23 @@ func (node) Row(obj runtime.Object, now time.Time) (Row, error) {
 		b.Health(Pending)
 	}
 	return b.Row(), nil
+}
+
+// Meter sets the node's CPU, %CPU, MEM and %MEM from the entry "" of
+// usage, the percentages of its allocatable. CPU/A and MEM/A are Row's.
+func (node) Meter(row *Row, obj runtime.Object, usage map[string]Usage) {
+	n, ok := obj.(*corev1.Node)
+	if !ok || n == nil {
+		return
+	}
+	u, ok := usage[""]
+	if !ok {
+		return
+	}
+	metricSetMc(row, nodeCPU, u.CPU)
+	metricSetPerc(row, nodePercCPU, u.CPU, n.Status.Allocatable.Cpu().MilliValue())
+	metricSetMi(row, nodeMem, u.Mem)
+	metricSetPerc(row, nodePercMem, u.Mem, n.Status.Allocatable.Memory().Value())
 }
 
 // nodeStatuses returns the words of the STATUS cell, sorted, and whether

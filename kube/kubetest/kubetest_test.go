@@ -90,3 +90,32 @@ func TestSetTableSignalsTheWatch(t *testing.T) {
 		t.Errorf("open after Close: %v", open)
 	}
 }
+
+func TestFakeUsage(t *testing.T) {
+	s := New(keys.Grant{})
+	u := s.ClusterUsage()
+	defer u.Close()
+	if got, ok := u.Current(); ok || got.Served {
+		t.Errorf("%+v, %v before SetUsage", got, ok)
+	}
+	want := kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}
+	s.SetUsage(want, true)
+	select {
+	case <-u.Changed():
+	default:
+		t.Fatal("no signal after SetUsage")
+	}
+	if got, ok := u.Current(); !ok || got != want {
+		t.Errorf("%+v, %v; want %+v, true", got, ok, want)
+	}
+	s.SetUsage(kube.ClusterUsage{Served: true}, false)
+	s.SetUsage(kube.ClusterUsage{Served: true}, false)
+	select {
+	case <-u.Changed():
+	default:
+		t.Fatal("no signal after the second SetUsage")
+	}
+	if got, ok := u.Current(); ok || !got.Served {
+		t.Errorf("%+v, %v; want served and not ok", got, ok)
+	}
+}

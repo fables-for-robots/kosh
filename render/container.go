@@ -19,8 +19,14 @@ var containerColumns = []Column{
 	{Name: "STATE"},
 	{Name: "RESTARTS", Right: true, Numeric: true},
 	{Name: "PROBES(L:R:S)"},
+	{Name: "CPU", Right: true, Numeric: true, Metric: true},
 	{Name: "CPU/RL", Right: true, Numeric: true},
+	{Name: "%CPU/R", Right: true, Numeric: true, Metric: true},
+	{Name: "%CPU/L", Right: true, Numeric: true, Metric: true},
+	{Name: "MEM", Right: true, Numeric: true, Metric: true},
 	{Name: "MEM/RL", Right: true, Numeric: true},
+	{Name: "%MEM/R", Right: true, Numeric: true, Metric: true},
+	{Name: "%MEM/L", Right: true, Numeric: true, Metric: true},
 	{Name: "PORTS"},
 	{Name: "VALID", Wide: true},
 	{Name: "AGE", Numeric: true},
@@ -89,8 +95,15 @@ func containerRow(pod *corev1.Pod, idx string, c *corev1.Container, cs *corev1.C
 		Text(state).
 		Int(int64(restarts)).
 		Text(containerProbe(c.LivenessProbe)+":"+containerProbe(c.ReadinessProbe)+":"+containerProbe(c.StartupProbe)).
+		// The metric cells are NAValue until MeterContainers fills them.
+		Num(NAValue, 0).
 		Num(workloadCPU(req)+":"+workloadCPU(lim), float64(req.cpu)).
+		Num(NAValue, 0).
+		Num(NAValue, 0).
+		Num(NAValue, 0).
 		Num(workloadMem(req)+":"+workloadMem(lim), float64(req.mem)).
+		Num(NAValue, 0).
+		Num(NAValue, 0).
 		Text(containerPorts(c.Ports)).
 		Valid(valid).
 		Age(containerSince(pod, cs), now).

@@ -3,8 +3,11 @@ package kube
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +21,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
+
+	"github.com/fables-for-robots/kosh/render"
 )
 
 // readEnvResolve resolves name with s, and fails the test when it
@@ -268,5 +273,64 @@ func TestEnvOrdinaryReferencesAreRead(t *testing.T) {
 		}
 		readCollect(t, ls)
 		ls.Close()
+	}
+}
+
+// The API server of envtest serves no metrics API, as a cluster without
+// metrics-server: the tables are those of stage 1, and the header has no
+// usage.
+func TestNoMetricsAPIOnEnvtest(t *testing.T) {
+	cfg := startAPIServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// render's renderers, whose pods and nodes are metered, not the
+	// tests' own.
+	c, err := New(ctx, cfg, Options{Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(c.Close)
+	typed := kubernetes.NewForConfigOrDie(cfg)
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}},
+	}
+	if _, err := typed.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	s := c.Session(context.Background(), fullGrant)
+	w, err := s.Watch(Query{Resource: readEnvResolve(t, s, "pods")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	var tab Table
+	eventually(t, "the pod's row", func() bool {
+		tab = w.Table(time.Now())
+		return len(tab.Rows) == 1 && !tab.Stale && tab.Err == nil
+	})
+	if column(tab, "CPU") >= 0 || column(tab, "MEM") >= 0 {
+		t.Errorf("columns %v without the metrics API", tab.Columns)
+	}
+	if column(tab, "IP") < 0 {
+		t.Errorf("columns %v: not the pods' renderer's", tab.Columns)
+	}
+	whole(t, tab)
+
+	u := s.ClusterUsage()
+	defer u.Close()
+	if got, ok := u.Current(); ok || got.Served {
+		t.Errorf("ClusterUsage %+v, %v without the metrics API", got, ok)
+	}
+	// The cluster has nodes kosh can read: the watch found no metrics
+	// API, and so holds neither the nodes' cache nor a poller.
+	if r, ok := c.knownResource(render.Nodes); !ok || !r.Typed {
+		t.Errorf("nodes %+v, %v: not a kind kosh reads, and the test shows nothing", r, ok)
+	}
+	if c.running(render.Nodes) {
+		t.Error("the usage watch holds the nodes' cache without the metrics API")
+	}
+	if n := c.pollerCount(); n != 0 {
+		t.Errorf("%d pollers without the metrics API", n)
 	}
 }

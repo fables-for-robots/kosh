@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/keys"
+	"github.com/fables-for-robots/kosh/kube"
 )
 
 // The smallest window the frame is drawn in.
@@ -39,6 +40,24 @@ type root struct {
 	// startErr is why the table of pods could not be opened at the
 	// start; the body shows it while the stack is empty.
 	startErr error
+	// usageWatch is the cluster's use of its nodes, for the header's CPU
+	// and MEM lines. usage is its last reading, and prevUsage the last ok
+	// one before it, which the arrows compare with: a reading that is
+	// not ok says n/a and leaves prevUsage as it was.
+	usageWatch       kube.UsageWatch
+	usage, prevUsage usageReading
+}
+
+// usageReading is a reading of the usage watch: ok is false while there
+// is none.
+type usageReading struct {
+	u  kube.ClusterUsage
+	ok bool
+}
+
+// usageMsg is what the usage watch says after it signalled.
+type usageMsg struct {
+	usageReading
 }
 
 func newRoot(e env, version string) *root {
@@ -51,9 +70,26 @@ func newRoot(e env, version string) *root {
 	}
 }
 
-// Init resolves pods and opens their table in the namespace default.
+// Init resolves pods and opens their table in the namespace default,
+// and opens the cluster's usage for the header.
 func (r *root) Init() tea.Cmd {
-	return r.resolve("pods", "pods", "", false, true, true)
+	r.usageWatch = r.e.sess.ClusterUsage()
+	return tea.Batch(r.resolve("pods", "pods", "", false, true, true), r.waitUsage())
+}
+
+// waitUsage waits for the usage watch to signal, and reads it then. The
+// session's end closes the watch, and the watch closes its Changed: the
+// wait ends then with nothing, and nothing of the session is left
+// waiting.
+func (r *root) waitUsage() tea.Cmd {
+	w := r.usageWatch
+	return waitCmd(func() tea.Msg {
+		if _, open := <-w.Changed(); !open {
+			return nil
+		}
+		u, ok := w.Current()
+		return usageMsg{usageReading{u: u, ok: ok}}
+	})
 }
 
 // Update routes msg: a key press to the one part that has the keys, a
@@ -108,6 +144,12 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case suggestionsMsg:
 		r.prompt.suggest(msg.names)
 		return r, nil
+	case usageMsg:
+		if r.usage.ok {
+			r.prevUsage = r.usage
+		}
+		r.usage = msg.usageReading
+		return r, r.waitUsage()
 	}
 	return r, r.broadcast(msg)
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/keys"
+	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
 )
 
@@ -336,4 +337,35 @@ func TestPromptOverAFullscreenView(t *testing.T) {
 		hs.send(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		hs.drawn()
 	}
+}
+
+// Closing the usage watch, as the session's end does, ends the root's
+// wait on it: the wait returns nothing, the root waits no more, and the
+// header keeps what it last read.
+func TestClosingTheUsageWatchEndsTheWait(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
+	hs.awaitFrame("CPU:     12%")
+
+	hs.root().usageWatch.Close()
+	// The wait in flight ends with a nil message, which is dropped;
+	// nothing else arrives, so the frame is as it was and no later
+	// reading can be seen.
+	select {
+	case msg := <-hs.async:
+		if msg != nil {
+			t.Fatalf("the wait on a closed watch returned %#v, want nil", msg)
+		}
+	case <-time.After(deadline):
+		t.Fatal("the wait on a closed watch did not end")
+	}
+	hs.wantFrame("CPU:     12%")
+	sess.SetUsage(kube.ClusterUsage{CPU: 50, Mem: 50, Served: true}, true)
+	select {
+	case msg := <-hs.async:
+		t.Fatalf("a message came after the watch was closed: %#v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+	hs.wantFrame("CPU:     12%")
 }

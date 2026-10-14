@@ -17,7 +17,9 @@ package e2e
 // cluster and one kosh: TestRoleCanBeChanged, TestKeyRemovedEndsTheSession
 // and TestShellEndsWithItsKey change kosh's role and its key list, and
 // put them back; TestStopTellsTheSessions restarts kosh and comes last.
-// The other tests of a shell come before them.
+// The other tests of a shell come before them. The tests of the metrics
+// come after the shell's, and TestMetricsColumnsFollowTheAPI, which runs
+// only with KOSH_E2E_SLOW=1, takes the metrics API away and puts it back.
 
 import (
 	"bufio"
@@ -1810,6 +1812,271 @@ func TestShellSurvivesNothing(t *testing.T) {
 	for _, l := range repaired {
 		t.Log(l)
 	}
+}
+
+// tableHeader returns the index of the table's header line, the line
+// under its top border, or -1.
+func tableHeader(lines []string) int {
+	for i, l := range lines {
+		if strings.HasPrefix(l, "┌") && i+1 < len(lines) {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// words returns where each run of characters that are not blank or the
+// table's border is in line, in runes: [from, to) pairs.
+func words(line []rune) [][2]int {
+	var out [][2]int
+	from := -1
+	for i := 0; i <= len(line); i++ {
+		blank := i == len(line) || line[i] == ' ' || line[i] == '│'
+		switch {
+		case !blank && from < 0:
+			from = i
+		case blank && from >= 0:
+			out = append(out, [2]int{from, i})
+			from = -1
+		}
+	}
+	return out
+}
+
+// column returns where the column name is in the table's header line, in
+// runes, with the sort arrow after it if it has one; ok is false when the
+// table has no such column.
+func column(lines []string, name string) (from, to int, ok bool) {
+	h := tableHeader(lines)
+	if h < 0 {
+		return 0, 0, false
+	}
+	header := []rune(lines[h])
+	for _, w := range words(header) {
+		if strings.TrimRight(string(header[w[0]:w[1]]), "↑↓") == name {
+			return w[0], w[1], true
+		}
+	}
+	return 0, 0, false
+}
+
+// hasColumn reports whether the table's header line has the column name.
+func hasColumn(lines []string, name string) bool {
+	_, _, ok := column(lines, name)
+	return ok
+}
+
+// cell returns the cell of the column name in the row whose first cell
+// is first: the text of the row under the column's name in the header
+// line, where a cell aligned to the left begins and one aligned to the
+// right ends. ok is false when the table has no such column or no such
+// row; a blank cell is "".
+func cell(lines []string, first, name string) (string, bool) {
+	from, to, ok := column(lines, name)
+	if !ok {
+		return "", false
+	}
+	for _, l := range lines[tableHeader(lines)+1:] {
+		cells := strings.Fields(strings.Trim(l, "│ "))
+		if len(cells) == 0 || cells[0] != first {
+			continue
+		}
+		r := []rune(l)
+		for _, w := range words(r) {
+			if w[0] < to && w[1] > from {
+				return string(r[w[0]:w[1]]), true
+			}
+		}
+		return "", true
+	}
+	return "", false
+}
+
+// number matches a cell of millicores, mebibytes or a percentage: a
+// whole number.
+var number = regexp.MustCompile(`^[0-9]+$`)
+
+// The cluster of scripts/test-e2e.sh has metrics-server: the pods table
+// has the metric columns, and the running pod a number in CPU once
+// metrics-server has measured it.
+func TestPodsShowCPUAndMemory(t *testing.T) {
+	inCluster(t)
+	c := connect(t, fullKey(t), 160, 40)
+	c.waitFor("Pods(default)")
+	c.waitRow("marker", "Running")
+	c.waitUntil(wait, "the columns CPU and MEM", func(lines []string) bool {
+		return hasColumn(lines, "CPU") && hasColumn(lines, "MEM")
+	})
+	// n/a until a reading covers the pod, then a number. What it showed
+	// on the way is logged, not checked: a frame can be read half drawn.
+	var seen []string
+	c.waitUntil(90*time.Second, "a number in marker's CPU", func(lines []string) bool {
+		v, _ := cell(lines, "marker", "CPU")
+		if len(seen) == 0 || seen[len(seen)-1] != v {
+			seen = append(seen, v)
+		}
+		return number.MatchString(v)
+	})
+	t.Logf("marker's CPU was in turn %q", seen)
+	c.waitUntil(wait, "a number in marker's MEM", func(lines []string) bool {
+		v, _ := cell(lines, "marker", "MEM")
+		return number.MatchString(v)
+	})
+	t.Logf("the screen:\n%s", c.scr)
+}
+
+// nodeName is the name of the kind cluster's one node.
+func nodeName(t *testing.T) string {
+	t.Helper()
+	return strings.TrimSpace(kubectl(t, "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}"))
+}
+
+// A node's allocatable CPU is the node's own, without a reading.
+func TestNodesShowAllocatable(t *testing.T) {
+	inCluster(t)
+	node := nodeName(t)
+	c := connect(t, fullKey(t), 160, 40)
+	c.waitFor("Pods(default)")
+	c.send(":nodes" + keyEnter)
+	c.waitRow(node)
+	c.waitUntil(wait, "a number in "+node+"'s CPU/A", func(lines []string) bool {
+		v, _ := cell(lines, node, "CPU/A")
+		return number.MatchString(v)
+	})
+	for _, name := range []string{"CPU", "%CPU", "MEM", "MEM/A", "%MEM"} {
+		if !hasColumn(c.scr.lines(), name) {
+			t.Errorf("the nodes table has no column %s:\n%s", name, c.scr)
+		}
+	}
+	t.Logf("the screen:\n%s", c.scr)
+}
+
+// usageLine matches the header's line of the cluster's CPU or MEM with a
+// percentage.
+var usageLine = regexp.MustCompile(`^(CPU|MEM): +[0-9]+%`)
+
+// usageLines returns the header's lines of CPU and MEM with a
+// percentage, by their name.
+func usageLines(lines []string) map[string]string {
+	found := map[string]string{}
+	for _, l := range headerLines(lines) {
+		if m := usageLine.FindStringSubmatch(l); m != nil {
+			found[m[1]] = l
+		}
+	}
+	return found
+}
+
+func TestHeaderShowsClusterUsage(t *testing.T) {
+	inCluster(t)
+	c := connect(t, fullKey(t), 120, 40)
+	c.waitFor("Pods(default)")
+	c.waitUntil(90*time.Second, "the header's CPU: and MEM: with a percentage", func(lines []string) bool {
+		return len(usageLines(lines)) == 2
+	})
+	t.Logf("the screen:\n%s", c.scr)
+}
+
+// metricsAPIUp waits for the metrics API to be available again.
+func metricsAPIUp(t *testing.T) {
+	t.Helper()
+	kubectl(t, "wait", "--for=condition=Available", "apiservice/v1beta1.metrics.k8s.io", "--timeout=180s")
+}
+
+// saveMetricsAPI writes the APIService of the metrics API, as the
+// cluster has it now and without what the API server keeps of it, to a
+// file that kubectl apply makes it again from, and returns the file.
+func saveMetricsAPI(t *testing.T) string {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(kubectl(t, "get", "apiservice", "v1beta1.metrics.k8s.io", "-o", "json")), &obj); err != nil {
+		t.Fatal(err)
+	}
+	delete(obj, "status")
+	meta, _ := obj["metadata"].(map[string]any)
+	for _, f := range []string{"managedFields", "resourceVersion", "uid", "creationTimestamp", "generation"} {
+		delete(meta, f)
+	}
+	if ann, ok := meta["annotations"].(map[string]any); ok {
+		delete(ann, "kubectl.kubernetes.io/last-applied-configuration")
+	}
+	b, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "apiservice.json")
+	if err := os.WriteFile(file, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+// metricsServer returns the generation of the Deployment metrics-server
+// and its container's arguments.
+func metricsServer(t *testing.T) (generation, args string) {
+	t.Helper()
+	out := kubectl(t, "--namespace", "kube-system", "get", "deployment", "metrics-server",
+		"-o", "jsonpath={.metadata.generation} {.spec.template.spec.containers[0].args}")
+	generation, args, _ = strings.Cut(out, " ")
+	return generation, args
+}
+
+// The columns and the header's lines exist while the cluster serves the
+// metrics API: they go within discovery's interval of its removal and
+// come back within it of its return. The APIService alone is taken away
+// and made again: metrics-server itself runs on, untouched. Up to 12
+// minutes, so only with KOSH_E2E_SLOW=1.
+func TestMetricsColumnsFollowTheAPI(t *testing.T) {
+	inCluster(t)
+	if os.Getenv("KOSH_E2E_SLOW") != "1" {
+		t.Skip("KOSH_E2E_SLOW=1: it waits for discovery, every 5 minutes, twice")
+	}
+	saved := saveMetricsAPI(t)
+	generation, args := metricsServer(t)
+	if !strings.Contains(args, "--kubelet-insecure-tls") {
+		t.Fatalf("metrics-server runs without --kubelet-insecure-tls: %s", args)
+	}
+	// The test puts the API back however it ends.
+	t.Cleanup(func() {
+		kubectl(t, "apply", "-f", saved)
+		metricsAPIUp(t)
+	})
+
+	c := connect(t, fullKey(t), 160, 40)
+	c.waitFor("Pods(default)")
+	c.waitRow("marker", "Running")
+	c.waitUntil(wait, "the column CPU and the header's lines", func(lines []string) bool {
+		return hasColumn(lines, "CPU") && len(usageLines(lines)) == 2
+	})
+
+	start := time.Now()
+	kubectl(t, "delete", "apiservice", "v1beta1.metrics.k8s.io")
+	c.waitUntil(6*time.Minute, "the column CPU gone", func(lines []string) bool {
+		return hasColumn(lines, "NAME") && !hasColumn(lines, "CPU") && row(lines, "marker", "Running") != ""
+	})
+	t.Logf("the column CPU went %v after the APIService was deleted", time.Since(start).Round(time.Second))
+	c.waitUntil(wait, "the header's CPU: and MEM: gone", func(lines []string) bool {
+		return !lineWith(headerLines(lines), "CPU:") && !lineWith(headerLines(lines), "MEM:")
+	})
+	t.Logf("the header's lines went %v after the APIService was deleted", time.Since(start).Round(time.Second))
+
+	start = time.Now()
+	kubectl(t, "apply", "-f", saved)
+	c.waitUntil(6*time.Minute, "the column CPU back", func(lines []string) bool {
+		return hasColumn(lines, "CPU") && row(lines, "marker", "Running") != ""
+	})
+	t.Logf("the column CPU came back %v after the APIService was made again", time.Since(start).Round(time.Second))
+	c.waitUntil(90*time.Second, "the header's CPU: and MEM: back, with a percentage", func(lines []string) bool {
+		return len(usageLines(lines)) == 2
+	})
+	t.Logf("the header's lines came back, with a percentage, %v after the APIService was made again", time.Since(start).Round(time.Second))
+
+	// What came back is the metrics-server that was there: its Deployment
+	// was not changed, keeps its flag, and has no rollout under way.
+	if g, a := metricsServer(t); g != generation || !strings.Contains(a, "--kubelet-insecure-tls") {
+		t.Errorf("metrics-server's Deployment changed: generation %s, arguments %s; before: generation %s, arguments %s", g, a, generation, args)
+	}
+	kubectl(t, "--namespace", "kube-system", "rollout", "status", "deployment/metrics-server", "--timeout=60s")
 }
 
 // setKeys installs the chart again with the key list of lines, keeping
