@@ -244,10 +244,25 @@ session whose input was 64 KiB of which the library made no key, no
 paste and no report is ended, with `kosh: the terminal sent what is no
 key, no paste and no report, and too much of it; this session was
 closed` and a warning in the log that names the key. And of one control
-sequence's parameter separators 24 are passed on: the library's parser
-has room for 32 parameters and writes the 33rd beyond it, which would
-end kosh for every session. None of this touches a shell's input, which
-goes to the container as it comes.
+sequence's parameter separators 24 are passed on, and of a device
+control string's 15: the library's parser has room for 32 parameters
+and writes the 33rd beyond it, which would end kosh for every session,
+and its reader of device control strings types what follows the 16th
+separator into the UI as keys. None of this touches a shell's input,
+which goes to the container as it comes.
+
+**A session's end.** The UI library's reader hands the UI its events
+one at a time, and stays for good, with what it had gathered, behind a
+UI that has ended and takes none. So a session's UI is ended after its
+reader. The reader is given a read of no bytes, from which it comes
+back only when the UI has taken every event of what was read before,
+and then its end; the UI is ended when no event has come from the
+reader for 50 ms after that, since what the library had gathered
+unfinished it hands over then, and nothing tells the end of it. Every
+session's end lasts those 50 ms longer. A UI that takes nothing,
+because its client does not read, keeps its reader: that needs the
+library's change (`upstream.md` beside the plan), and the log has a
+warning that names the key.
 
 ## 6. `tui`
 

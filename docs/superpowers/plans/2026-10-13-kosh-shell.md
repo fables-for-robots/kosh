@@ -62,3 +62,69 @@ What the spec implies and a person or an attacker would meet first; each has its
 | 6 | Closing: the feature reviewed as a whole | `task-06-closing.md` | 5 |
 
 Tasks 2, 3 and 4 are built side by side, each in a worktree of its own: they own different packages and meet only at the contract.
+
+## Departures
+
+What was built differs from what this plan and its task briefs said in the
+places below. Each was decided while the plan was carried out; the ledger
+beside the task files (`2026-10-13-kosh-shell/ledger.md`) has each decision
+with its reason and what it costs if it was wrong. Where the spec itself
+was amended, the section is named.
+
+### How it was carried out
+
+| The plan said | What was done | Why |
+|---|---|---|
+| Task 5 depends on tasks 2, 3 and 4 | Task 5 was cut from a branch that held Task 3 before its review; Task 3's fixes, and later the fixes of the whole feature's review, were merged into it and its scripts run again | The three parts had never run together, and the end-to-end task is the longest step |
+| The feature is reviewed as a whole after Task 5 | The review of the whole ran on the three merged parts while Task 5 ran its tests | Task 5 adds tests and the README, no code of the feature |
+| Review Focus 3: when the session ends while a shell has the terminal, the remote process is ended | The stream is closed and nothing more is done: what ran in the container can go on (spec §7, a known issue in the README, `ended="the session ended"` in the log) | It is what the API's exec does and kubectl leaves the same; the API has no call to end the process |
+| What the review finds is fixed in one wave and reviewed once more | One wave, as three rounds side by side, one per package, by the implementers who had built them, and one re-review of all three; then a second round for `sshd` and a second re-review; then a third, which the controller amended itself, and a third re-review | The findings fell into `kube`, `sshd` and `tui` with nothing shared; the re-review found that the wave's reset sequence moved the cursor and that its bound on a paste could be got round; the tests then failed on Linux with the race detector, where a session's end left the library's reader behind, and the third round's repair still left it when keys were in hand |
+| Every fix round is reviewed again | Task 4's follow-up round (76 lines outside tests) was merged on the controller's reading of its diff | Each hunk was one of the four points asked for; the review of the whole read it again |
+
+### The contract and `kube`
+
+| The plan said | What was built | Why |
+|---|---|---|
+| The terminal's sizes reach `Exec` as a channel of sizes (spec, first version) | A function `Size` and a channel of tokens `Resized`, in `kube`, `sshd` and `tui` alike (spec §4) | It is what the probe built and measured, and needs no goroutine between the layers |
+| Nothing about which executor | The WebSocket executor alone, without kubectl's fallback to SPDY | The fallback turns the API's typed refusals into plain text |
+| "The command did not start" is the runtime's error | Decided by an error of the stream that has no type and came before any byte of output | The runtimes word it differently; only containerd's words were seen |
+| The command is logged | As quoted words, cut after 1 KiB outside the quotes with ` …` | A slice of words is printed by the log's handler without word boundaries: `sh -c "a b"` and `sh -c a b` read the same |
+| An end of `Exec` by its context is an error like another | Logged as `ended="the session ended"`, with no `error` (spec §7) | The only caller is a session's turn, whose context ends only with the session; the spec promises that line to whoever removes a key |
+| Nothing about what a stream holds | The stream runs on a context of its own; the end line and the release of the session's hold are written in a defer, and a panic under the stream is logged without its value | A race in client-go can leave four goroutines of a stream behind; they now hold nothing of the session |
+
+### `sshd`
+
+| The plan said | What was built | Why |
+|---|---|---|
+| The terminal is handed over with Bubble Tea's `Exec` | `sshd` reads the SSH channel itself: one pump, a reader for the program and one for the command, and a mark that the terminal answers to tell where one ends | The probe: the plain way loses input at every hand-over and stalls for half a second |
+| A command writes through the session | A command writes to the raw channel | The session's writer turns every line feed into CR LF and breaks a full-screen program |
+| Nothing about a turn's length | A turn lasts at least 10 ms, and a watchdog repairs a screen that does not draw after one | A race in Bubble Tea v2.0.10 after a command that returns at once leaves a screen that never draws again |
+| Nothing about the terminal's state after a shell | One fixed reset sequence is written after every turn in which a command was called, and before the session's last message; it leaves the cursor where the command left it (spec §5) | The spec promises a terminal in its normal state, and no task owned it |
+| Nothing about what a client's input can make a session hold | The program's input passes at most 256 KiB of one bracketed paste; a session whose reader was handed 64 KiB of which the terminal library made no event is ended with a message; of one control sequence's parameter separators 24 are passed on, of a device control string's 15 (spec §5) | The library gathers a paste, and a sequence that never ends, without limit, and its parser writes a 33rd parameter beyond its array, a panic that ends the process: any key could do either, in v0.1.0 too |
+| A session's program is ended with a quit | Its reader is ended first, while the program still takes what the reader has: it is given a read of no bytes, from which it comes back when the program has every event of what was read, and then its end; the program is ended when no event has come for 50 ms after that. Every session's end lasts 50 ms longer (spec §5) | A reader left behind a program that has ended holds what it had gathered, for good: found on Linux with the race detector, where the program's loop is slow |
+| A terminal that is busy refuses a command | A command waits up to 200 ms for a terminal that a screen repair holds | The user's key press would have been answered with "busy" for a repair of 10 ms |
+| A removed key's connection is closed with its last session | It is left for its client to close, and closed a second after the session's end (spec §1.6) | Closed under the client's last writes it is reset, and a `kubectl port-forward` then ends for all its connections: found end to end |
+| Nothing about a client that closes only the channel | The end's timer runs then too | A command that does not return would have kept the session of a client that keeps its connection |
+
+### `tui` and `cli`
+
+| The plan said | What was built | Why |
+|---|---|---|
+| A binding applies by resource and grant | A binding can say that it needs the session's terminal (`binding.Handover`); the keys, the hints and the help skip it when the session has none, and such a binding is given the cursor's row alone | `Applies` does not see the session's environment |
+| A function `words` | `commandWords` | Six test files have a helper `words` |
+| The text is trimmed of spaces at its ends first | It is not trimmed | Trimming took an escaped space at the end with it |
+| `tui/dialog.go` changes only as far as needed | A title, a field that cannot be changed, `enter` in a field pressing a button and a hook for cancel, each off unless a dialog asks for it | No existing dialog draws or behaves differently |
+| The pod is read for its containers | Through the session's `YAML`, decoded into a small struct of the UI's own, one request | The containers table has no annotations, and `k8s.io/api` is not imported into `tui` |
+| What the API refuses brings the dialog back (spec §1.5, first version) | It is said in the flash; the dialog comes back only for a command that did not start (spec §1.5) | Another command does not help against a refusal |
+| A paste into a dialog's field joins its lines | A paste that holds a line break or a control character is refused whole in the Command field | A paste must not smuggle a second line into a command |
+| The action keys are held from `s` until the return | The dialog gives the hold back when it opens and takes it again at the press | A session that ended with the dialog open kept the hold |
+| A refused hand-over is an error flash | The dialog comes back with the reason | The text the user typed is kept |
+| Every session is given the hand-over function | Only a full key's session is | A read-only key has no use for it |
+
+### End to end
+
+| The plan said | What was done | Why |
+|---|---|---|
+| Task 5 changes no code of kosh | Two defects that its tests found were fixed in `kube` and `sshd` by those packages' rounds, and its scripts run again: the log line of a shell cut by its session's end, and the reset of a removed key's connection | The tests were right and the product was not |
+| `scripts/test-e2e.sh` changes only if an image must be loaded beforehand | It also keeps kubectl's and helm's caches and configuration in its work directory | Both write into the home directory by default |
+| CI is green before the feature is handed over | The jobs' commands were run by hand on a Linux machine first | Publishing the branch publishes the input that crashes the terminal library's parser, which its authors have not been told of: the push waits for the user's word |
