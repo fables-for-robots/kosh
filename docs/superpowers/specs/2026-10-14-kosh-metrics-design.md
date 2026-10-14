@@ -254,20 +254,36 @@ type ClusterUsage struct {
 
 The watch holds the nodes' cache (acquired as `watchTyped` acquires it;
 the allocatable of each node is in the node object) and the nodes'
-poller, and computes, on each signal of either: for every node of the
+poller, **both only while the API serves the metrics of nodes**, acquired
+and released together, checked at open and every `MetricsPoll`: a
+session on a cluster without metrics-server holds no nodes informer for
+a header that shows nothing. *(As built; the first draft held the cache
+for the session, and the whole-branch review showed what that costs on a
+large cluster without metrics-server, and that a role without `list` on
+`nodes` then runs a failing informer for every session.)* When the nodes
+cannot be listed, the watch logs one warning naming the reason, so that
+the header's `n/a` is explained.
+
+`Current` computes, from what the two hold then: for every node of the
 cache, allocatable CPU and memory; for every node the reading covers,
 its usage; `CPU = floor(100 × Σusage / Σallocatable)`, `n/a` when the
-sum of allocatable is 0. The nodes' cache is held for the session: it is
-one informer of a small kind, and `kubectl top node` is what every admin
-runs anyway. Like the watches of §4.4, it acquires the poller when the
-API is served and releases it when not, checked on every signal and
-every `MetricsPoll`.
+sum of allocatable is 0. `Changed` receives at open, after each list of
+the poller, when the hold changes, and once when the nodes' cache first
+syncs — not when a node changes between two polls: the header's arrow is
+to show the change from one poll to the next. `Close` closes `Changed`,
+once nothing can signal it any more, so that a wait on it ends with the
+session that opened the watch; every signal and the close go through one
+lock, so that a session that has already ended when it opens the watch
+cannot make a signal race the close.
 
 ### 4.6 RBAC
 
-`get` and `list` on `pods` and `nodes` in the group `metrics.k8s.io`.
-`cluster-admin`, the chart's default, has them. The README says what a
-narrower role needs, beside what it says for `pods/exec`.
+`get` and `list` on `pods` and `nodes` in the group `metrics.k8s.io` for
+the columns, and `list` and `watch` on `nodes` (core) for the header's
+lines, which read the nodes' allocatable. `cluster-admin`, the chart's
+default, has them; the built-in `view` has the metrics but not the
+nodes. The README says what a narrower role needs, beside what it says
+for `pods/exec`.
 
 ## 5. `render`: metric columns
 

@@ -186,6 +186,22 @@
 
 ---
 
+## Departures
+
+Where what was built differs from the plan's text, and why. The ledger
+(`2026-10-14-kosh-metrics/ledger.md`) has the rulings.
+
+| Plan | Built | Why |
+|---|---|---|
+| Task 2: the metrics lists served by a `PrependReactor` on the dynamic fake | `newDynamicFake`, client-go's `NewSimpleDynamicClient` with the two metrics list kinds registered | the fake panics on a list of an unknown kind before any reactor runs |
+| Task 3: `mergeChanged(a, b)` | a `changes` channel with `notify` and `forward` goroutines run by `Cluster.goUntil`, counted in `c.wg` | the poller comes and goes during a watch's life |
+| Task 3, spec §4.5: the nodes' cache held for the session | held only while the metrics of nodes are served, with the poller | the whole-branch review: a large cluster without metrics-server held every Node for nothing, and a role without `list` on `nodes` ran a failing informer per session |
+| Task 3: the usage watch recomputes on either signal | recomputes on each `Current`; signals on polls, at open, on a served change, and once at the cache's sync, not on a node's change | a node's status update between polls cleared the header's arrow |
+| Task 4: the watch closed where the root closes its views | the root has no end hook; the session's end closes the watch (`AfterFunc`), the watch closes `Changed`, the root's wait ends on that | nothing in Bubble Tea tells the model that the session ended |
+| Task 4: `shift-c`/`shift-m` were in the design conversation | not added | k9s at the reference commit binds none; Sort Column covers it |
+| Task 5: the slow test re-applies the manifest | it saves and re-creates only the APIService, and asserts the Deployment untouched and rolled out | re-applying the stock manifest dropped `--kubelet-insecure-tls`; the rollout stalled and the old pod served, so the test passed by accident |
+| Task 5: no test filter in the script | `KOSH_E2E_RUN=<regexp>`; `KOSH_E2E_SLOW=1` raises the deadline to 40 minutes | the slow test alone, and the two together, do not fit in 20 minutes |
+
 ## Self-review
 
 - Spec coverage: §1 (Tasks 1, 3, 4), §2 (Task 1 `n/a`), §3 (Task 2 `metricsServed`, Task 3 per-`Table` check), §4 (Tasks 2, 3), §5 (Task 1), §6 (Task 4), §7 (Task 5), §8 (each task's tests; e2e in Task 5), §4.6 RBAC (Task 5 docs). §1.5 sorting needs no code: `Numeric` columns sort by `Order` today.
