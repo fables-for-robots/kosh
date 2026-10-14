@@ -95,8 +95,8 @@ func (pod) Row(obj runtime.Object, now time.Time) (Row, error) {
 }
 
 // Meter sets the pod's metric cells from the usage of its containers,
-// summed: only the containers and init containers its spec names, of
-// which metrics-server reports those that run. The percentages are of
+// summed: only the init, main and ephemeral containers its spec names,
+// of which metrics-server reports those that run. The percentages are of
 // the requests and limits the CPU/RL and MEM/RL cells show. A usage
 // that names none of the pod's containers leaves the cells NAValue, as
 // a pod the reading did not cover.
@@ -107,17 +107,22 @@ func (pod) Meter(row *Row, obj runtime.Object, usage map[string]Usage) {
 	}
 	var sum Usage
 	found := false
-	add := func(cs []corev1.Container) {
-		for i := range cs {
-			if u, ok := usage[cs[i].Name]; ok {
-				sum.CPU += u.CPU
-				sum.Mem += u.Mem
-				found = true
-			}
+	add := func(name string) {
+		if u, ok := usage[name]; ok {
+			sum.CPU += u.CPU
+			sum.Mem += u.Mem
+			found = true
 		}
 	}
-	add(po.Spec.InitContainers)
-	add(po.Spec.Containers)
+	for i := range po.Spec.InitContainers {
+		add(po.Spec.InitContainers[i].Name)
+	}
+	for i := range po.Spec.Containers {
+		add(po.Spec.Containers[i].Name)
+	}
+	for i := range po.Spec.EphemeralContainers {
+		add(po.Spec.EphemeralContainers[i].Name)
+	}
 	if !found {
 		return
 	}

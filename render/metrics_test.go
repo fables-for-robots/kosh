@@ -279,6 +279,20 @@ func TestPodMeter(t *testing.T) {
 		cells, _ := podMetered(t, po, usage)
 		wantCells(t, cells, map[string]string{"CPU": "210", "MEM": "410"})
 	})
+	t.Run("an ephemeral container", func(t *testing.T) {
+		po := metricTestPod()
+		po.Spec.Containers = po.Spec.Containers[:1]
+		po.Spec.EphemeralContainers = []corev1.EphemeralContainer{
+			{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug"}},
+		}
+		usage := map[string]Usage{
+			"a":     {CPU: 50, Mem: 100 * metricTestMiB},
+			"debug": {CPU: 7, Mem: 3 * metricTestMiB},
+		}
+		cells, order := podMetered(t, po, usage)
+		wantCells(t, cells, map[string]string{"CPU": "57", "MEM": "103"})
+		wantOrders(t, order, map[string]float64{"CPU": 57})
+	})
 	t.Run("no requests or limits", func(t *testing.T) {
 		po := metricTestPod()
 		for i := range po.Spec.Containers {

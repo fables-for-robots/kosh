@@ -20,14 +20,17 @@ type Metered interface {
 	// Meter fills the metric cells of row, the row of obj, from usage,
 	// the reading's usage of obj's containers (for a pod: keyed by the
 	// container's name; for a node: the one entry ""). A nil usage
-	// leaves the cells NAValue.
+	// leaves the cells NAValue. row is whole, as Row made it and before
+	// StripMetrics: the cells are found at their indexes in Columns.
 	Meter(row *Row, obj runtime.Object, usage map[string]Usage)
 }
 
 // MeterContainers fills the metric cells of rows, the rows ContainerRows
 // made of pod, from usage, keyed by the container's name. Each row is
 // metered against its own container's requests and limits; a row whose
-// container is not in usage keeps NAValue.
+// container is not in usage keeps NAValue. The rows are whole, as
+// ContainerRows made them and before StripMetrics: the cells are found
+// at their indexes in ContainerColumns.
 func MeterContainers(rows []Row, pod *corev1.Pod, usage map[string]Usage) {
 	if pod == nil || len(usage) == 0 {
 		return
@@ -169,12 +172,11 @@ func metricSetMi(row *Row, i int, bytes int64) {
 // metricSetPerc sets a cell of used over of in percent, sorted by the
 // percentage, or NAValue and 0 when of is 0.
 func metricSetPerc(row *Row, i int, used, of int64) {
-	if of == 0 {
-		metricSet(row, i, NAValue, 0)
-		return
+	var order float64
+	if of != 0 {
+		order = float64(metricPercent(used, of))
 	}
-	p := metricPercent(used, of)
-	metricSet(row, i, strconv.FormatInt(p, 10), float64(p))
+	metricSet(row, i, metricPerc(used, of), order)
 }
 
 // metricMc prints millicores as k9s does: a whole number without a
