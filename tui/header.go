@@ -107,9 +107,9 @@ func (r *root) header() []string {
 }
 
 // usageCell draws a percentage of the header's usage lines: "12%", with
-// ↑ when it rose since the reading before and ↓ when it fell, and
-// nothing more when it did not or there was no reading before; n/a
-// while there is no reading.
+// ↑ when it rose since the last ok reading before and ↓ when it fell,
+// and nothing more when it did not or there was no ok reading before;
+// n/a while there is no reading.
 func usageCell(now int, ok bool, before int, beforeOK bool) string {
 	if !ok {
 		return styleInfoValue.Render(render.NAValue)

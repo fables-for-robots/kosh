@@ -238,6 +238,17 @@ func TestHeaderShowsUsageWhenServed(t *testing.T) {
 		t.Errorf("the same reading again: the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     14%", "MEM:     40%")
 	}
 
+	// A reading that is not ok says n/a, and the next ok one is compared
+	// with the last ok one before it, across the gap.
+	sess.SetUsage(kube.ClusterUsage{Served: true}, false)
+	hs.awaitFrame("CPU:     n/a")
+	sess.SetUsage(kube.ClusterUsage{CPU: 20, Mem: 30, Served: true}, true)
+	hs.awaitFrame("CPU:     20%")
+	_, plain = headerAt(hs, 80)
+	if cpu, mem := usageLines(plain); cpu != "CPU:     20% ↑" || mem != "MEM:     30% ↓" {
+		t.Errorf("14 and 40, n/a, then 20 and 30: the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     20% ↑", "MEM:     30% ↓")
+	}
+
 	// The lines do not move the columns right of the left block, and
 	// every line is as wide as the window, at every width.
 	for w := 40; w <= 200; w++ {
@@ -249,7 +260,8 @@ func TestHeaderShowsUsageWhenServed(t *testing.T) {
 		}
 	}
 	_, plain = headerAt(hs, 80)
-	if at, want := strings.Index(plain[3], "<shift-o>"), strings.Index(plain[0], "<shift-n>"); at != want {
+	cell := func(l, key string) int { return ansi.StringWidth(l[:strings.Index(l, key)]) }
+	if at, want := cell(plain[3], "<shift-o>"), cell(plain[0], "<shift-n>"); at != want {
 		t.Errorf("the hints of line 3 start at %d, those of line 0 at %d:\n%s", at, want, strings.Join(plain, "\n"))
 	}
 }

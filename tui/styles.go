@@ -75,9 +75,9 @@ var (
 	styleRowChanged = lipgloss.NewStyle().Foreground(colorGreenYellow)
 	styleSection    = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 	// styleUp and styleDown are the header's arrows of a usage that
-	// rose or fell, red and green as k9s draws them.
-	styleUp   = lipgloss.NewStyle().Foreground(colorRed)
-	styleDown = lipgloss.NewStyle().Foreground(colorGreen)
+	// rose or fell, red and green and bold as k9s draws them.
+	styleUp   = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+	styleDown = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 )
 
 // healthStyles colour a row by its health, as k9s's status colours do.

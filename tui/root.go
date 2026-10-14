@@ -42,8 +42,9 @@ type root struct {
 	// start; the body shows it while the stack is empty.
 	startErr error
 	// usageWatch is the cluster's use of its nodes, for the header's CPU
-	// and MEM lines. usage is its last reading and prevUsage the one
-	// before, which the arrows compare with.
+	// and MEM lines. usage is its last reading, and prevUsage the last ok
+	// one before it, which the arrows compare with: a reading that is
+	// not ok says n/a and leaves prevUsage as it was.
 	usageWatch       kube.UsageWatch
 	usage, prevUsage usageReading
 }
@@ -66,8 +67,9 @@ type usageMsg struct {
 // usageWaitMax bounds a wait on the usage watch. Nothing tells the root
 // that the session ended, and the watch, which the session's end
 // closes, does not end a wait on its Changed: the wait ends by itself
-// instead, so that it outlives the session by no more than this.
-const usageWaitMax = time.Minute
+// instead, so that it outlives the session by no more than this. A wait
+// takes it when it is made; tests may shorten it.
+var usageWaitMax = time.Minute
 
 func newRoot(e env, version string) *root {
 	return &root{
@@ -88,9 +90,9 @@ func (r *root) Init() tea.Cmd {
 
 // waitUsage waits for the usage watch to signal, and reads it then.
 func (r *root) waitUsage() tea.Cmd {
-	w := r.usageWatch
+	w, most := r.usageWatch, usageWaitMax
 	return waitCmd(func() tea.Msg {
-		t := time.NewTimer(usageWaitMax)
+		t := time.NewTimer(most)
 		defer t.Stop()
 		select {
 		case <-w.Changed():
@@ -156,7 +158,10 @@ func (r *root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r, nil
 	case usageMsg:
 		if msg.read {
-			r.prevUsage, r.usage = r.usage, msg.usageReading
+			if r.usage.ok {
+				r.prevUsage = r.usage
+			}
+			r.usage = msg.usageReading
 		}
 		return r, r.waitUsage()
 	}

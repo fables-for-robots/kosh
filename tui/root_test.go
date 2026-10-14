@@ -342,6 +342,9 @@ func TestPromptOverAFullscreenView(t *testing.T) {
 // A wait on the usage watch that ends without a signal is not a
 // reading: the arrows stay, and the root waits again.
 func TestAUsageWaitWithoutASignalKeepsTheReadings(t *testing.T) {
+	was := usageWaitMax
+	usageWaitMax = 20 * time.Millisecond
+	t.Cleanup(func() { usageWaitMax = was })
 	sess := newSession()
 	hs := newHarness(t, sess, 100, 30)
 	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
@@ -349,7 +352,10 @@ func TestAUsageWaitWithoutASignalKeepsTheReadings(t *testing.T) {
 	sess.SetUsage(kube.ClusterUsage{CPU: 14, Mem: 40, Served: true}, true)
 	hs.awaitFrame("CPU:     14% ↑")
 
-	hs.send(usageMsg{})
+	// Waits that end without a signal, one after another: the messages
+	// keep coming only while each wait is made again.
+	start := time.Now()
+	hs.await("waits to end without a signal for 200 ms", func() bool { return time.Since(start) > 200*time.Millisecond })
 	hs.wantFrame("CPU:     14% ↑", "MEM:     40% ↓")
 
 	sess.SetUsage(kube.ClusterUsage{CPU: 9, Mem: 40, Served: true}, true)
