@@ -340,6 +340,11 @@ func TestUsageWatchSignalsOnPollsNotOnNodes(t *testing.T) {
 		_, ok := u.Current()
 		return ok
 	})
+	// The watch signals once when the nodes' cache first syncs, from a
+	// goroutine that may run a moment after Current is first ok: two
+	// polls' worth of time lets it land, so that the loop below meets
+	// no signal that is neither a poll's nor the node's change.
+	time.Sleep(2 * e.c.opts.MetricsPoll)
 	nodes := e.dyn.Resource(render.Nodes)
 	for attempt := 0; ; attempt++ {
 		if attempt == 5 {
