@@ -4,8 +4,10 @@
 // A renderer is a pure function of the object and the time. It knows
 // nothing of the terminal and nothing of the API server. The columns of
 // a kind, their order and which of them are shown only wide follow k9s
-// (internal/render at commit 8f29fba), less the columns that need
-// metrics, GPUs, a vulnerability scan or a port-forward.
+// (internal/render at commit 8f29fba), less the columns that need GPUs,
+// a vulnerability scan or a port-forward. The columns that need
+// metrics-server are Metric: a Metered renderer fills them from a
+// reading, and StripMetrics takes them away where there is none.
 package render
 
 import (
@@ -57,6 +59,9 @@ type Column struct {
 	// Numeric: the rows are sorted in this column by Row.Order and not
 	// by the text of the cell.
 	Numeric bool
+	// Metric: the cells come from metrics-server, through Meter. The
+	// column is in the table only while the metrics API is served.
+	Metric bool
 }
 
 // Row is one object in a table.

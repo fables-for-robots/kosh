@@ -9,7 +9,7 @@ import (
 )
 
 func TestContainerColumns(t *testing.T) {
-	wantColumnList(t, ContainerColumns(), "IDX", "NAME", "IMAGE", "READY", "STATE", "RESTARTS", "PROBES(L:R:S)", "CPU/RL", "MEM/RL", "PORTS", "VALID*", "AGE")
+	wantColumnList(t, ContainerColumns(), "IDX", "NAME", "IMAGE", "READY", "STATE", "RESTARTS", "PROBES(L:R:S)", "CPU", "CPU/RL", "%CPU/R", "%CPU/L", "MEM", "MEM/RL", "%MEM/R", "%MEM/L", "PORTS", "VALID*", "AGE")
 }
 
 // containerTestCells returns the cells of row by the name of their
@@ -109,7 +109,8 @@ func TestContainerRows(t *testing.T) {
 		{
 			cells: map[string]string{
 				"IDX": "M1", "NAME": "app", "IMAGE": "nginx:1.27", "READY": "true", "STATE": "Running",
-				"RESTARTS": "2", "PROBES(L:R:S)": "on:on:off", "CPU/RL": "100:500", "MEM/RL": "128:256",
+				"RESTARTS": "2", "PROBES(L:R:S)": "on:on:off", "CPU": NAValue, "CPU/RL": "100:500", "%CPU/R": NAValue,
+				"%CPU/L": NAValue, "MEM": NAValue, "MEM/RL": "128:256", "%MEM/R": NAValue, "%MEM/L": NAValue,
 				"PORTS": "http:8080,9090╱UDP", "VALID": "", "AGE": "3h",
 			},
 			health: OK,
