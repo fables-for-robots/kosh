@@ -2581,3 +2581,61 @@ func TestInputOfATerminalIsNotAFlood(t *testing.T) {
 		t.Errorf("the session was ended for the input of a terminal")
 	}
 }
+
+// TestControlSequenceOfFortyParameters sends complete control sequences
+// with more parameters than the library's parser has room for, each
+// followed by an ordinary key: the library does not panic (it would be
+// the end of the test's process, as it would be of kosh), the session
+// goes on, and the key arrives at the model as that key, once. So the
+// guard, which drops the separators beyond maxSeparators, neither
+// swallows what follows a sequence nor loses its place in the input.
+func TestControlSequenceOfFortyParameters(t *testing.T) {
+	params := func(sep string) string { return strings.Repeat("1"+sep, 39) + "1" }
+	cases := []struct {
+		name string
+		seq  string
+		// split sends the sequence one write to each separator.
+		split bool
+	}{
+		{name: "a control sequence", seq: "\x1b[" + params(";") + "m"},
+		{name: "split at each separator", seq: "\x1b[" + params(";") + "m", split: true},
+		{name: "with colons", seq: "\x1b[" + params(":") + "m"},
+		{name: "with colons, split at each", seq: "\x1b[" + params(":") + "m", split: true},
+		{name: "with the 8-bit introducer", seq: "\x9b" + params(";") + "m"},
+		{name: "with the 8-bit introducer, split at each separator", seq: "\x9b" + params(";") + "m", split: true},
+		{name: "a device control string", seq: "\x1bP" + params(";") + "pdata\x1b\\"},
+		{name: "a device control string, split at each separator", seq: "\x1bP" + params(";") + "pdata\x1b\\", split: true},
+		{name: "a device control string with the 8-bit introducer", seq: "\x90" + params(";") + "pdata\x1b\\"},
+	}
+	hv := newHandover(nil)
+	h, tm := startHandover(t, hv)
+	for i, c := range cases {
+		key := string(rune('a' + i))
+		if c.split {
+			rest := c.seq
+			for len(rest) > 0 {
+				n := strings.IndexAny(rest, ";:") + 1
+				if n == 0 {
+					n = len(rest)
+				}
+				tm.press(rest[:n])
+				rest = rest[n:]
+			}
+			tm.press(key)
+		} else {
+			tm.press(c.seq + key)
+		}
+		hv.wait(t, c.name+": the model has the key after the sequence", func() bool {
+			return len(hv.keys) > 0 && hv.keys[len(hv.keys)-1] == key
+		})
+		hv.mu.Lock()
+		keys := strings.Join(hv.keys, "")
+		hv.mu.Unlock()
+		if want := "abcdefghi"[:i+1]; keys != want {
+			t.Fatalf("%s: the model has the keys %q, want %q: each key after its sequence, once, and nothing of the sequence", c.name, keys, want)
+		}
+	}
+	if tm.ended() || h.floodLines() != 0 {
+		t.Error("the session was ended for control sequences of forty parameters")
+	}
+}

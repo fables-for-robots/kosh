@@ -137,10 +137,16 @@ const minTurn = 10 * time.Millisecond
 //     cursor for both screens put it where it was on the alternate one.)
 //   - Setting the margins homes the cursor: so it is done between a
 //     save and a restore.
-//   - Resetting origin mode homes the cursor too, and the restore before
-//     would bring the mode back as it brings back everything saved with
-//     the cursor: so origin mode is left as it is. With the margins at
-//     the screen's edges it changes nothing.
+//   - Origin mode is left as the command left it: no sequence clears
+//     it and keeps the cursor's place. Resetting it homes the cursor,
+//     and every restore of the cursor, the one here and the one that
+//     leaving the alternate screen does, brings it back as it was
+//     saved. With the margins at the screen's edges it changes nothing.
+//     It costs something only when rows are addressed while a scroll
+//     region is set, as the library's renderer does when it scrolls a
+//     part of the screen, and only after a command that set origin mode
+//     and did not clear it: a full-screen program that was killed, of
+//     the few that set it at all.
 //
 // What a restore of the cursor brings back with it, attributes, the
 // character set and autowrap, is undone after the last restore.
@@ -673,8 +679,13 @@ func (s *pasteScanner) data(b byte) []byte {
 }
 
 // maxSeparators is how many separators of parameters, ";" and ":", one
-// control sequence may have on its way to the program.
-const maxSeparators = 24
+// control sequence may have on its way to the program, and
+// maxStringSeparators how many the beginning of a device control string
+// may have.
+const (
+	maxSeparators       = 24
+	maxStringSeparators = 15
+)
 
 // paramGuard is what the program's input passes after the pasteScanner.
 // The library's parser of control sequences has room for 32 parameters
@@ -683,6 +694,11 @@ const maxSeparators = 24
 // goroutine of the library's, which is the end of kosh for everybody.
 // So of the separators of one control sequence the guard hands on
 // maxSeparators and drops the rest; no terminal sends that many.
+//
+// Of a device control string it hands on maxStringSeparators: the
+// library's reader of those has room for 16 parameters, and what comes
+// after the 16th separator it gives the program as keys, one for each
+// byte of the rest of the string.
 //
 // The guard does not parse: it knows when the library may be counting
 // parameters, and errs on the side of thinking it is. The library begins
@@ -693,8 +709,9 @@ type paramGuard struct {
 	// state is where the guard is: guardIdle, guardEscape after an
 	// escape and its intermediate bytes, or guardParams.
 	state uint8
-	// seps is how many separators the sequence has had.
-	seps int
+	// seps is how many separators the sequence has had, and max how
+	// many it may have.
+	seps, max int
 }
 
 const (
@@ -711,12 +728,16 @@ func (g *paramGuard) filter(b []byte) int {
 		switch {
 		case c == '\x1b':
 			g.state = guardEscape
-		case c == 0x9b || c == 0x90:
-			g.state, g.seps = guardParams, 0
+		case c == 0x9b:
+			g.state, g.seps, g.max = guardParams, 0, maxSeparators
+		case c == 0x90:
+			g.state, g.seps, g.max = guardParams, 0, maxStringSeparators
 		case g.state == guardEscape:
 			switch {
-			case c == '[' || c == 'P':
-				g.state, g.seps = guardParams, 0
+			case c == '[':
+				g.state, g.seps, g.max = guardParams, 0, maxSeparators
+			case c == 'P':
+				g.state, g.seps, g.max = guardParams, 0, maxStringSeparators
 			case c >= 0x20 && c <= 0x2f:
 			default:
 				g.state = guardIdle
@@ -724,7 +745,7 @@ func (g *paramGuard) filter(b []byte) int {
 		case g.state == guardParams:
 			switch {
 			case c == ';' || c == ':':
-				if g.seps >= maxSeparators {
+				if g.seps >= g.max {
 					continue
 				}
 				g.seps++
