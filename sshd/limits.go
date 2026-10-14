@@ -71,7 +71,9 @@ type conn struct {
 	mu       sync.Mutex
 	authed   bool
 	closed   bool
-	keyGone  bool        // its key left the key list: closed when it has no session
+	keyGone  bool        // its key left the key list: no new session, and closed when it has none
+	linger   *time.Timer // closes the connection of a key that is gone, after its last session
+	ended    time.Time   // when its last session ended, or zero
 	sessions int         // sessions whose handler runs
 	channels int         // session channels open
 	idle     *time.Timer // closes the connection when it has no session
@@ -159,23 +161,48 @@ func (s *Server) countKey(c *conn) string {
 }
 
 // keyRemoved is called when c's key has left the key list, after its
-// sessions were told to end: c is closed now when it has no session, or
-// else when its last session has ended.
+// sessions were told to end. From now on c gets no session channel. When
+// it has no session it is closed now: its client is idle. Else it is
+// closed after its last session has ended, and so is one whose last
+// session has only just ended, perhaps of this very change: see
+// lingerForKey.
 func (c *conn) keyRemoved() {
 	c.mu.Lock()
 	c.keyGone = true
-	now := c.sessions == 0 && !c.closed
+	now := false
+	switch {
+	case c.sessions != 0 || c.closed:
+	case !c.ended.IsZero() && time.Since(c.ended) < c.srv.keyLinger:
+		if c.linger == nil {
+			c.lingerForKey()
+		}
+	default:
+		now = true
+	}
 	c.mu.Unlock()
 	if now {
-		c.closeForKey()
+		_ = c.Close()
 	}
 }
 
-// closeForKey closes c, whose key has left the list, and logs it.
-func (c *conn) closeForKey() {
-	c.srv.log.Info("connection closed", "transport", c.transport, "remote", c.remote,
-		"fingerprint", fingerprint(c.key), "reason", reasonKeyRemoved)
-	_ = c.Close()
+// lingerForKey is called when the last session of a connection whose
+// key is gone has ended. The session has told its client why, sent its
+// exit status and closed its channel; the client now answers: what its
+// terminal replies to the session's last output, its own close of the
+// channel, its disconnect. A connection that is closed under those
+// writes answers the first with a reset, and the next fails: an ssh
+// client does not mind, but what carries the connection may, and a
+// kubectl port-forward ends for all its connections on such an error.
+//
+// So the client is left to close the connection, which is the ordinary
+// end of an SSH connection and is what clients do when their session has
+// ended; one that does not is closed after srv.keyLinger. In that time
+// the connection can do nothing: openChannel refuses it a channel, and
+// the server has no handler for any other request. c.mu is held, and
+// c.ended is when the last session ended.
+func (c *conn) lingerForKey() {
+	c.disarmIdleLocked()
+	c.linger = time.AfterFunc(c.srv.keyLinger-time.Since(c.ended), func() { _ = c.Close() })
 }
 
 // uncountKey takes c from the connections of its key, if it is counted.
@@ -218,14 +245,19 @@ func (c *conn) sessionStarted() {
 
 func (c *conn) sessionEnded() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.sessions--
-	gone := c.sessions == 0 && c.keyGone && !c.closed
-	if c.sessions == 0 && c.authed && !c.closed && !gone {
-		c.armIdleLocked()
+	if c.sessions == 0 {
+		c.ended = time.Now()
 	}
-	c.mu.Unlock()
-	if gone {
-		c.closeForKey()
+	switch {
+	case c.sessions != 0 || c.closed:
+	case c.keyGone:
+		if c.linger == nil {
+			c.lingerForKey()
+		}
+	case c.authed:
+		c.armIdleLocked()
 	}
 }
 
@@ -265,14 +297,26 @@ func (c *conn) Read(p []byte) (int, error) {
 }
 
 // Close closes the connection, and gives its place in the handshake back
-// if it still holds one.
+// if it still holds one. The first Close of a connection whose key has
+// left the list says so in the log, whoever closes it: the server at
+// once or after the linger, the client, the end of a session that did
+// not end, a shutdown.
 func (c *conn) Close() error {
 	err := c.Conn.Close()
 	c.leaveHandshake()
 	c.mu.Lock()
+	forKey := c.keyGone && !c.closed
 	c.closed = true
 	c.disarmIdleLocked()
+	if c.linger != nil {
+		c.linger.Stop()
+		c.linger = nil
+	}
 	c.mu.Unlock()
+	if forKey {
+		c.srv.log.Info("connection closed", "transport", c.transport, "remote", c.remote,
+			"fingerprint", fingerprint(c.key), "reason", reasonKeyRemoved)
+	}
 	// After closed is set: countKey counts no closed connection.
 	c.srv.uncountKey(c)
 	return err

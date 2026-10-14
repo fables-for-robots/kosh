@@ -60,12 +60,18 @@ type Session struct {
 	//
 	// run must return when its context is done, which it is when the
 	// session ends: the client gone, the channel closed, the key removed
-	// or changed, kosh shutting down. done is told ErrTerminalBusy, and
-	// run is not called, when a command has the terminal already; it is
-	// told ErrSessionEnded when the session ended before run began.
+	// or changed, kosh shutting down. A run that waits then for a write
+	// to Terminal.Out that the client does not take is released with
+	// the connection: see there. done is told ErrTerminalBusy, and
+	// run is not called, when a command has the terminal already and
+	// still has it 200 ms later; it is told ErrSessionEnded when the
+	// session ended before run began.
 	//
-	// The program has the terminal back no sooner than 10 ms after run
-	// was called, however soon run returns. A panic in run ends the
+	// When run has returned the terminal is reset to its normal state,
+	// whatever run left it in: screen, colours, character set, margins,
+	// the modes of keys, mouse and paste. The program has the terminal
+	// back no sooner than 10 ms after run was called, however soon run
+	// returns. A panic in run ends the
 	// session as a crash of its program does: the client is told
 	// MsgCrashed, and done is not called.
 	Exec func(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd
@@ -85,13 +91,15 @@ type Terminal struct {
 	// with io.ErrClosedPipe.
 	//
 	// A write that waits because the client is not reading cannot be
-	// ended from here: it returns when the client reads again or closes
-	// the channel, or when the connection is closed, which at the
-	// session's end is after the end's timeout at the latest, and it
-	// fails then with the channel's error. So run must not wait for a
-	// write before it returns on its context. The turn itself waits for
-	// such a write when run has returned, so that nothing of the
-	// command's is written after it.
+	// ended from here: it is released when the client reads again or
+	// closes the channel, or when the connection is closed, and fails
+	// then with the channel's error. At the session's end the connection
+	// is closed after the end's timeout at the latest: a command that
+	// waits for such a write before it returns, and a turn that waits
+	// for one after its command has returned (it does, so that nothing
+	// of the command's is written after it), are cut off with the
+	// connection then, the client is not told why the session ended,
+	// and the log says that the write was what was waited for.
 	Out io.Writer
 	// Size returns the window's size now, in cells.
 	Size func() (width, height int)
@@ -163,9 +171,16 @@ type Server struct {
 	// its program and say why. Then its connection is closed: a client
 	// that does not read cannot keep a session kosh has ended.
 	endTimeout time.Duration
+	// keyLinger is how long the connection of a key that has left the
+	// list stays open after its last session has ended, for its client
+	// to close it: see conn.lingerForKey.
+	keyLinger time.Duration
 	// minTurn is how long a command's turn with a session's terminal
 	// lasts at least: minTurn, but for a test.
 	minTurn time.Duration
+	// repairTurn is how long the turn lasts that repairs a session's
+	// screen: minTurn, but for a test.
+	repairTurn time.Duration
 
 	handshakes atomic.Int64 // connections in the handshake, over every listener
 
@@ -213,7 +228,9 @@ func New(cfg Config) (*Server, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		endTimeout: 2 * time.Second,
+		keyLinger:  time.Second,
 		minTurn:    minTurn,
+		repairTurn: minTurn,
 		listeners:  map[net.Listener]string{},
 		conns:      map[*conn]struct{}{},
 		sessions:   map[*session]struct{}{},

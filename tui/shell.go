@@ -99,11 +99,15 @@ func shellOpen(e env, q kube.Query, refs []kube.ObjectRef) tea.Cmd {
 			release()
 			return flashMsg{text: fmt.Sprintf("container %s of pod %s/%s is not running", container, pod.Namespace, pod.Name)}, nil
 		}
-		s := &shell{e: e, pod: pod, names: names, at: at, release: release}
+		s := &shell{e: e, pod: pod, names: names, at: at}
 		if container != "" {
 			s.names, s.at, s.fixed = []string{container}, 0, true
 		}
-		return openDialogMsg{s.dialog(shellDefaultCommand, "")}, nil
+		d := s.dialog(shellDefaultCommand, "")
+		// The keys are given back when the dialog opens, which has them
+		// itself; Shell takes them again.
+		d.onOpen = release
+		return openDialogMsg{d}, nil
 	})
 }
 
@@ -183,13 +187,12 @@ type shell struct {
 	names []string
 	at    int
 	fixed bool
-	// release gives the session's keys of actions back; it does so once.
-	release func()
 }
 
 // dialog returns the dialog with command in the Command field and why
-// under the fields. It holds the keys of actions until it closes with
-// nothing done, or Shell hands them on with the terminal.
+// under the fields. It holds none of the session's keys of actions: it
+// has every key while it is open. Shell takes them, for the hand-over;
+// when something else has them then, it says so and the dialog closes.
 func (s *shell) dialog(command, why string) *formDialog {
 	var container *formField
 	if s.fixed || len(s.names) == 1 {
@@ -215,12 +218,17 @@ func (s *shell) dialog(command, why string) *formDialog {
 			if container.kind == formIsChoice {
 				s.at = container.at
 			}
-			return s.handover(text, words), ""
+			sess := s.e.sess
+			if !actionBegin(sess) {
+				return flash(actionTextBusy), ""
+			}
+			var once sync.Once
+			release := func() { once.Do(func() { actionEnd(sess) }) }
+			return s.handover(text, words, release), ""
 		},
 	})
 	d.title = "Shell"
 	d.why = why
-	d.onCancel = s.release
 	d.setFocus(1)
 	return d
 }
@@ -229,8 +237,9 @@ func (s *shell) dialog(command, why string) *formDialog {
 // function that says where the shell is and runs words in the container
 // chosen, until it ends; and what comes of it when the terminal is the
 // UI's again. text is the Command field's, for the dialog when the
-// command did not start.
-func (s *shell) handover(text string, words []string) tea.Cmd {
+// command did not start. release gives back the keys of actions, which
+// are held until then; it does so once.
+func (s *shell) handover(text string, words []string, release func()) tea.Cmd {
 	sess, pod, container, at := s.e.sess, s.pod, s.names[s.at], s.at
 	var (
 		mu     sync.Mutex
@@ -263,7 +272,7 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 			// The session is ending: done's message may never be taken
 			// by a program that ends with it, so the keys are given back
 			// here. done gives them back too, which then does nothing.
-			s.release()
+			release()
 		}
 		return err
 	}
@@ -274,13 +283,19 @@ func (s *shell) handover(text string, words []string) tea.Cmd {
 		mu.Lock()
 		r, started, over := result, ran, ended
 		mu.Unlock()
-		if started && !over && errors.Is(err, kube.ErrExecNotStarted) {
-			// The dialog again, which holds the keys from here on.
+		release()
+		again := func() tea.Msg {
+			// The dialog again, as it was, with the reason.
 			s.at = at
 			return tea.BatchMsg{openDialog(s.dialog(text, errorText(err.Error()))), refresh()}
 		}
-		s.release()
 		switch {
+		case !started && err != nil:
+			// The terminal could not be handed over: enter once more is
+			// the way in.
+			return again()
+		case !over && errors.Is(err, kube.ErrExecNotStarted):
+			return again()
 		case err != nil:
 			return tea.BatchMsg{flashErr(err), refresh()}
 		case r.Status != 0:

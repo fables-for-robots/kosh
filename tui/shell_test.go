@@ -570,8 +570,8 @@ func TestShellBadCommandStays(t *testing.T) {
 	if len(sess.Called("Exec")) != 0 || term.runs != 0 {
 		t.Error("something was run")
 	}
-	if !actionBusy(sess) {
-		t.Error("the action keys are free while the dialog is open")
+	if actionBusy(sess) {
+		t.Error("the action keys are held while the dialog is open")
 	}
 }
 
@@ -707,11 +707,9 @@ func TestShellDidNotStart(t *testing.T) {
 	if _, batch := msg.(tea.BatchMsg); batch || seq.Kind() != reflect.Slice || seq.Len() != 2 {
 		t.Fatalf("Shell does not close and then hand over in a sequence: %T", msg)
 	}
-	// From the press on, the hand-over holds the keys: the dialog, were
-	// it dropped before its close was taken, does not give them back.
-	pressed.Drop()
+	// The press took the keys: the hand-over holds them from here.
 	if !actionBusy(sess) {
-		t.Fatal("a dialog dropped after Shell was pressed gave the keys back")
+		t.Fatal("Shell did not take the keys")
 	}
 	if _, ok := seq.Index(0).Interface().(tea.Cmd)().(closeDialogMsg); !ok {
 		t.Fatal("what Shell does first is not to close the dialog")
@@ -733,8 +731,8 @@ func TestShellDidNotStart(t *testing.T) {
 	if dialogFocused(hs) != "Command" {
 		t.Errorf("the focus is on %q", dialogFocused(hs))
 	}
-	if !actionBusy(sess) {
-		t.Error("the action keys are free while the dialog is open again")
+	if actionBusy(sess) {
+		t.Error("the action keys are held while the dialog is open again")
 	}
 	// Edited, and enter: Exec again with the new words.
 	delete(sess.Errs, "Exec")
@@ -781,17 +779,72 @@ func TestShellRefusedByTheAPI(t *testing.T) {
 // done is told an error, run is not called.
 func TestShellHandoverRefused(t *testing.T) {
 	sess, term, hs := shellSetup(t, shellPodYAML("", running("app"), nil, nil))
-	term.refuse = errors.New("the terminal is busy")
-	hs.press("s", "enter")
+	term.refuse = errors.New("the terminal is \x1b[2Jbusy")
+	hs.press("s", "space", "enter")
+	// The dialog again, with the command as it was and the reason: enter
+	// once more is the way in.
+	d := shellDialog(hs)
 	hs.wantFrame("the terminal is busy")
-	if !strings.Contains(hs.drawnLine("the terminal is busy"), sgr(styleError)) {
-		t.Error("the refusal is not an error flash")
+	if strings.Contains(hs.drawn(), "\x1b[2J") {
+		t.Error("the reason is not cleaned")
+	}
+	if want := shellDefaultCommand + " "; d.field("Command").value() != want {
+		t.Errorf("the command is %q", d.field("Command").value())
+	}
+	if dialogFocused(hs) != "Command" {
+		t.Errorf("the focus is on %q", dialogFocused(hs))
 	}
 	if len(sess.Called("Exec")) != 0 || term.out.Len() != 0 {
 		t.Error("something ran")
 	}
+	if actionBusy(sess) {
+		t.Error("the keys are held")
+	}
+	term.refuse = nil
+	hs.press("enter")
+	if ex := shellExecs(sess); len(ex) != 1 || !slices.Equal(ex[0].opts.Command, shellDefaultWords) {
+		t.Errorf("Exec was called so: %+v", ex)
+	}
 	if hs.root().dlg != nil || actionBusy(sess) {
 		t.Error("a dialog is open or the keys are held")
+	}
+}
+
+// The dialog holds none of the session's keys of actions while it is
+// open, so a program that ends with it open leaves nothing held. Shell
+// takes them; when something else has them then, it says so and closes.
+func TestShellDialogHoldsNothing(t *testing.T) {
+	sess, term, hs := shellSetup(t, shellPodYAML("", running("app"), nil, nil))
+	inRunning := func() bool {
+		actionsRunning.Lock()
+		defer actionsRunning.Unlock()
+		_, ok := actionsRunning.m[sess]
+		return ok
+	}
+	hs.press("s")
+	shellDialog(hs)
+	if inRunning() {
+		t.Error("the session is in actionsRunning while the dialog is open")
+	}
+	// Something takes the keys meanwhile: Shell says so, and closes.
+	if !actionBegin(sess) {
+		t.Fatal("the keys were held")
+	}
+	hs.press("enter")
+	hs.wantFrame(actionTextBusy)
+	if hs.root().dlg != nil || len(sess.Called("Exec")) != 0 || term.runs != 0 {
+		t.Error("Shell ran or stayed open while the keys were held")
+	}
+	actionEnd(sess)
+	// The program ends with the dialog open: nothing is left.
+	hs.press("s")
+	shellDialog(hs)
+	hs.press("ctrl+c")
+	if !hs.quit {
+		t.Fatal("ctrl+c did not end the program")
+	}
+	if inRunning() {
+		t.Error("the session is left in actionsRunning")
 	}
 }
 
@@ -892,12 +945,13 @@ func TestShellHoldsTheActionKeys(t *testing.T) {
 		t.Error("the keys are free while the pod is read")
 	}
 	hs.send(read())
-	// The dialog holds them.
+	// The dialog holds nothing: it has the keys itself.
 	shellDialog(hs)
-	if !busy() {
-		t.Error("the keys are free while the dialog is open")
+	if busy() {
+		t.Error("the keys are held while the dialog is open")
 	}
-	// The shell holds them, and the return gives them back.
+	// From the press, the shell holds them, and the return gives them
+	// back.
 	var during bool
 	sess.ExecDo = func(context.Context, kube.ObjectRef, kube.ExecOptions) (kube.ExecResult, error) {
 		during = busy()
