@@ -115,7 +115,7 @@ func (s *session) watchTyped(q Query) (Watch, error) {
 			w.metered = m
 			w.metrics = &metricsHold{c: s.c, gvr: gvr, changed: ch}
 			w.changed = ch
-			w.stopCache = ch.forward(changed, s.c.ctx.Done())
+			w.stopCache = ch.forward(s.c, changed)
 		}
 	}
 	w.mu.Lock()
@@ -250,12 +250,16 @@ func (h *metricsHold) follow() *metricsPoller {
 			return nil
 		}
 		sub, unsubscribe := p.subscribe()
-		stopForward := h.changed.forward(sub, h.c.ctx.Done())
+		stopForward := h.changed.forward(h.c, sub)
 		h.poller = p
 		h.stop = func() {
 			stopForward()
 			unsubscribe()
 		}
+		// The poller may have a reading already, shared with another
+		// watch, or have listed before the subscription: the watch is not
+		// to wait for the next poll to show it.
+		h.changed.notify()
 	case !served && h.poller != nil:
 		h.drop()
 	}

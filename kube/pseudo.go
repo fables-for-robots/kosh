@@ -72,7 +72,7 @@ func (s *session) watchContainers(pod ObjectRef) (Watch, error) {
 		changed:     ch,
 		metrics:     &metricsHold{c: s.c, gvr: PodMetrics, changed: ch},
 		unsubscribe: unsubscribe,
-		stopCache:   ch.forward(changed, s.c.ctx.Done()),
+		stopCache:   ch.forward(s.c, changed),
 	}
 	w.mu.Lock()
 	w.stopAfter = context.AfterFunc(s.ctx, w.Close)

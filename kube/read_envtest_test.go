@@ -21,6 +21,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
+
+	"github.com/fables-for-robots/kosh/render"
 )
 
 // readEnvResolve resolves name with s, and fails the test when it
@@ -319,5 +321,13 @@ func TestNoMetricsAPIOnEnvtest(t *testing.T) {
 	defer u.Close()
 	if got, ok := u.Current(); ok || got.Served {
 		t.Errorf("ClusterUsage %+v, %v without the metrics API", got, ok)
+	}
+	// The watch holds the nodes' cache, and so looked at discovery and
+	// found no metrics API, rather than having no nodes to read.
+	if !c.held(render.Nodes) {
+		t.Error("the usage watch holds no nodes' cache")
+	}
+	if n := c.pollerCount(); n != 0 {
+		t.Errorf("%d pollers without the metrics API", n)
 	}
 }

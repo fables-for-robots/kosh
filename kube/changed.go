@@ -18,29 +18,46 @@ func (ch changes) notify() {
 	}
 }
 
-// forward notifies ch of every signal of from, from a goroutine of its
-// own, until stop is called or done is closed. stop returns once the
+// forward notifies ch of every signal of from, from a goroutine that c
+// runs, until stop is called or c is closed. stop returns once the
 // goroutine has ended, so that nothing is forwarded after it; it may be
-// called more than once.
-//
-// The goroutine is the watch's, not the Cluster's: Close of the Cluster
-// does not wait for it, and it ends with done, the Cluster's context,
-// for a watch that outlives the Cluster.
-func (ch changes) forward(from <-chan struct{}, done <-chan struct{}) (stop func()) {
-	quit, ended := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(ended)
+// called more than once. Once c is closed nothing is forwarded, and no
+// goroutine is started.
+func (ch changes) forward(c *Cluster, from <-chan struct{}) (stop func()) {
+	return c.goUntil(func(quit <-chan struct{}) {
 		for {
 			select {
 			case <-from:
 				ch.notify()
 			case <-quit:
 				return
-			case <-done:
+			case <-c.ctx.Done():
 				return
 			}
 		}
-	}()
+	})
+}
+
+// goUntil runs f in a goroutine counted in c.wg, as every goroutine the
+// Cluster runs is, so that Close waits for it; f returns when quit is
+// closed or c's context is done. The returned function closes quit and
+// waits for f to have returned; it may be called more than once. Once c
+// is closed f is not run, and the function returns at once.
+func (c *Cluster) goUntil(f func(quit <-chan struct{})) (stop func()) {
+	quit, ended := make(chan struct{}), make(chan struct{})
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		close(ended)
+	} else {
+		c.wg.Add(1)
+		c.mu.Unlock()
+		go func() {
+			defer c.wg.Done()
+			defer close(ended)
+			f(quit)
+		}()
+	}
 	var once sync.Once
 	return func() {
 		once.Do(func() { close(quit) })

@@ -11,8 +11,9 @@ import (
 
 // usageWatch is the cluster's use of its nodes, for the header: the
 // nodes' cache, which has what each node can give, and the poller of the
-// nodes' metrics, held while the API serves them. It is computed on each
-// Current from what the two hold now.
+// nodes' metrics, held while the API serves them. The hold follows
+// discovery at open, on every Current and every opts.MetricsPoll; the
+// usage is computed on each Current from what the two hold then.
 type usageWatch struct {
 	c *Cluster
 	// cache is nil when the cluster has no nodes kosh can read: Current
@@ -45,32 +46,36 @@ func (s *session) ClusterUsage() UsageWatch {
 	w.cache = k
 	w.metrics = &metricsHold{c: c, gvr: NodeMetrics, changed: w.changed}
 	sub, unsubscribe := k.subscribe()
-	stopForward := w.changed.forward(sub, c.ctx.Done())
+	stopForward := w.changed.forward(c, sub)
 	stopTick := w.tick()
 	w.stop = func() {
 		stopTick()
 		stopForward()
 		unsubscribe()
 	}
-	// So that the first Current says whether the API is served.
+	// The polling starts at open: the poller is acquired now when the
+	// API serves the metrics of nodes.
 	w.metrics.follow()
 
 	w.mu.Lock()
 	w.stopAfter = context.AfterFunc(s.ctx, w.Close)
 	w.mu.Unlock()
+	// The nodes' cache and the poller may be another session's, synced
+	// and with a reading, and signal nothing until they change: the
+	// watch's consumer is not to wait for that to see what Current says.
+	w.changed.notify()
 	return w
 }
 
-// tick signals Changed every opts.MetricsPoll at which discovery says
-// otherwise than the hold of the poller does, from a goroutine of its
-// own, until the returned function is called or the Cluster is closed:
-// without the poller nothing else signals when metrics-server is
-// installed. The Current that follows takes the poller, or gives it
-// back. The function returns once the goroutine has ended.
+// tick takes the poller or gives it back as discovery says, every
+// opts.MetricsPoll, from a goroutine the Cluster runs, until the
+// returned function is called or the Cluster is closed: without the
+// poller nothing else signals when metrics-server is installed, and the
+// header's reading is not to wait for its consumer to call Current. It
+// signals Changed when the hold changed. The function returns once the
+// goroutine has ended.
 func (w *usageWatch) tick() (stop func()) {
-	quit, ended := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(ended)
+	return w.c.goUntil(func(quit <-chan struct{}) {
 		t := time.NewTicker(w.c.opts.MetricsPoll)
 		defer t.Stop()
 		for {
@@ -80,17 +85,13 @@ func (w *usageWatch) tick() (stop func()) {
 			case <-w.c.ctx.Done():
 				return
 			case <-t.C:
-				if w.c.metricsServed(NodeMetrics) != w.metrics.held() {
+				held := w.metrics.held()
+				if (w.metrics.follow() != nil) != held {
 					w.changed.notify()
 				}
 			}
 		}
-	}()
-	var once sync.Once
-	return func() {
-		once.Do(func() { close(quit) })
-		<-ended
-	}
+	})
 }
 
 // Current takes or gives back the poller as discovery says now, as a
@@ -122,8 +123,10 @@ func (w *usageWatch) Current() (ClusterUsage, bool) {
 			mem += use.Mem
 		}
 	}
-	// No node that says what it can give, or none in the cache yet: no
-	// percentage.
+	// When either sum of allocatable is 0 (no node in the cache yet, or
+	// none that says what it can give) there is no percentage of it, and
+	// none of the other either: a ClusterUsage has one ok for both lines,
+	// so both say n/a rather than one say a number nobody can check.
 	if allocCPU == 0 || allocMem == 0 {
 		return u, false
 	}
