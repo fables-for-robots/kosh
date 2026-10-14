@@ -171,6 +171,10 @@ type Server struct {
 	// its program and say why. Then its connection is closed: a client
 	// that does not read cannot keep a session kosh has ended.
 	endTimeout time.Duration
+	// keyLinger is how long the connection of a key that has left the
+	// list stays open after its last session has ended, for its client
+	// to close it: see conn.lingerForKey.
+	keyLinger time.Duration
 	// minTurn is how long a command's turn with a session's terminal
 	// lasts at least: minTurn, but for a test.
 	minTurn time.Duration
@@ -224,6 +228,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		endTimeout: 2 * time.Second,
+		keyLinger:  time.Second,
 		minTurn:    minTurn,
 		repairTurn: minTurn,
 		listeners:  map[net.Listener]string{},
