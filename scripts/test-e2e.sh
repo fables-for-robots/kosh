@@ -59,6 +59,11 @@ RANDOM_ID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 CLUSTER=kosh-e2e-$RANDOM_ID
 TAG=kosh-e2e:$RANDOM_ID
 export KUBECONFIG=$WORK/kubeconfig
+# kubectl's discovery cache and helm's directories, which default to the
+# home directory, are the run's own: for the script's calls and the
+# tests'.
+export KUBECACHEDIR=$WORK/kube-cache
+export HELM_CACHE_HOME=$WORK/helm/cache HELM_CONFIG_HOME=$WORK/helm/config HELM_DATA_HOME=$WORK/helm/data
 
 CREATED_CLUSTER=
 TAGGED=

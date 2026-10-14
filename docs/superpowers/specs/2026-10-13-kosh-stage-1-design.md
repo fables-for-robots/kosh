@@ -738,8 +738,9 @@ colours and a change of the window's size arrive as over TCP.
 
 ## 21. Not in this stage
 
-- Anything that enters a pod: shell, attach, port-forward, copying
-  files (§22).
+- Anything else that enters a pod: attach, port-forward, copying files
+  (§22). A shell in a pod came after this stage, with a design of its
+  own (`2026-10-13-kosh-shell-design.md`).
 - Metrics: the CPU and memory columns, pulses (§22).
 - xray, and "used by" for ConfigMaps, Secrets, claims and
   ServiceAccounts (§22).
@@ -755,7 +756,9 @@ colours and a change of the window's size arrive as over TCP.
 ## 22. Later stages
 
 - **Stage 2: into the pods.** A shell in a container, attach,
-  port-forward, copying files.
+  port-forward, copying files. The shell is built
+  (`2026-10-13-kosh-shell-design.md`, kosh v0.2.0); attach,
+  port-forward and copying files are not yet.
 - **Stage 3: what k9s has besides.** The metrics columns and pulses with
   metrics-server, xray, "used by", and what else of k9s is missed.
 
