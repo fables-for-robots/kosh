@@ -212,7 +212,9 @@ What is typed in a shell, and what it prints, is never logged, and
 nothing of it is recorded.
 
 For the CPU and memory of [Metrics](#metrics), a narrower role needs
-`get` and `list` on `pods` and `nodes` in the group `metrics.k8s.io`.
+`get` and `list` on `pods` and `nodes` in the group `metrics.k8s.io`, and
+for the header's lines also `list` and `watch` on `nodes` (core), which
+`view` does not give.
 
 ## Using it
 
@@ -315,17 +317,24 @@ removal, in sessions already open.
   did not cover (`CPU/A` and `MEM/A` are the node's own);
 - in a percentage of requests or limits that are 0;
 - in every cell but a node's `CPU/A` and `MEM/A` (the node's own), and
-  in both lines, while the API is served and the reading fails:
-  metrics-server is down, its APIService is not available, or kosh's
-  ServiceAccount may not read it. kosh's log says `metrics could not be
-  read` once, with why, and `metrics can be read again` when a reading
-  works again;
+  in both lines, while the API is served and the reading fails. When
+  kosh's ServiceAccount may not read it, that lasts; kosh's log says
+  `metrics could not be read` once, with why, and `metrics can be read
+  again` when a reading works again. When metrics-server is down or its
+  APIService is not available, it lasts until kosh next looks for the
+  API, within 5 minutes; then the columns and the lines go, as without
+  metrics-server, and come back within 5 minutes of its return;
+- in both lines while kosh may not list the nodes, whose allocatable
+  the percentages are of; kosh's log says `the nodes cannot be listed`
+  once for the session, with why;
 - in the lines until the first reading has come.
 
 kosh reads the metrics with its ServiceAccount: a role narrower than
 `cluster-admin` needs `get` and `list` on `pods` and `nodes` in the group
-`metrics.k8s.io`. metrics-server's own manifest adds those to `view`,
-`edit` and `admin`.
+`metrics.k8s.io`, which metrics-server's own manifest adds to `view`,
+`edit` and `admin`; and, for the header's lines, `list` and `watch` on
+`nodes` (core), which `view` does not have. kosh reads the nodes for the
+header only while the cluster serves the metrics API.
 
 ## Values
 

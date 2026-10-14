@@ -266,13 +266,6 @@ func (h *metricsHold) follow() *metricsPoller {
 	return h.poller
 }
 
-// held reports whether the hold has the poller.
-func (h *metricsHold) held() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.poller != nil
-}
-
 // drop gives the poller back. h.mu is held.
 func (h *metricsHold) drop() {
 	h.stop()

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -103,9 +106,94 @@ func TestClusterUsageWithoutTheAPI(t *testing.T) {
 	if got, ok := u.Current(); ok || got.Served {
 		t.Errorf("%+v, %v without the API", got, ok)
 	}
-	if e.c.pollerCount() != 0 {
-		t.Error("a poller without the API")
+	if e.c.pollerCount() != 0 || e.c.running(render.Nodes) {
+		t.Errorf("%d pollers, the nodes' informer running %v without the API", e.c.pollerCount(), e.c.running(render.Nodes))
 	}
+}
+
+// The usage watch holds the nodes' cache and their poller while the API
+// serves the metrics of nodes, and neither while it does not.
+func TestUsageWatchHoldsTheNodesOnlyWhileServed(t *testing.T) {
+	api := newMetricsAPI()
+	api.set(NodeMetrics, nodeMetrics("n1", "1", "2Gi"))
+	e := meteredEnv(t, api, nil, Options{MetricsPoll: time.Hour}, allocNode("n1", "4", "8Gi"))
+	u := e.session(t).ClusterUsage()
+	defer u.Close()
+	if _, ok := u.Current(); ok || e.c.running(render.Nodes) || e.c.pollerCount() != 0 {
+		t.Fatalf("without the API: ok %v, nodes' informer %v, %d pollers", ok, e.c.running(render.Nodes), e.c.pollerCount())
+	}
+
+	e.disc.setResources(metricsResources())
+	e.c.refresh(context.Background())
+	eventually(t, "the cluster's usage once the API is served", func() bool {
+		got, ok := u.Current()
+		return ok && got.Served
+	})
+	if !e.c.held(render.Nodes) || e.c.pollerOf(NodeMetrics) == nil {
+		t.Error("the nodes' cache and poller are not held while the API is served")
+	}
+
+	e.disc.setResources(standardResources())
+	e.c.refresh(context.Background())
+	if got, ok := u.Current(); ok || got.Served {
+		t.Errorf("%+v, %v after the API went away", got, ok)
+	}
+	if e.c.pollerCount() != 0 || !e.c.idle(render.Nodes) {
+		t.Error("the nodes' poller or cache is held after the API went away")
+	}
+}
+
+// Nodes that kosh may not list leave the header n/a, and the log says
+// why, once for the watch however often it is read.
+func TestUsageWatchLogsNodesItMayNotList(t *testing.T) {
+	log := newAuditLog()
+	api := newMetricsAPI()
+	api.set(NodeMetrics, nodeMetrics("n1", "1", "2Gi"))
+	e := newEnv(t, envConfig{
+		opts: Options{MetricsPoll: 10 * time.Millisecond, Log: log.logger()}, resources: metricsResources(), real: true,
+		before: func(e *env) {
+			api.install(e)
+			e.dyn.PrependReactor("list", "nodes", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				if a.GetResource().Group != "" {
+					return false, nil, nil
+				}
+				return true, nil, apierrors.NewForbidden(a.GetResource().GroupResource(), "", errors.New("RBAC"))
+			})
+		},
+	}, allocNode("n1", "4", "8Gi"))
+	u := e.session(t).ClusterUsage()
+	defer u.Close()
+	const msg = "the nodes cannot be listed: the cluster's CPU and memory are n/a"
+	eventually(t, "the line that the nodes cannot be listed", func() bool {
+		u.Current()
+		return len(log.with(msg)) > 0
+	})
+	n := api.count(NodeMetrics)
+	eventually(t, "more polls", func() bool {
+		u.Current()
+		return api.count(NodeMetrics) > n+5
+	})
+	if got, ok := u.Current(); ok || !got.Served {
+		t.Errorf("%+v, %v; want served and n/a", got, ok)
+	}
+	if recs := log.with(msg); len(recs) != 1 || recs[0].Level != slog.LevelWarn || !strings.Contains(recs[0].Attrs["err"].String(), "forbidden") {
+		t.Errorf("records %+v, want one WARN with the API's refusal", recs)
+	}
+}
+
+// A watch opened where there are no nodes kosh can read closes Changed
+// when the session ends, as every usage watch does.
+func TestUsageWatchWithoutNodesClosesAtTheSessionsEnd(t *testing.T) {
+	// The tests' renderers have none for nodes: nodes are not typed.
+	e := newEnv(t, envConfig{resources: metricsResources()})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := e.c.Session(ctx, fullGrant).ClusterUsage()
+	if got, ok := u.Current(); ok || got.Served {
+		t.Errorf("%+v, %v without nodes kosh can read", got, ok)
+	}
+	cancel()
+	closedWithin(t, u.Changed(), time.Second, "the session ended")
 }
 
 func TestCloseWithWatchesOpen(t *testing.T) {
@@ -294,4 +382,45 @@ func TestUsageWatchSignalsOnPollsNotOnNodes(t *testing.T) {
 		break
 	}
 	waitSignal(t, u.Changed())
+}
+
+// closedWithin waits for ch to be closed, receiving any signal before
+// that, and fails the test after d.
+func closedWithin(t *testing.T, ch <-chan struct{}, d time.Duration, what string) {
+	t.Helper()
+	deadline := time.After(d)
+	for {
+		select {
+		case _, open := <-ch:
+			if !open {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("Changed not closed within %v: %s", d, what)
+		}
+	}
+}
+
+// A session that ended before ClusterUsage was called closes the watch
+// at once, from AfterFunc's goroutine, while ClusterUsage is still
+// opening it: nothing may signal the closed Changed. Another session
+// keeps the nodes' cache and the poller warm, so that the opening is
+// quick and the race is close.
+func TestClusterUsageOnAnEndedSession(t *testing.T) {
+	api := newMetricsAPI()
+	api.set(NodeMetrics, nodeMetrics("n1", "1", "2Gi"))
+	e := meteredEnv(t, api, metricsResources(), Options{MetricsPoll: time.Hour}, allocNode("n1", "4", "8Gi"))
+	warm := e.session(t).ClusterUsage()
+	defer warm.Close()
+	eventually(t, "the warm watch's reading", func() bool {
+		_, ok := warm.Current()
+		return ok
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ended := e.c.Session(ctx, fullGrant)
+	for range 2000 {
+		u := ended.ClusterUsage()
+		closedWithin(t, u.Changed(), 5*time.Second, "a watch of a session that had ended")
+	}
 }

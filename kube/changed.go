@@ -2,11 +2,10 @@ package kube
 
 import "sync"
 
-// changes is the Changed of a watch whose signals come from more than one
-// source: the cache of its kind, and the metrics poller that it holds for
-// as long as the API serves the metrics. It has room for one signal, as
-// every Changed: many are one. A watch of a table never closes it; the
-// usage watch closes it at Close, once nothing can notify it any more.
+// changes is the Changed of a watch of a table whose signals come from
+// more than one source: the cache of its kind, and the metrics poller
+// that it holds for as long as the API serves the metrics. It has room
+// for one signal, as every Changed: many are one. It is never closed.
 type changes chan struct{}
 
 func newChanges() changes { return make(changes, 1) }
@@ -19,17 +18,22 @@ func (ch changes) notify() {
 	}
 }
 
-// forward notifies ch of every signal of from, from a goroutine that c
+// forward notifies ch of every signal of from, as c.forward does.
+func (ch changes) forward(c *Cluster, from <-chan struct{}) (stop func()) {
+	return c.forward(from, ch.notify)
+}
+
+// forward calls notify on every signal of from, from a goroutine that c
 // runs, until stop is called or c is closed. stop returns once the
 // goroutine has ended, so that nothing is forwarded after it; it may be
 // called more than once. Once c is closed nothing is forwarded, and no
 // goroutine is started.
-func (ch changes) forward(c *Cluster, from <-chan struct{}) (stop func()) {
+func (c *Cluster) forward(from <-chan struct{}, notify func()) (stop func()) {
 	return c.goUntil(func(quit <-chan struct{}) {
 		for {
 			select {
 			case <-from:
-				ch.notify()
+				notify()
 			case <-quit:
 				return
 			case <-c.ctx.Done():

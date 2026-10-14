@@ -322,10 +322,13 @@ func TestNoMetricsAPIOnEnvtest(t *testing.T) {
 	if got, ok := u.Current(); ok || got.Served {
 		t.Errorf("ClusterUsage %+v, %v without the metrics API", got, ok)
 	}
-	// The watch holds the nodes' cache, and so looked at discovery and
-	// found no metrics API, rather than having no nodes to read.
-	if !c.held(render.Nodes) {
-		t.Error("the usage watch holds no nodes' cache")
+	// The cluster has nodes kosh can read: the watch found no metrics
+	// API, and so holds neither the nodes' cache nor a poller.
+	if r, ok := c.knownResource(render.Nodes); !ok || !r.Typed {
+		t.Errorf("nodes %+v, %v: not a kind kosh reads, and the test shows nothing", r, ok)
+	}
+	if c.running(render.Nodes) {
+		t.Error("the usage watch holds the nodes' cache without the metrics API")
 	}
 	if n := c.pollerCount(); n != 0 {
 		t.Errorf("%d pollers without the metrics API", n)
