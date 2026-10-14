@@ -1,6 +1,7 @@
 package sshd
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -26,6 +27,13 @@ import (
 
 // exec is Session.Exec.
 func (sess *session) exec(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
+	return sess.handover(run, done, busyWait)
+}
+
+// handover returns the command of a hand-over: exec, which waits busy
+// for a terminal that a command has before it tells done that it is
+// busy.
+func (sess *session) handover(run func(context.Context, Terminal) error, done func(error) tea.Msg, busy time.Duration) tea.Cmd {
 	// tell tells done what became of the command; a nil done is told
 	// nothing, and the program is given no message.
 	tell := func(err error) tea.Msg {
@@ -40,7 +48,7 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 		}
 		// From here on what the client sends is the command's, and the
 		// program's reader is given the mark and its end.
-		in, drained, told := sess.in.give()
+		in, drained, told := sess.in.give(busy)
 		if in == nil {
 			return tell(ErrTerminalBusy)
 		}
@@ -78,6 +86,13 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 	}
 }
 
+// busyWait is how long a hand-over waits for a terminal that a command
+// has. When the model asks, that command can only be the repair of the
+// screen (see watchScreen), which is over in minTurn: the model's
+// command is not to be refused for that. A model that asks twice has its
+// second command wait this long, and refused then.
+const busyWait = 200 * time.Millisecond
+
 // minTurn is how long a turn lasts at least: Run does not return sooner,
 // however soon the command does.
 //
@@ -93,6 +108,37 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 // and it costs a command that lasts longer than this nothing. What is
 // left to the scheduler is what watchScreen is for.
 const minTurn = 10 * time.Millisecond
+
+// terminalReset is written to the client when a command has returned,
+// before the program takes the terminal back or the session says why it
+// ends. A command is given the terminal in its normal state, and what it
+// leaves is its own business: a full-screen program that was killed, or
+// a binary file printed, leaves modes that Bubble Tea, which sets only
+// what the program needs, would draw the program in for the rest of the
+// session. Each part undoes one thing; none clears the screen or moves
+// the cursor.
+const terminalReset = "" +
+	"\x1b[?1049l" + // the normal screen, not the alternate one
+	"\x1b[0m" + // no colour, no attribute
+	"\x1b(B" + // G0 is ASCII, not the line-drawing set
+	"\x0f" + // and G0 is the set in use (SI)
+	"\x1b[r" + // no scroll region: the margins are the screen's
+	"\x1b[?6l" + // positions count from the screen's corner, not the region's
+	"\x1b[?7h" + // a line that is full wraps
+	"\x1b[4l" + // characters replace, they are not inserted
+	"\x1b[?1l" + // the cursor keys send their normal sequences
+	"\x1b>" + // and the keypad its digits
+	"\x1b[?1000l" + // no mouse reports: of buttons,
+	"\x1b[?1002l" + // of drags,
+	"\x1b[?1003l" + // of every move,
+	"\x1b[?1005l" + // nor their encodings: UTF-8,
+	"\x1b[?1006l" + // SGR,
+	"\x1b[?1015l" + // urxvt
+	"\x1b[?1004l" + // no reports of focus
+	"\x1b[?2004l" + // a paste is not bracketed
+	"\x1b[?2026l" + // output is not held back for synchronised updates
+	"\x1b[=0u" + // no flags of the kitty keyboard protocol
+	"\x1b[?25h" // the cursor is shown
 
 // turn is the time one command has the terminal, as a tea.ExecCommand:
 // Bubble Tea calls Run in the program's event loop when it has released
@@ -116,8 +162,9 @@ func (t *turn) SetStderr(io.Writer) {}
 
 // Run calls the command with the terminal, and returns what it
 // returned. When Run returns the turn is over: the command's reader is
-// told io.EOF, its writer is closed, and the input is the program's, for
-// the reader Bubble Tea starts next.
+// told io.EOF, its writer is closed, the terminal is reset to its normal
+// state (terminalReset), and the input is the program's, for the reader
+// Bubble Tea starts next.
 //
 // The command's context is done when the session ends, by the client or
 // by kosh, and from that moment the command reads io.EOF and its writes
@@ -135,14 +182,28 @@ func (t *turn) Run() error {
 		sess.in.cut(t.in)
 		out.close()
 	})
+	// called is set when the command is: a turn whose command was never
+	// called has nothing to undo.
+	called := false
 	defer func() {
 		stop()
 		cancel()
+		// First of all: a reader of the command's that is still in Read,
+		// as the copier of a stream is, takes nothing of what the client
+		// sends from here on.
+		sess.in.cut(t.in)
 		// A write of the command's that is under way is waited for: the
 		// program's output must not run into it. One that the client
 		// does not take ends with the channel or the connection.
 		sess.commandWaits(waitsForWrite)
 		out.close()
+		if called {
+			// Whatever the command left: see terminalReset. A session
+			// that ends here has it before its last message; a client
+			// that does not read holds this write up as it does the
+			// command's, and a connection that is gone refuses it.
+			_, _ = io.WriteString(sess.raw, terminalReset)
+		}
 		sess.commandWaits("")
 		sess.in.takeBack(t.in)
 		// See minTurn. What the command left unread waits for the
@@ -152,9 +213,10 @@ func (t *turn) Run() error {
 		}
 		sess.watchScreen()
 	}()
-	if !sess.beginCommand(cancel) {
+	if !sess.beginCommand(cancel, out) {
 		return ErrSessionEnded
 	}
+	called = true
 	size, resized, unwatch := sess.win.watch()
 	defer unwatch()
 	return t.run(ctx, Terminal{In: t.in, Out: out, Size: size, Resized: resized})
@@ -163,6 +225,10 @@ func (t *turn) Run() error {
 // gate is the writer of one command's turn: it passes what it is given
 // on to w, and after close it passes nothing.
 type gate struct {
+	// writing is how many calls of Write are under way, or wait for
+	// one that is.
+	writing atomic.Int32
+
 	mu     sync.Mutex
 	w      io.Writer
 	closed bool
@@ -170,6 +236,8 @@ type gate struct {
 
 // Write writes p to w, or fails with io.ErrClosedPipe after close.
 func (g *gate) Write(p []byte) (int, error) {
+	g.writing.Add(1)
+	defer g.writing.Add(-1)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
@@ -289,6 +357,132 @@ const (
 	drainWait = 250 * time.Millisecond
 )
 
+// A paste, as a terminal in bracketed paste mode sends it, and how much
+// of one the program is given.
+const (
+	pasteStart = "\x1b[200~"
+	pasteEnd   = "\x1b[201~"
+	// pasteLimit is how many bytes of one paste the program is given.
+	pasteLimit = 1 << 20
+)
+
+// pasteScanner is what the program's input passes on its way to the
+// program. Bubble Tea's reader collects a bracketed paste until its end
+// mark, however long that takes and however much comes before it: a
+// client that sends the start mark and then megabytes has the server
+// hold them all. So a paste is cut at pasteLimit: the scanner knows the
+// two marks, counts the bytes between them, and of what is beyond the
+// limit it hands nothing on until the end mark, which it hands on whole.
+// The program sees a paste of pasteLimit bytes at most, properly ended;
+// what was dropped is held nowhere.
+//
+// Nothing is held back to wait for more: a byte that may be the
+// beginning of a mark is handed on as what it is until then, since it
+// may as well be the Escape key.
+type pasteScanner struct {
+	// in is set between a start mark and its end mark.
+	in bool
+	// n is how many bytes of the paste have been handed on.
+	n int
+	// mark holds the last bytes handed in when they are the beginning of
+	// a mark, start or end: the two begin alike. passed is how many of
+	// them were handed on.
+	mark   []byte
+	passed int
+	// pending is what was to be handed on and found no room.
+	pending []byte
+}
+
+// filter hands the bytes of src on into dst. It returns how many bytes
+// it put into dst and how many of src it took, which are more when it
+// dropped some. It takes none while dst is full.
+func (s *pasteScanner) filter(dst, src []byte) (nd, ns int) {
+	nd = copy(dst, s.pending)
+	s.pending = s.pending[nd:]
+	for ns < len(src) && len(s.pending) == 0 && nd < len(dst) {
+		if len(s.mark) == 0 && src[ns] != '\x1b' {
+			// A run of bytes that are no part of a mark: all at once.
+			run := src[ns:]
+			if i := bytes.IndexByte(run, '\x1b'); i >= 0 {
+				run = run[:i]
+			}
+			if s.in {
+				left := pasteLimit - s.n
+				if left == 0 {
+					// Beyond the limit: dropped.
+					ns += len(run)
+					continue
+				}
+				run = run[:min(len(run), left)]
+			}
+			k := copy(dst[nd:], run)
+			if s.in {
+				s.n += k
+			}
+			nd, ns = nd+k, ns+k
+			continue
+		}
+		for _, b := range s.step(src[ns]) {
+			if nd < len(dst) {
+				dst[nd] = b
+				nd++
+			} else {
+				s.pending = append(s.pending, b)
+			}
+		}
+		ns++
+	}
+	return nd, ns
+}
+
+// step takes one byte that is, or may be, part of a mark, and returns
+// what is to be handed on for it: the byte, nothing when it is dropped,
+// or the end mark, as much of it as was not handed on yet.
+func (s *pasteScanner) step(b byte) []byte {
+	if n := len(s.mark); b != pasteStart[n] && b != pasteEnd[n] {
+		// Not a mark after all. An escape begins the next try.
+		s.mark, s.passed = s.mark[:0], 0
+		if b != '\x1b' {
+			return s.data(b)
+		}
+	}
+	s.mark = append(s.mark, b)
+	out := s.data(b)
+	if len(out) > 0 && s.passed == len(s.mark)-1 {
+		s.passed++
+	}
+	switch string(s.mark) {
+	case pasteEnd:
+		if s.in {
+			// Whole, whatever of it was dropped as a part of the paste.
+			out = append(out, pasteEnd[s.passed:]...)
+			s.in, s.n = false, 0
+		}
+	case pasteStart:
+		if !s.in {
+			s.in, s.n = true, 0
+		}
+	default:
+		if len(s.mark) < len(pasteStart) {
+			return out
+		}
+	}
+	s.mark, s.passed = s.mark[:0], 0
+	return out
+}
+
+// data returns b to be handed on, or nothing when b is a byte of a
+// paste beyond the limit.
+func (s *pasteScanner) data(b byte) []byte {
+	if s.in {
+		if s.n >= pasteLimit {
+			return nil
+		}
+		s.n++
+	}
+	return []byte{b}
+}
+
 // input is what the client sends on the session channel. One goroutine,
 // pump, reads the channel; the bytes wait in buf, inputBuffer of them at
 // most, for the one who has the terminal: the program, or the command
@@ -314,6 +508,12 @@ type input struct {
 	// gone is set when the program's reader was told err: the program
 	// reads no more.
 	gone bool
+
+	// paste is what the bytes pass on their way to the program, and
+	// only to the program: a command's input has backpressure of its
+	// own, and a large paste into a shell is the user's business. It
+	// begins anew whenever the terminal changes hands.
+	paste pasteScanner
 
 	// turn is the reader of the command that has the terminal, or nil
 	// when the program has it.
@@ -406,6 +606,20 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 		case c != nil && (in.turn != c || c.over):
 			// A command's reader after its turn.
 			return 0, io.EOF
+		case c == nil && (len(in.buf) > 0 || len(in.paste.pending) > 0):
+			// The program's bytes, through the scanner: see pasteScanner.
+			nd, ns := in.paste.filter(p, in.buf)
+			in.buf = in.buf[ns:]
+			if len(in.buf) == 0 {
+				in.buf = nil
+			}
+			in.cond.Broadcast()
+			if nd > 0 {
+				return nd, nil
+			}
+			// All of it was dropped: the pump has room, and the program
+			// waits for more.
+			continue
 		case len(in.buf) > 0:
 			n := copy(p, in.buf)
 			in.buf = in.buf[n:]
@@ -432,15 +646,28 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 // when the mark has arrived at the program (see markSeen), told when the
 // program's reader has been told io.EOF; both are closed already when
 // the program reads no more. give returns nil when a command has the
-// terminal.
-func (in *input) give() (c *commandInput, drained, told <-chan struct{}) {
+// terminal, and still has it after wait.
+func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan struct{}) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	if in.turn != nil && wait > 0 {
+		// The end of a turn is told to cond; so is the end of the wait.
+		deadline := time.Now().Add(wait)
+		wake := time.AfterFunc(wait, func() {
+			in.mu.Lock()
+			in.cond.Broadcast()
+			in.mu.Unlock()
+		})
+		defer wake.Stop()
+		for in.turn != nil && time.Now().Before(deadline) {
+			in.cond.Wait()
+		}
+	}
 	if in.turn != nil {
 		return nil, nil, nil
 	}
 	c = &commandInput{in: in}
-	in.turn = c
+	in.turn, in.paste = c, pasteScanner{}
 	d, t := make(chan struct{}), make(chan struct{})
 	if in.gone {
 		close(d)
@@ -481,6 +708,7 @@ func (in *input) takeBack(c *commandInput) {
 	c.over = true
 	if in.turn == c {
 		in.turn, in.mark, in.drained, in.told = nil, false, nil, nil
+		in.paste = pasteScanner{}
 	}
 	in.cond.Broadcast()
 }
@@ -558,17 +786,19 @@ func (sess *session) checkScreen(n int64) {
 		return
 	}
 	// As the program would run the command of a hand-over: it returns
-	// nil when the terminal is busy or the session over.
-	msg := sess.exec(func(ctx context.Context, _ Terminal) error {
-		// Not the server's minTurn, which a test may have made nothing.
-		wait := time.NewTimer(minTurn)
+	// nil when the terminal is busy, for which it does not wait, or the
+	// session over.
+	msg := sess.handover(func(ctx context.Context, _ Terminal) error {
+		// minTurn, and not the server's, which a test may have made
+		// nothing.
+		wait := time.NewTimer(sess.srv.repairTurn)
 		defer wait.Stop()
 		select {
 		case <-wait.C:
 		case <-ctx.Done():
 		}
 		return nil
-	}, nil)()
+	}, nil, 0)()
 	if msg == nil {
 		return
 	}

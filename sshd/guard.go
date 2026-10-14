@@ -21,7 +21,8 @@ type guard struct {
 	stopped *atomic.Bool
 	// panicked is told of a panic, with the stack where it happened.
 	panicked func(in string, value any, stack []byte)
-	// failed is set after a panic: the model is not called again.
+	// failed is set after a panic, and by release: the model is not
+	// called again.
 	failed bool
 }
 
@@ -49,8 +50,11 @@ func (g *guard) fail(in string, r any) {
 	g.panicked(in, r, debug.Stack())
 }
 
-// Init calls the model's Init.
+// Init calls the model's Init, unless the model has failed.
 func (g *guard) Init() (cmd tea.Cmd) {
+	if g.failed {
+		return nil
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			g.fail("Init", r)
@@ -90,4 +94,10 @@ func (g *guard) View() (v tea.View) {
 		}
 	}()
 	return g.inner.View()
+}
+
+// release lets go of the model: it is not called again. It is called
+// when the program has returned, in the goroutine that ran it.
+func (g *guard) release() {
+	g.failed, g.inner = true, nil
 }
