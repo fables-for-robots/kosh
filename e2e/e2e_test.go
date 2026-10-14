@@ -1773,8 +1773,8 @@ func TestShellSurvivesNothing(t *testing.T) {
 	shell := ended[len(ended)-1]
 	t.Logf("and: %s", shell)
 	// The stream was cut, not the shell ended: the spec's §7.
-	if !hasAttr(shell, "ended", "the session ended") {
-		t.Errorf("the shell's end line does not say ended=%q: %s", "the session ended", shell)
+	if !hasAttr(shell, "ended", "the session ended") || strings.Contains(shell, " error=") {
+		t.Errorf("the shell's end line does not say ended=%q, and that alone: %s", "the session ended", shell)
 	}
 
 	c := connect(t, k, 120, 40)
@@ -2014,9 +2014,25 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	}, func() string { return "kosh's log:\n" + koshLog(t) })
 	shell := ended[len(ended)-1]
 	t.Logf("kosh's log: %s", shell)
-	if !hasAttr(shell, "ended", "the session ended") {
-		t.Errorf("the shell's end line does not say ended=%q: %s", "the session ended", shell)
+	if !hasAttr(shell, "ended", "the session ended") || strings.Contains(shell, " error=") {
+		t.Errorf("the shell's end line does not say ended=%q, and that alone: %s", "the session ended", shell)
 	}
+	// A record, for whoever reads the run: the session's end, and the
+	// close of its connection, by the client or by kosh a second later.
+	fp := ssh.FingerprintSHA256(k.signer.PublicKey())
+	var closed []string
+	deadline := time.Now().Add(10 * time.Second)
+	for len(closed) == 0 && time.Now().Before(deadline) {
+		closed = logLines(t, "connection closed", "fingerprint", fp)
+		time.Sleep(100 * time.Millisecond)
+	}
+	if ends := logLines(t, "session end", "key", k.name); len(ends) > 0 {
+		t.Logf("kosh's log: %s", ends[len(ends)-1])
+	}
+	for _, l := range closed {
+		t.Logf("kosh's log: %s", l)
+	}
+
 	// A record of the limit the spec states, not a requirement.
 	t.Logf("%s, PID %s in marker, after its session ended: still running %v", orphan, pid, slices.Contains(running(t, "marker", orphan), pid))
 
