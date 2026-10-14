@@ -159,7 +159,9 @@ read-only ssh-ed25519 AAAAC3Nza... bob@laptop
   upgrade`, and once the kubelet has updated the mounted file (up to a
   minute or two), a session whose key left the list ends with `this key
   is no longer accepted`, and one whose key changed between full and
-  read-only ends so that it reconnects with its new rights.
+  read-only ends so that it reconnects with its new rights. The
+  connection of a key that left the list is left for its client to
+  close, and kosh closes it a second after its last session ended.
 - A certificate is not accepted. A comment may not begin with
   `read-only`: `ssh-ed25519 AAAA... read-only bob` is a read-only key
   written wrongly, and the line is rejected.
@@ -238,9 +240,11 @@ opens a dialog with the container and the command:
 `enter` starts it: `s`, `enter` is the whole way in. The command is
 `sh -c "command -v bash >/dev/null && exec bash || exec sh"`, bash where
 the image has it and sh otherwise; change it in the field when the image
-has another shell, or no `sh` at all: `/bin/ash`, say. When it cannot be
-started, the dialog comes back with the container runtime's reason
-(`exec: "sh": executable file not found in $PATH`). The command is words,
+has another shell than `sh`: `/bin/bash` for an image with only bash,
+`/busybox/sh`, `nu`. When it cannot be started, the dialog comes back with
+the container runtime's reason (`exec: "sh": executable file not found in
+$PATH`). An image with no shell at all, as kosh's own, cannot be helped
+by the field. The command is words,
 as a shell cuts a simple command, quotes and all, and is not run through
 a shell: for a shell's language write `sh -c '…'`, as in
 `sh -c 'cd /tmp && exec sh'`. The shell has your terminal as `kubectl
@@ -308,11 +312,12 @@ The chart refuses to install without state (`state.existingSecret` or
   Connect again.
 - **What runs in a shell can outlive the shell's session.** When a
   session ends while its shell is open (the key leaves the list, the
-  connection is lost, kosh restarts), the shell and what it started go on
-  running in the container, without a terminal, until they end or the
-  container does, as with `kubectl exec` when its client goes away: the
-  API offers no way to end them. kosh's log has the shell's end line,
-  with the pod and the container.
+  connection is lost, kosh restarts), the shell and what it started can
+  go on running in the container, without a terminal, until they end or
+  the container does, as with `kubectl exec` when its client goes away:
+  the API offers no way to end them. The shell's end line in kosh's log
+  then says `ended="the session ended"`, with the pod and the container,
+  so that whoever removes a key knows where to look.
 - **A key's 17th connection is closed without a word.** A key has at most
   16 open connections; the next is closed without a message to the client
   (kosh's log says why). Many connections opened within a few seconds can
