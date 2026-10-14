@@ -1,11 +1,15 @@
 package kube
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
@@ -233,4 +237,61 @@ func TestGoUntilIsWaitedForByClose(t *testing.T) {
 	if ran {
 		t.Error("run after Close")
 	}
+}
+
+// The header's arrow compares one reading with the one before, so the
+// usage watch signals on a poll and not on a node's change between two
+// polls.
+func TestUsageWatchSignalsOnPollsNotOnNodes(t *testing.T) {
+	api := newMetricsAPI()
+	api.set(NodeMetrics, nodeMetrics("n1", "1", "2Gi"))
+	e := meteredEnv(t, api, metricsResources(), Options{MetricsPoll: 300 * time.Millisecond}, allocNode("n1", "4", "8Gi"))
+	u := e.session(t).ClusterUsage()
+	defer u.Close()
+	eventually(t, "a reading", func() bool {
+		_, ok := u.Current()
+		return ok
+	})
+	nodes := e.dyn.Resource(render.Nodes)
+	for attempt := 0; ; attempt++ {
+		if attempt == 5 {
+			t.Fatal("a poll came between the node's change and the look at Changed five times")
+		}
+		// Right after a poll, the next one is a whole interval away.
+		drain(u.Changed())
+		waitSignal(t, u.Changed())
+		n := api.count(NodeMetrics)
+		label := fmt.Sprintf("v%d", attempt)
+		obj, err := nodes.Get(context.Background(), "n1", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		obj.SetLabels(map[string]string{"test": label})
+		if _, err := nodes.Update(context.Background(), obj, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, "the node's change in the cache", func() bool {
+			e.c.mu.Lock()
+			k := e.c.caches[render.Nodes]
+			e.c.mu.Unlock()
+			o, ok := k.get("", "n1")
+			return ok && o.(*corev1.Node).Labels["test"] == label
+		})
+		// A poll's signal comes after its list is counted: a signal seen
+		// before a count that has not moved is not a poll's.
+		signalled := false
+		select {
+		case <-u.Changed():
+			signalled = true
+		default:
+		}
+		if api.count(NodeMetrics) != n {
+			continue
+		}
+		if signalled {
+			t.Fatal("Changed after a node's change between two polls")
+		}
+		break
+	}
+	waitSignal(t, u.Changed())
 }

@@ -14,6 +14,13 @@ import (
 // nodes' metrics, held while the API serves them. The hold follows
 // discovery at open, on every Current and every opts.MetricsPoll; the
 // usage is computed on each Current from what the two hold then.
+//
+// Changed receives at open, after each list of the poller, when the hold
+// changes, and once when the nodes' cache first syncs, but not when a
+// node changes: the header's arrow compares one reading with the one
+// before, and is to show the change from one poll to the next, not from
+// a node's status update between two polls. A node's allocatable rarely
+// changes, and the next poll's Current reads it from the cache.
 type usageWatch struct {
 	c *Cluster
 	// cache is nil when the cluster has no nodes kosh can read: Current
@@ -21,7 +28,7 @@ type usageWatch struct {
 	cache   *kindCache
 	metrics *metricsHold
 	changed changes
-	stop    func() // ends the forwarding of the cache's signals and the tick
+	stop    func() // ends the wait for the cache's first sync and the tick
 
 	closeOnce sync.Once
 
@@ -45,13 +52,11 @@ func (s *session) ClusterUsage() UsageWatch {
 	}
 	w.cache = k
 	w.metrics = &metricsHold{c: c, gvr: NodeMetrics, changed: w.changed}
-	sub, unsubscribe := k.subscribe()
-	stopForward := w.changed.forward(c, sub)
+	stopSynced := w.synced()
 	stopTick := w.tick()
 	w.stop = func() {
 		stopTick()
-		stopForward()
-		unsubscribe()
+		stopSynced()
 	}
 	// The polling starts at open: the poller is acquired now when the
 	// API serves the metrics of nodes.
@@ -65,6 +70,23 @@ func (s *session) ClusterUsage() UsageWatch {
 	// watch's consumer is not to wait for that to see what Current says.
 	w.changed.notify()
 	return w
+}
+
+// synced signals Changed once the nodes' cache has its first list, from
+// a goroutine the Cluster runs, until the returned function is called or
+// the Cluster is closed: a reading that came before the nodes has no
+// percentage, and the next list may be a whole MetricsPoll away. Before
+// that Current was never ok, so the signal moves no arrow. The function
+// returns once the goroutine has ended.
+func (w *usageWatch) synced() (stop func()) {
+	return w.c.goUntil(func(quit <-chan struct{}) {
+		select {
+		case <-w.cache.informer.HasSyncedChecker().Done():
+			w.changed.notify()
+		case <-quit:
+		case <-w.c.ctx.Done():
+		}
+	})
 }
 
 // tick takes the poller or gives it back as discovery says, every
