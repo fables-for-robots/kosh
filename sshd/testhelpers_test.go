@@ -337,6 +337,9 @@ func newHarness(t *testing.T, opts ...option) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A linger that a test can wait out; those that look at the linger
+	// set their own.
+	srv.keyLinger = 50 * time.Millisecond
 	for _, o := range opts {
 		if o.srv != nil {
 			o.srv(srv)
