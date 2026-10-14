@@ -301,6 +301,9 @@ func (sess *session) filter(_ tea.Model, msg tea.Msg) tea.Msg {
 		sess.in.eventSeen()
 	}
 	switch msg := msg.(type) {
+	case windProbe:
+		close(msg.taken)
+		return nil
 	case tea.SuspendMsg:
 		return tea.ResumeMsg{}
 	case tea.ModeReportMsg:
@@ -364,7 +367,13 @@ func (sess *session) wind() {
 	sess.windOnce.Do(func() {
 		defer sess.wound.Store(true)
 		sess.winding.Store(true)
-		drained, told := sess.in.endProgram()
+		// A program that takes nothing now, because it waits for a
+		// client that does not read, would not take the mark either,
+		// and the mark would be what the reader is left with. So the
+		// program is asked first whether it takes a message: one that
+		// does not is given no mark, and its reader its end at once, as
+		// a reader that has gathered nothing needs no more.
+		drained, told := sess.in.endProgram(sess.programTakes())
 		select {
 		case <-drained:
 		case <-time.After(windWait):
@@ -375,6 +384,31 @@ func (sess *session) wind() {
 		case <-time.After(windWait):
 		}
 	})
+}
+
+// windProbe is a message that the filter takes out, and tells of.
+type windProbe struct{ taken chan struct{} }
+
+// probeWait is how long a program has to take a windProbe.
+const probeWait = 100 * time.Millisecond
+
+// programTakes reports whether the program takes a message now.
+func (sess *session) programTakes() bool {
+	sess.mu.Lock()
+	p := sess.program
+	sess.mu.Unlock()
+	if p == nil {
+		return false
+	}
+	probe := windProbe{make(chan struct{})}
+	// Send returns when the program takes it, or has ended.
+	go p.Send(probe)
+	select {
+	case <-probe.taken:
+		return true
+	case <-time.After(probeWait):
+		return false
+	}
 }
 
 // quit ends the program: its reader first, and then the program, with a
@@ -946,7 +980,8 @@ func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan
 	return c, d, t
 }
 
-// endProgram ends the program's reading: the program's reader is given
+// endProgram ends the program's reading. Without mark the program's
+// reader is given io.EOF at once. With it the reader is given
 // drainMark, and then waits (it reads no channel and is not at its end)
 // until endProgramEOF; a reader that Bubble Tea starts later is at its
 // end at once. drained and told are as give's: drained closes when the
@@ -954,15 +989,20 @@ func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan
 // io.EOF. Both are closed already when no reader of the program is
 // reading: a command has the terminal, the program was wound already, or
 // the reader was told the channel's end.
-func (in *input) endProgram() (drained, told <-chan struct{}) {
+func (in *input) endProgram(mark bool) (drained, told <-chan struct{}) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	d, t := make(chan struct{}), make(chan struct{})
-	if in.ended || in.ending || in.turn != nil || in.gone {
+	switch {
+	case in.ended || in.ending || in.turn != nil || in.gone:
 		close(d)
 		close(t)
 		in.ended = true
-	} else {
+	case !mark:
+		// No mark, and so nothing to wait for but the reader's end.
+		close(d)
+		in.ended, in.endEOF, in.told = true, true, t
+	default:
 		in.mark, in.ending, in.drained, in.told = true, true, d, t
 	}
 	in.cond.Broadcast()
