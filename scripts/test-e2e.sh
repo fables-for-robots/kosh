@@ -156,7 +156,7 @@ done
 
 # 3. The keys and the state.
 step "the keys and the state"
-ssh-keygen -q -t ed25519 -N '' -C alice@kosh-e2e -f "$WORK/full"
+ssh-keygen -q -t ed25519 -N '' -C alice@kosh-e2e/admin -f "$WORK/full"
 ssh-keygen -q -t ed25519 -N '' -C bob@kosh-e2e -f "$WORK/readonly"
 mkdir -m 0700 "$WORK/state"
 docker run --rm --user "$(id -u):$(id -g)" -v "$WORK/state:/state" "$TAG" id --state-dir /state >"$WORK/id"
@@ -166,10 +166,7 @@ sed -n 's/^host key *//p' "$WORK/id" >"$WORK/host_key.pub"
 [ -n "$ENDPOINT" ] && [ -s "$WORK/host_key.pub" ] || fail "kosh id printed no endpoint ID or host key"
 kubectl create namespace "$NAMESPACE"
 kubectl --namespace "$NAMESPACE" create secret generic kosh-state --from-file="$WORK/state"
-{
-  cat "$WORK/full.pub"
-  echo "read-only $(cat "$WORK/readonly.pub")"
-} >"$WORK/authorized_keys"
+cat "$WORK/full.pub" "$WORK/readonly.pub" >"$WORK/authorized_keys"
 
 # 4. kosh, installed with its chart.
 step "kosh, installed with the chart"

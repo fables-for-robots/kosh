@@ -1,11 +1,12 @@
 // Package keys is the list of accepted keys: the file in OpenSSH's
 // authorized_keys format that says whose SSH key kosh accepts, and
-// whether as a full key or a read-only one.
+// whether as an admin or read-only.
 //
-// A line is a key, with the option read-only in front or none, and a
-// comment after it that is the key's name. A line with any other option,
-// and a line that does not parse, is rejected: it gives no access. Empty
-// lines and lines that begin with # are skipped.
+// A line is a key and, after it, a comment that is the key's name. The
+// name decides what the key may do: one that ends in /admin is an admin,
+// who may do everything kosh does; any other is read-only. A line with
+// an option, and a line that does not parse, is rejected: it gives no
+// access. Empty lines and lines that begin with # are skipped.
 package keys
 
 import (
@@ -22,23 +23,24 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// OptionReadOnly is the one option of a line that kosh knows.
-const OptionReadOnly = "read-only"
+// AdminSuffix ends the name of a key that is an admin. It is this, in
+// this case, at the very end of the name.
+const AdminSuffix = "/admin"
 
 // Grant is what the key list says about one key.
 type Grant struct {
-	// Name is the key's comment, or its fingerprint when it has none.
+	// Name is the key's comment, or its fingerprint when it has none. An
+	// admin's ends in AdminSuffix.
 	Name string
 	// Fingerprint is the SHA256 fingerprint of the key, as ssh-keygen -l
 	// prints it: "SHA256:…".
 	Fingerprint string
 	// ReadOnly is true for a key that may change nothing and read no
-	// Secret's contents.
+	// Secret's contents: every key whose name does not end in AdminSuffix.
 	ReadOnly bool
 }
 
@@ -55,8 +57,8 @@ type Set struct {
 
 // Parse reads a key list. It does not fail: a line it cannot accept is in
 // the rejected ones, and the others are in the set. A key that is on more
-// than one line is read-only if any of its lines says so, and has the
-// name of its first line.
+// than one line is read-only unless every line names it an admin, and has
+// the name of its first line.
 func Parse(r io.Reader) (*Set, []Rejected) {
 	set := &Set{grants: map[string]Grant{}}
 	var rejected []Rejected
@@ -138,26 +140,25 @@ func (s *Set) add(line []byte) (reason string) {
 	if _, ok := key.(*ssh.Certificate); ok {
 		return "certificates are not accepted: list the key itself"
 	}
-	readOnly := false
-	var unknown []string
-	for _, o := range options {
-		if strings.EqualFold(o, OptionReadOnly) {
-			readOnly = true
-		} else {
-			unknown = append(unknown, o)
+	if len(options) > 0 {
+		// The option read-only of earlier versions gets its own words: a
+		// list written for them means something else now.
+		for _, o := range options {
+			if strings.EqualFold(o, "read-only") {
+				return reasonReadOnlyOption
+			}
 		}
+		return "unknown option " + strings.Join(options, ", ")
 	}
-	if len(unknown) > 0 {
-		return "unknown option " + strings.Join(unknown, ", ")
-	}
-	// "ssh-ed25519 AAAA… read-only guest" would otherwise be a full key
-	// named "read-only guest". With the option, any comment will do.
-	if !readOnly && saysReadOnly(comment) {
-		return reasonReadOnlyComment
+	admin := strings.HasSuffix(comment, AdminSuffix)
+	// "dragan/Admin" is an admin written wrongly, not a read-only key that
+	// nobody notices.
+	if !admin && strings.HasSuffix(strings.ToLower(comment), AdminSuffix) {
+		return reasonAdminCase
 	}
 	wire := string(key.Marshal())
 	if g, ok := s.grants[wire]; ok {
-		g.ReadOnly = g.ReadOnly || readOnly
+		g.ReadOnly = g.ReadOnly || !admin
 		s.grants[wire] = g
 		return ""
 	}
@@ -166,51 +167,17 @@ func (s *Set) add(line []byte) (reason string) {
 	if name == "" {
 		name = fp
 	}
-	s.grants[wire] = Grant{Name: name, Fingerprint: fp, ReadOnly: readOnly}
+	s.grants[wire] = Grant{Name: name, Fingerprint: fp, ReadOnly: !admin}
 	return ""
 }
 
-// reasonReadOnlyComment is why a line without the option whose comment
-// says read-only is rejected.
-const reasonReadOnlyComment = "read-only is an option and goes in front of the key type; " +
-	"a full key's name must not hold read-only, readonly, read_only or read only"
+// reasonReadOnlyOption is why a line with the option read-only of kosh
+// before 0.3.0 is rejected.
+const reasonReadOnlyOption = "the option read-only is gone: a key is read-only unless its name ends in " + AdminSuffix
 
-// readOnlyWords are the ways read-only is written in a comment, as
-// saysReadOnly reads it.
-var readOnlyWords = []string{"read-only", "readonly", "read_only", "read only"}
-
-// saysReadOnly reports whether comment holds read-only, readonly,
-// read_only or read only anywhere, in any case, once its format
-// characters (Unicode's Cf: zero-width spaces, a byte order mark) are
-// dropped, every dash (Pd) is read as "-" and every run of white space
-// as one space.
-func saysReadOnly(comment string) bool {
-	var b strings.Builder
-	space := false
-	for _, r := range comment {
-		switch {
-		case unicode.Is(unicode.Cf, r):
-			continue
-		case unicode.IsSpace(r):
-			if !space {
-				b.WriteByte(' ')
-			}
-			space = true
-			continue
-		case unicode.Is(unicode.Pd, r):
-			r = '-'
-		}
-		space = false
-		b.WriteRune(unicode.ToLower(r))
-	}
-	s := b.String()
-	for _, w := range readOnlyWords {
-		if strings.Contains(s, w) {
-			return true
-		}
-	}
-	return false
-}
+// reasonAdminCase is why a line whose name ends in /admin in another
+// case is rejected.
+const reasonAdminCase = "the admin suffix is " + AdminSuffix + ", in lower case, at the end of the name"
 
 // Lookup returns the grant of key.
 func (s *Set) Lookup(key ssh.PublicKey) (Grant, bool) {
@@ -221,8 +188,8 @@ func (s *Set) Lookup(key ssh.PublicKey) (Grant, bool) {
 	return g, ok
 }
 
-// counts returns how many keys are full and how many read-only.
-func (s *Set) counts() (full, readOnly int) {
+// counts returns how many keys are admins and how many read-only.
+func (s *Set) counts() (admin, readOnly int) {
 	if s == nil {
 		return 0, 0
 	}
@@ -230,10 +197,10 @@ func (s *Set) counts() (full, readOnly int) {
 		if g.ReadOnly {
 			readOnly++
 		} else {
-			full++
+			admin++
 		}
 	}
-	return full, readOnly
+	return admin, readOnly
 }
 
 // Len returns the number of keys.
@@ -285,20 +252,26 @@ func Open(path string, log *slog.Logger) (*List, error) {
 	return l, nil
 }
 
+// msgNoAdmin is logged for a list of keys none of which is an admin.
+const msgNoAdmin = "key list has no admin: every session is read-only"
+
 // parseLogged parses data, the content of the file at path, and logs
-// what Open and Watch log of it: each rejected line, a list of no key,
-// and msg with the counts: of keys, full and read-only, and of lines
-// rejected.
+// what Open and Watch log of it: each rejected line, a list of no key, a
+// list of no admin, and msg with the counts: of keys, admins and
+// read-only, and of lines rejected.
 func parseLogged(path string, data []byte, log *slog.Logger, msg string) *Set {
 	set, rejected := Parse(bytes.NewReader(data))
 	for _, r := range rejected {
 		log.Warn("key list: a line is rejected and gives no access", "path", path, "line", r.Line, "reason", r.Reason)
 	}
-	if set.Len() == 0 {
+	admin, readOnly := set.counts()
+	switch {
+	case set.Len() == 0:
 		log.Warn("key list holds no key: nobody is accepted", "path", path)
+	case admin == 0:
+		log.Warn(msgNoAdmin, "path", path, "hint", "an admin's name ends in "+AdminSuffix)
 	}
-	full, readOnly := set.counts()
-	log.Info(msg, "path", path, "keys", set.Len(), "full", full, "read_only", readOnly, "rejected", len(rejected))
+	log.Info(msg, "path", path, "keys", set.Len(), "admin", admin, "read_only", readOnly, "rejected", len(rejected))
 	return set
 }
 

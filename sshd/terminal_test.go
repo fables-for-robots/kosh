@@ -1373,7 +1373,7 @@ func TestCommandThatDoesNotReturn(t *testing.T) {
 			rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
 				return strings.HasPrefix(r.Msg, "session did not end in time")
 			})
-			if !strings.Contains(rec.Msg, "did not return") || rec.Level.String() != "WARN" || rec.Attrs["key"] != "ann" || rec.Attrs["reason"] != e.reason {
+			if !strings.Contains(rec.Msg, "did not return") || rec.Level.String() != "WARN" || rec.Attrs["key"] != admin("ann") || rec.Attrs["reason"] != e.reason {
 				t.Errorf("the line %v does not say that the command did not return, or whose session it was and why it was ended", rec)
 			}
 			// The connection is closed, and the client's session with it.
@@ -1853,7 +1853,7 @@ func TestSessionEndsWhileTheClientDoesNotRead(t *testing.T) {
 			rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
 				return strings.HasPrefix(r.Msg, "session did not end in time")
 			})
-			if !strings.Contains(rec.Msg, "the client did not take what its command wrote") || rec.Attrs["key"] != "ann" || rec.Attrs["reason"] != MsgKeyRemoved {
+			if !strings.Contains(rec.Msg, "the client did not take what its command wrote") || rec.Attrs["key"] != admin("ann") || rec.Attrs["reason"] != MsgKeyRemoved {
 				t.Errorf("the line %v does not say that a write of the command's was waited for, or whose session it was and why it was ended", rec)
 			}
 			h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" && r.Attrs["reason"] == MsgKeyRemoved })

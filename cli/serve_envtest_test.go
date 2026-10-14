@@ -97,10 +97,10 @@ func newUser(t *testing.T, name string, readOnly bool) user {
 	if err != nil {
 		t.Fatal(err)
 	}
-	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
-	if readOnly {
-		line = keys.OptionReadOnly + " " + line
+	if !readOnly {
+		name += keys.AdminSuffix
 	}
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
 	return user{signer: signer, line: line}
 }
 
@@ -341,7 +341,7 @@ func TestServeEndToEnd(t *testing.T) {
 	for _, r := range k.log.records() {
 		if name, ok := r.Attrs["key"]; ok {
 			named++
-			if name != "alice@laptop" || r.Attrs["fingerprint"] != fp {
+			if name != "alice@laptop"+keys.AdminSuffix || r.Attrs["fingerprint"] != fp {
 				t.Errorf("%v: a key without its fingerprint %s", r, fp)
 			}
 		}

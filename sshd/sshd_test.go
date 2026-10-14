@@ -55,7 +55,7 @@ func TestAcceptedKeyGetsTheProgram(t *testing.T) {
 		t.Errorf("Sessions() = %d with one program running, want 1", n)
 	}
 	rec := h.log.waitFor(t, "of the start of the session", func(r logRecord) bool { return r.Msg == "session start" })
-	if rec.Attrs["key"] != "alice" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(key.PublicKey()) ||
+	if rec.Attrs["key"] != admin("alice") || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(key.PublicKey()) ||
 		rec.Attrs["read_only"] != "false" || rec.Attrs["transport"] != "tcp" || rec.Attrs["remote"] == "" {
 		t.Errorf("the start of the session is logged as %v", rec)
 	}
@@ -225,7 +225,7 @@ func TestNoTerminal(t *testing.T) {
 	if got := tm.stderr.String(); got != MsgNeedsTerminal+"\n" {
 		t.Errorf("error stream %q, want %q", got, MsgNeedsTerminal+"\n")
 	}
-	h.refusalLogged(MsgNeedsTerminal, "alice")
+	h.refusalLogged(MsgNeedsTerminal, admin("alice"))
 	if h.models.Load() != 0 {
 		t.Error("a model was made")
 	}
@@ -234,7 +234,7 @@ func TestNoTerminal(t *testing.T) {
 func TestCommandIsRefused(t *testing.T) {
 	h := newHarness(t)
 	cl := h.dial(h.key("alice", false), "kosh")
-	defer h.refusalLogged(MsgNoCommands, "alice")
+	defer h.refusalLogged(MsgNoCommands, admin("alice"))
 	for _, pty := range []bool{false, true} {
 		tm := openSession(t, cl, pty, "ls")
 		if st := tm.exit(); st != 1 {

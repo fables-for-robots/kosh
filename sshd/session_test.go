@@ -94,7 +94,7 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 		t.Errorf("the removed key's session ends with %q, want the line %q", out[max(0, len(out)-80):], MsgKeyRemoved)
 	}
 	rec := h.log.waitFor(t, "of the end of alice's session", func(r logRecord) bool {
-		return r.Msg == "session end" && r.Attrs["key"] == "alice"
+		return r.Msg == "session end" && r.Attrs["key"] == admin("alice")
 	})
 	if rec.Attrs["reason"] != MsgKeyRemoved || rec.Attrs["duration"] == "" || rec.Attrs["transport"] != "tcp" ||
 		rec.Attrs["remote"] == "" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) || rec.Attrs["read_only"] != "false" {
@@ -235,7 +235,7 @@ func TestReplaceDoesNotBlockOnSessions(t *testing.T) {
 	rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
 		return strings.HasPrefix(r.Msg, "session did not end in time")
 	})
-	if rec.Attrs["key"] != "alice" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) {
+	if rec.Attrs["key"] != admin("alice") || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) {
 		t.Errorf("the line %v does not name the key by its name and fingerprint", rec)
 	}
 }

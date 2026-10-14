@@ -67,21 +67,93 @@ func noRejected(t *testing.T, rejected []Rejected) {
 	}
 }
 
-func TestParseFullAndReadOnly(t *testing.T) {
-	full, fullLine := newKey(t)
+func TestParseAdminAndReadOnly(t *testing.T) {
+	admin, adminLine := newKey(t)
 	ro, roLine := newKey(t)
-	set, rejected := parseString(fullLine + " dragan@mac\nread-only " + roLine + " guest@laptop\n")
+	set, rejected := parseString(adminLine + " dragan@mac/admin\n" + roLine + " guest@laptop\n")
 	noRejected(t, rejected)
 	if set.Len() != 2 {
 		t.Fatalf("Len = %d, want 2", set.Len())
 	}
-	g := mustGrant(t, set, full)
-	if g.ReadOnly || g.Name != "dragan@mac" || g.Fingerprint != ssh.FingerprintSHA256(full) {
-		t.Errorf("full grant = %+v", g)
+	g := mustGrant(t, set, admin)
+	if g.ReadOnly || g.Name != "dragan@mac/admin" || g.Fingerprint != ssh.FingerprintSHA256(admin) {
+		t.Errorf("admin grant = %+v", g)
 	}
 	g = mustGrant(t, set, ro)
 	if !g.ReadOnly || g.Name != "guest@laptop" || g.Fingerprint != ssh.FingerprintSHA256(ro) {
 		t.Errorf("read-only grant = %+v", g)
+	}
+}
+
+// The suffix is /admin, exactly, at the very end of the name. A name that
+// ends in it in another case is a mistake that is pointed out, not a
+// read-only key that nobody notices; anything else is a read-only key.
+func TestParseAdminSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		comment  string
+		admin    bool
+		rejected bool
+		why      string
+	}{
+		{"dragan/admin", true, false, "the suffix"},
+		{"mic92/key-1/admin", true, false, "after another slash"},
+		{"/admin", true, false, "nothing before it"},
+		{"Dragan's  old laptop/admin", true, false, "spaces in the name"},
+		{"dragan /admin", true, false, "a space before the slash: it is still the end of the name"},
+		{"dragan/admin  ", true, false, "trailing spaces are not part of a name"},
+		{"dragan", false, false, "no suffix"},
+		{"admin", false, false, "the word without the slash"},
+		{"dragan-admin", false, false, "with a dash"},
+		{"dragan_admin", false, false, "with an underscore"},
+		{"dragan@admin", false, false, "with an at"},
+		{"dragan/admin/", false, false, "a slash after it"},
+		{"dragan/admin laptop", false, false, "not at the end"},
+		{"dragan/administrator", false, false, "a longer word"},
+		{"dragan/admin\u200b", false, false, "a zero-width space after it: not the end, and not pointed out"},
+		{"dragan\u2215admin", false, false, "a division slash, not /"},
+		{"dragan/Admin", false, true, "in another case"},
+		{"dragan/ADMIN", false, true, "in capitals"},
+		{"DRAGAN/ADMIN", false, true, "all in capitals"},
+	} {
+		t.Run(tc.comment, func(t *testing.T) {
+			comment, err := strconv.Unquote(`"` + tc.comment + `"`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, line := newKey(t)
+			set, rejected := parseString(line + " " + comment + "\n")
+			if tc.rejected {
+				if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reasonAdminCase {
+					t.Fatalf("%s: rejected = %+v, want line 1: %s", tc.why, rejected, reasonAdminCase)
+				}
+				mustNotGrant(t, set, key)
+				return
+			}
+			noRejected(t, rejected)
+			g := mustGrant(t, set, key)
+			if g.ReadOnly == tc.admin {
+				t.Errorf("%s: ReadOnly = %v, want %v", tc.why, g.ReadOnly, !tc.admin)
+			}
+			if want := strings.TrimSpace(comment); g.Name != want {
+				t.Errorf("%s: Name = %q, want %q", tc.why, g.Name, want)
+			}
+		})
+	}
+}
+
+// The option read-only of earlier versions is refused, so that a list
+// written for them is not read as something else without a word: its
+// keys without /admin are read-only now whatever it says.
+func TestParseRejectsTheReadOnlyOption(t *testing.T) {
+	for _, opt := range []string{"read-only", "Read-Only", "READ-ONLY", "read-only,no-pty"} {
+		t.Run(opt, func(t *testing.T) {
+			key, line := newKey(t)
+			set, rejected := parseString(opt + " " + line + " guest\n")
+			if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reasonReadOnlyOption {
+				t.Fatalf("rejected = %+v, want line 1: %s", rejected, reasonReadOnlyOption)
+			}
+			mustNotGrant(t, set, key)
+		})
 	}
 }
 
@@ -99,7 +171,6 @@ func TestParseRejectsUnknownOptions(t *testing.T) {
 		{"readonly", "readonly"},
 		{"no-pty", "no-pty"},
 		{`command="echo hi"`, `command="echo hi"`},
-		{"read-only,no-pty", "no-pty"},
 		{"restrict", "restrict"},
 	} {
 		t.Run(tc.options, func(t *testing.T) {
@@ -117,19 +188,6 @@ func TestParseRejectsUnknownOptions(t *testing.T) {
 			mustNotGrant(t, set, key)
 			if set.Len() != 0 {
 				t.Errorf("Len = %d, want 0", set.Len())
-			}
-		})
-	}
-}
-
-func TestParseReadOnlyInAnyCase(t *testing.T) {
-	for _, opt := range []string{"Read-Only", "READ-ONLY"} {
-		t.Run(opt, func(t *testing.T) {
-			key, line := newKey(t)
-			set, rejected := parseString(opt + " " + line + "\n")
-			noRejected(t, rejected)
-			if !mustGrant(t, set, key).ReadOnly {
-				t.Errorf("%s gave a full key", opt)
 			}
 		})
 	}
@@ -189,25 +247,33 @@ func TestParseCommentWithSpaces(t *testing.T) {
 
 func TestParseDuplicateKey(t *testing.T) {
 	for _, tc := range []struct{ name, first, second string }{
-		{"full then read-only", "", "read-only "},
-		{"read-only then full", "read-only ", ""},
+		{"admin then read-only", "first/admin", "second"},
+		{"read-only then admin", "first", "second/admin"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			key, line := newKey(t)
-			set, rejected := parseString(tc.first + line + " first\n" + tc.second + line + " second\n")
+			set, rejected := parseString(line + " " + tc.first + "\n" + line + " " + tc.second + "\n")
 			noRejected(t, rejected)
 			if set.Len() != 1 {
 				t.Errorf("Len = %d, want 1", set.Len())
 			}
 			g := mustGrant(t, set, key)
 			if !g.ReadOnly {
-				t.Error("full, want read-only")
+				t.Error("admin, want read-only")
 			}
-			if g.Name != "first" {
-				t.Errorf("Name = %q, want first", g.Name)
+			if g.Name != tc.first {
+				t.Errorf("Name = %q, want %q", g.Name, tc.first)
 			}
 		})
 	}
+	t.Run("admin twice", func(t *testing.T) {
+		key, line := newKey(t)
+		set, rejected := parseString(line + " first/admin\n" + line + " second/admin\n")
+		noRejected(t, rejected)
+		if g := mustGrant(t, set, key); g.ReadOnly || g.Name != "first/admin" {
+			t.Errorf("grant = %+v, want admin named first/admin", g)
+		}
+	})
 }
 
 func TestParseAsPeopleWriteThem(t *testing.T) {
@@ -229,9 +295,9 @@ func TestParseAsPeopleWriteThem(t *testing.T) {
 	t.Run("CRLF", func(t *testing.T) {
 		k1, l1 := newKey(t)
 		k2, l2 := newKey(t)
-		set, rejected := parseString("# keys\r\n\r\n" + l1 + " one\r\nread-only " + l2 + " two\r\n")
+		set, rejected := parseString("# keys\r\n\r\n" + l1 + " one/admin\r\n" + l2 + " two\r\n")
 		noRejected(t, rejected)
-		if g := mustGrant(t, set, k1); g.Name != "one" || g.ReadOnly {
+		if g := mustGrant(t, set, k1); g.Name != "one/admin" || g.ReadOnly {
 			t.Errorf("first = %+v", g)
 		}
 		if g := mustGrant(t, set, k2); g.Name != "two" || !g.ReadOnly {
@@ -241,7 +307,7 @@ func TestParseAsPeopleWriteThem(t *testing.T) {
 	t.Run("no final line feed", func(t *testing.T) {
 		k1, l1 := newKey(t)
 		k2, l2 := newKey(t)
-		set, rejected := parseString(l1 + " one\nread-only " + l2 + " two")
+		set, rejected := parseString(l1 + " one/admin\n" + l2 + " two")
 		noRejected(t, rejected)
 		mustGrant(t, set, k1)
 		if g := mustGrant(t, set, k2); g.Name != "two" || !g.ReadOnly {
@@ -356,14 +422,14 @@ func newCertificate(t *testing.T, key ssh.PublicKey) string {
 
 func TestParseRejectsCertificates(t *testing.T) {
 	const reason = "certificates are not accepted: list the key itself"
-	for _, options := range []string{"", "read-only "} {
-		t.Run("options "+strings.TrimSpace(options), func(t *testing.T) {
+	for _, comment := range []string{"guest", "guest/admin"} {
+		t.Run(comment, func(t *testing.T) {
 			key, _ := newKey(t)
 			line := newCertificate(t, key)
 			if !strings.HasPrefix(line, "ssh-ed25519-cert-v01@openssh.com ") {
 				t.Fatalf("not a certificate line: %.60s", line)
 			}
-			set, rejected := parseString(options + line + " guest\n")
+			set, rejected := parseString(line + " " + comment + "\n")
 			if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reason {
 				t.Fatalf("rejected = %+v, want line 1: %s", rejected, reason)
 			}
@@ -375,66 +441,12 @@ func TestParseRejectsCertificates(t *testing.T) {
 	}
 }
 
-func TestParseReadOnlyAsComment(t *testing.T) {
-	const reason = "read-only is an option and goes in front of the key type; a full key's name must not hold read-only, readonly, read_only or read only"
-	for _, tc := range []struct {
-		line     string // with KEY for the key
-		rejected bool
-		why      string
-	}{
-		{"KEY read-only", true, "the comment is the option"},
-		{"KEY READ-ONLY guest", true, "in any case"},
-		{"KEY read-only\tguest", true, "followed by a tab"},
-		{"KEY  Read-Only  guest", true, "in mixed case"},
-		{"KEY (read-only) guest", true, "in brackets"},
-		{"KEY guest read-only", true, "after the name"},
-		{"KEY readonly", true, "without the dash"},
-		{"KEY read_only bot", true, "with an underscore"},
-		{"KEY read only", true, "with a space"},
-		{"KEY read\u2011only", true, "with a non-breaking hyphen, a dash (Pd)"},
-		{"KEY read\u2014only", true, "with an em dash (Pd)"},
-		{"KEY re\u200bad-only", true, "with a zero-width space, a format character (Cf)"},
-		{"KEY \ufeffread-only", true, "after a byte order mark (Cf)"},
-		{"KEY bob's read-only laptop", true, "anywhere in the comment"},
-		{"KEY read-only-bot", true, "as part of a word: read-only is in it"},
-		{"KEY read-onlyguest", true, "as part of a word"},
-		{"KEY thread-only-ish", true, "th + read-only + -ish: the words are in it, and the rule does not look for word boundaries"},
-		{"KEY reader", false, "read, but not read-only"},
-		{"KEY read-write", false, "read, but not read-only"},
-		{"KEY only reads", false, "the words, but not in that order"},
-		{"read-only KEY read-only", false, "the option is there: any comment"},
-		{"read-only KEY guest read-only", false, "the option is there: any comment"},
-		{"READ-ONLY KEY (readonly) guest", false, "the option is there: any comment"},
-	} {
-		t.Run(tc.line, func(t *testing.T) {
-			line, err := strconv.Unquote(`"` + tc.line + `"`)
-			if err != nil {
-				t.Fatal(err)
-			}
-			key, keyLine := newKey(t)
-			set, rejected := parseString(strings.Replace(line, "KEY", keyLine, 1) + "\n")
-			if !tc.rejected {
-				noRejected(t, rejected)
-				g := mustGrant(t, set, key)
-				if strings.HasPrefix(strings.ToLower(line), "read-only ") && !g.ReadOnly {
-					t.Errorf("%s: the key is full", tc.why)
-				}
-				return
-			}
-			if len(rejected) != 1 || rejected[0].Reason != reason {
-				t.Fatalf("%s: rejected = %+v, want: %s", tc.why, rejected, reason)
-			}
-			mustNotGrant(t, set, key)
-		})
-	}
-}
-
-func TestParseCommaOnlyOptionsIsFull(t *testing.T) {
+func TestParseCommaOnlyOptionsIsAccepted(t *testing.T) {
 	key, line := newKey(t)
-	set, rejected := parseString(", " + line + " c\n")
+	set, rejected := parseString(", " + line + " c/admin\n")
 	noRejected(t, rejected)
-	if g := mustGrant(t, set, key); g.ReadOnly || g.Name != "c" {
-		t.Errorf("grant = %+v, want a full key named c", g)
+	if g := mustGrant(t, set, key); g.ReadOnly || g.Name != "c/admin" {
+		t.Errorf("grant = %+v, want an admin named c/admin", g)
 	}
 }
 
@@ -508,7 +520,7 @@ func TestListOnChangeMayUseTheList(t *testing.T) {
 func TestListConcurrentUse(t *testing.T) {
 	key, line := newKey(t)
 	full, _ := parseString(line + "\n")
-	ro, _ := parseString("read-only " + line + "\n")
+	ro, _ := parseString(line + " guest\n")
 	l := NewList(full)
 	var wg sync.WaitGroup
 	for i := range 8 {

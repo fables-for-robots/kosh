@@ -129,7 +129,7 @@ func TestOpenLogsRejectedLinesAndCount(t *testing.T) {
 	key, line := newKey(t)
 	_, other := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, line+" me\nno-pty "+other+"\n# fine\nnot a key\n")
+	writeFile(t, path, line+" me/admin\nno-pty "+other+"\n# fine\nnot a key\n")
 	log, c := newLog()
 	l, err := Open(path, log)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestReloadCountsBothKinds(t *testing.T) {
 	_, b := newKey(t)
 	_, c := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, a+" a\n"+b+" b\nread-only "+c+" c\n")
+	writeFile(t, path, a+" a/admin\n"+b+" b/admin\n"+c+" c\n")
 	log, rec := newLog()
 	if _, err := Open(path, log); err != nil {
 		t.Fatal(err)
@@ -167,10 +167,30 @@ func TestReloadCountsBothKinds(t *testing.T) {
 	if len(infos) != 1 {
 		t.Fatalf("info = %+v, want one line", infos)
 	}
-	for k, want := range map[string]string{"keys": "3", "full": "2", "read_only": "1"} {
+	for k, want := range map[string]string{"keys": "3", "admin": "2", "read_only": "1"} {
 		if got := infos[0].attrs[k]; got != want {
 			t.Errorf("%s = %q, want %s", k, got, want)
 		}
+	}
+	if warns := rec.at(slog.LevelWarn); len(warns) != 0 {
+		t.Errorf("warnings = %+v, want none: the list has admins", warns)
+	}
+}
+
+// A list without an admin is most likely one written for a version where
+// a key was full unless marked: it is accepted, read-only throughout, and
+// the log says so.
+func TestOpenWarnsWithoutAnAdmin(t *testing.T) {
+	_, a := newKey(t)
+	path := filepath.Join(t.TempDir(), "authorized_keys")
+	writeFile(t, path, a+" a\n")
+	log, rec := newLog()
+	if _, err := Open(path, log); err != nil {
+		t.Fatal(err)
+	}
+	warns := rec.at(slog.LevelWarn)
+	if len(warns) != 1 || warns[0].msg != msgNoAdmin {
+		t.Errorf("warnings = %+v, want one: %s", warns, msgNoAdmin)
 	}
 }
 
@@ -206,7 +226,7 @@ func TestWatchTakesOverAChangedFile(t *testing.T) {
 	k1, l1 := newKey(t)
 	k2, l2 := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, l1+"\n")
+	writeFile(t, path, l1+" one/admin\n")
 	log, c := newLog()
 	l, err := Open(path, log)
 	if err != nil {
@@ -217,7 +237,7 @@ func TestWatchTakesOverAChangedFile(t *testing.T) {
 	if _, ok := l.Lookup(k2); ok {
 		t.Fatal("k2 found before it is in the file")
 	}
-	writeFile(t, path, l1+"\nread-only "+l2+" two\nrestrict "+l2+"\n")
+	writeFile(t, path, l1+" one/admin\n"+l2+" two\nrestrict "+l2+"\n")
 	waitFor(t, "k2", func() bool { _, ok := l.Lookup(k2); return ok })
 	waitReads(t, l)
 	if n := changes.Load(); n != 1 {

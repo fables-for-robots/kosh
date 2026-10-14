@@ -47,7 +47,7 @@ func TestPanicInUpdateEndsOnlyThatSession(t *testing.T) {
 	ta.waitFor(testWord)
 	tb.waitFor(testWord)
 	ta.press("p")
-	crashes(t, h, ta, "alice", "Update")
+	crashes(t, h, ta, admin("alice"), "Update")
 	stillAnswers(t, tb)
 }
 
@@ -59,7 +59,7 @@ func TestPanicInViewAndInit(t *testing.T) {
 		ta.waitFor(testWord)
 		tb.waitFor(testWord)
 		ta.press("v")
-		crashes(t, h, ta, "alice", "View")
+		crashes(t, h, ta, admin("alice"), "View")
 		stillAnswers(t, tb)
 	})
 	t.Run("Init", func(t *testing.T) {
@@ -68,7 +68,7 @@ func TestPanicInViewAndInit(t *testing.T) {
 		tb := openTerm(t, h.dial(bob, "kosh"))
 		tb.waitFor(testWord)
 		ta := openTerm(t, h.dial(h.key(panicInitName, false), "kosh"))
-		crashes(t, h, ta, panicInitName, "Init")
+		crashes(t, h, ta, admin(panicInitName), "Init")
 		stillAnswers(t, tb)
 	})
 }
@@ -89,7 +89,7 @@ func TestPanicInACommand(t *testing.T) {
 		t.Errorf("the session did not end with %q", MsgCrashed)
 	}
 	h.log.waitFor(t, "of the panic in a command", func(r logRecord) bool {
-		return r.Level == slog.LevelError && r.Attrs["key"] == "alice" && strings.Contains(r.Attrs["err"], "panic")
+		return r.Level == slog.LevelError && r.Attrs["key"] == admin("alice") && strings.Contains(r.Attrs["err"], "panic")
 	})
 	stillAnswers(t, tb)
 }
