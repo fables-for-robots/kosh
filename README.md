@@ -318,6 +318,11 @@ The chart refuses to install without state (`state.existingSecret` or
   the API offers no way to end them. The shell's end line in kosh's log
   then says `ended="the session ended"`, with the pod and the container,
   so that whoever removes a key knows where to look.
+- **A terminal that sends kosh 64 KiB that are no key, no paste and no
+  report loses its session**, with a message that says so. No terminal
+  we know does; it is the limit on what a client's input can make kosh
+  hold. A paste into kosh's own UI is cut at 256 KiB. Neither applies to
+  what is typed or pasted in a shell.
 - **A key's 17th connection is closed without a word.** A key has at most
   16 open connections; the next is closed without a message to the client
   (kosh's log says why). Many connections opened within a few seconds can

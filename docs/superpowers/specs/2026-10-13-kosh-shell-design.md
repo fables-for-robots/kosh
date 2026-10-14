@@ -228,6 +228,27 @@ program takes no message while a command runs. Measured: 1,200
 hand-overs with typing across both seams, no byte lost or out of order,
 about a third of a millisecond each.
 
+**After a command.** Whatever the command left the terminal in is
+undone before the UI draws again and before a session's last message:
+one fixed sequence that leaves the alternate screen, takes the scroll
+region, the attributes and the character set back, and turns off the
+mouse, the paste and the keyboard modes. It does not clear the screen
+and does not move the cursor: the next shell's output, and the user's
+own prompt when kosh is left, come below what the last shell printed.
+
+**What the UI's input may hold.** Since `sshd` reads the channel, it
+also bounds what a client's bytes can make a session hold, which the UI
+library does not (it gathers a paste, and a sequence that does not end,
+for as long as bytes come). A bracketed paste is cut at 256 KiB. A
+session whose input was 64 KiB of which the library made no key, no
+paste and no report is ended, with `kosh: the terminal sent what is no
+key, no paste and no report, and too much of it; this session was
+closed` and a warning in the log that names the key. And of one control
+sequence's parameter separators 24 are passed on: the library's parser
+has room for 32 parameters and writes the 33rd beyond it, which would
+end kosh for every session. None of this touches a shell's input, which
+goes to the container as it comes.
+
 ## 6. `tui`
 
 - A binding `s`, `Shell`, for pods and for the containers of a pod,
@@ -287,6 +308,8 @@ about a third of a millisecond each.
 - **What it holds.** One stream and a few goroutines per shell, one
   shell per session; nothing is buffered beyond the stream's own
   windows.
+- **What a client can make kosh hold or do with its bytes** is bounded
+  whatever it sends, for a read-only key as for a full one: see §5.
 - kosh still starts no process of its own, and nothing new is exposed.
 
 ## 8. The chart and the README
