@@ -200,10 +200,8 @@ level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=sca
 A shell in a pod is an action: admins only, into whatever container
 the ServiceAccount's role allows. A narrower role needs `get` and
 `create` on `pods/exec` for it; without them the API refuses, and kosh
-says so. For the CPU and memory of [Metrics](#metrics) it needs `get`
-and `list` on `pods` and `nodes` in the group `metrics.k8s.io`. kosh logs
-who opened a shell in what, with which command, and how and when it
-ended:
+says so. kosh logs who opened a shell in what, with which command, and
+how and when it ended:
 
 ```
 level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=exec object=pods/default/marker phase=start container=marker command="\"sh\" \"-c\" \"command -v bash >/dev/null && exec bash || exec sh\""
@@ -212,6 +210,9 @@ level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=exe
 
 What is typed in a shell, and what it prints, is never logged, and
 nothing of it is recorded.
+
+For the CPU and memory of [Metrics](#metrics), a narrower role needs
+`get` and `list` on `pods` and `nodes` in the group `metrics.k8s.io`.
 
 ## Using it
 
@@ -313,11 +314,12 @@ removal, in sessions already open.
   ephemeral container; in `CPU`, `%CPU`, `MEM` and `%MEM` of a node it
   did not cover (`CPU/A` and `MEM/A` are the node's own);
 - in a percentage of requests or limits that are 0;
-- in every cell and in both lines while the API is served and the
-  reading fails: metrics-server is down, its APIService is not
-  available, or kosh's ServiceAccount may not read it. kosh's log says
-  `metrics could not be read` once, with why, and `metrics can be read
-  again` when a reading works again;
+- in every cell but a node's `CPU/A` and `MEM/A` (the node's own), and
+  in both lines, while the API is served and the reading fails:
+  metrics-server is down, its APIService is not available, or kosh's
+  ServiceAccount may not read it. kosh's log says `metrics could not be
+  read` once, with why, and `metrics can be read again` when a reading
+  works again;
 - in the lines until the first reading has come.
 
 kosh reads the metrics with its ServiceAccount: a role narrower than

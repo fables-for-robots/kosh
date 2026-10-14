@@ -54,9 +54,11 @@ IROH_SSH_SHA256=6e39a6b22f14d683598600350ca642d3b67fd0b0a2f2a7b29928ad6cdf032826
 IROH_SSH_REPO=https://github.com/rustonbsd/iroh-ssh
 IROH_SSH_COMMIT=82e99719f8b4e44c69622140f4acb25e5ae54184
 
-# metrics-server, the released manifest of the version pinned here.
+# metrics-server: the released manifest of the version pinned here,
+# checked against its SHA-256.
 METRICS_SERVER_VERSION=v0.7.2
 METRICS_SERVER=https://github.com/kubernetes-sigs/metrics-server/releases/download/$METRICS_SERVER_VERSION/components.yaml
+METRICS_SERVER_SHA256=f103539a54ed72efe66616afc74a8bfaed651703cb3918797599046af5617441
 
 NAMESPACE=kosh
 RELEASE=kosh
@@ -147,13 +149,16 @@ else
 fi
 
 # 2. A cluster of its own, with the image in it, and the images the
-# test's objects run, so that nothing is pulled while the tests run.
+# test's objects and metrics-server run, so that nothing is pulled while
+# the tests run.
 step "the kind cluster $CLUSTER"
 CREATED_CLUSTER=1
 kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
 kind load docker-image "$TAG" --name "$CLUSTER"
+curl -fsSL --retry 3 -o "$WORK/metrics-server.yaml" "$METRICS_SERVER"
+echo "$METRICS_SERVER_SHA256  $WORK/metrics-server.yaml" | sha256sum -c --quiet - || fail "$METRICS_SERVER is not the one this script knows"
 # A registry that does not answer at once is tried again, three times.
-sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml | while read -r image; do
+sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml "$WORK/metrics-server.yaml" | while read -r image; do
   for try in 1 2 3; do
     docker exec "$CLUSTER-control-plane" crictl pull "$image" >/dev/null && break
     [ "$try" != 3 ] || fail "$image could not be pulled into the node"
@@ -167,7 +172,7 @@ done
 # their own signing, as kind's docs have it. Before kosh, whose
 # discovery at start then finds the metrics API.
 step "metrics-server $METRICS_SERVER_VERSION"
-kubectl apply -f "$METRICS_SERVER" >/dev/null
+kubectl apply -f "$WORK/metrics-server.yaml" >/dev/null
 kubectl --namespace kube-system patch deployment metrics-server --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
 kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=180s
@@ -288,7 +293,6 @@ KOSH_E2E_SSH=127.0.0.1:$port \
   KOSH_E2E_HOST_KEY=$WORK/host_key.pub \
   KOSH_E2E_ENDPOINT=$ENDPOINT \
   KOSH_E2E_IROH_SSH=$iroh_ssh \
-  KOSH_E2E_METRICS_SERVER=$METRICS_SERVER \
   go test -tags e2e -count=1 -timeout "$deadline" -v ${KOSH_E2E_RUN:+-run "$KOSH_E2E_RUN"} ./e2e/
 
 echo "all checks passed"

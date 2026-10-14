@@ -1983,20 +1983,62 @@ func metricsAPIUp(t *testing.T) {
 	kubectl(t, "wait", "--for=condition=Available", "apiservice/v1beta1.metrics.k8s.io", "--timeout=180s")
 }
 
+// saveMetricsAPI writes the APIService of the metrics API, as the
+// cluster has it now and without what the API server keeps of it, to a
+// file that kubectl apply makes it again from, and returns the file.
+func saveMetricsAPI(t *testing.T) string {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(kubectl(t, "get", "apiservice", "v1beta1.metrics.k8s.io", "-o", "json")), &obj); err != nil {
+		t.Fatal(err)
+	}
+	delete(obj, "status")
+	meta, _ := obj["metadata"].(map[string]any)
+	for _, f := range []string{"managedFields", "resourceVersion", "uid", "creationTimestamp", "generation"} {
+		delete(meta, f)
+	}
+	if ann, ok := meta["annotations"].(map[string]any); ok {
+		delete(ann, "kubectl.kubernetes.io/last-applied-configuration")
+	}
+	b, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "apiservice.json")
+	if err := os.WriteFile(file, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+// metricsServer returns the generation of the Deployment metrics-server
+// and its container's arguments.
+func metricsServer(t *testing.T) (generation, args string) {
+	t.Helper()
+	out := kubectl(t, "--namespace", "kube-system", "get", "deployment", "metrics-server",
+		"-o", "jsonpath={.metadata.generation} {.spec.template.spec.containers[0].args}")
+	generation, args, _ = strings.Cut(out, " ")
+	return generation, args
+}
+
 // The columns and the header's lines exist while the cluster serves the
 // metrics API: they go within discovery's interval of its removal and
-// come back within it of its return. Up to 12 minutes, so only with
-// KOSH_E2E_SLOW=1.
+// come back within it of its return. The APIService alone is taken away
+// and made again: metrics-server itself runs on, untouched. Up to 12
+// minutes, so only with KOSH_E2E_SLOW=1.
 func TestMetricsColumnsFollowTheAPI(t *testing.T) {
 	inCluster(t)
 	if os.Getenv("KOSH_E2E_SLOW") != "1" {
 		t.Skip("KOSH_E2E_SLOW=1: it waits for discovery, every 5 minutes, twice")
 	}
-	need(t, "KOSH_E2E_METRICS_SERVER")
-	manifest := os.Getenv("KOSH_E2E_METRICS_SERVER")
+	saved := saveMetricsAPI(t)
+	generation, args := metricsServer(t)
+	if !strings.Contains(args, "--kubelet-insecure-tls") {
+		t.Fatalf("metrics-server runs without --kubelet-insecure-tls: %s", args)
+	}
 	// The test puts the API back however it ends.
 	t.Cleanup(func() {
-		kubectl(t, "apply", "-f", manifest)
+		kubectl(t, "apply", "-f", saved)
 		metricsAPIUp(t)
 	})
 
@@ -2019,15 +2061,22 @@ func TestMetricsColumnsFollowTheAPI(t *testing.T) {
 	t.Logf("the header's lines went %v after the APIService was deleted", time.Since(start).Round(time.Second))
 
 	start = time.Now()
-	kubectl(t, "apply", "-f", manifest)
+	kubectl(t, "apply", "-f", saved)
 	c.waitUntil(6*time.Minute, "the column CPU back", func(lines []string) bool {
 		return hasColumn(lines, "CPU") && row(lines, "marker", "Running") != ""
 	})
-	t.Logf("the column CPU came back %v after the components were applied", time.Since(start).Round(time.Second))
+	t.Logf("the column CPU came back %v after the APIService was made again", time.Since(start).Round(time.Second))
 	c.waitUntil(90*time.Second, "the header's CPU: and MEM: back, with a percentage", func(lines []string) bool {
 		return len(usageLines(lines)) == 2
 	})
-	t.Logf("the header's lines came back, with a percentage, %v after the components were applied", time.Since(start).Round(time.Second))
+	t.Logf("the header's lines came back, with a percentage, %v after the APIService was made again", time.Since(start).Round(time.Second))
+
+	// What came back is the metrics-server that was there: its Deployment
+	// was not changed, keeps its flag, and has no rollout under way.
+	if g, a := metricsServer(t); g != generation || !strings.Contains(a, "--kubelet-insecure-tls") {
+		t.Errorf("metrics-server's Deployment changed: generation %s, arguments %s; before: generation %s, arguments %s", g, a, generation, args)
+	}
+	kubectl(t, "--namespace", "kube-system", "rollout", "status", "deployment/metrics-server", "--timeout=60s")
 }
 
 // setKeys installs the chart again with the key list of lines, keeping
