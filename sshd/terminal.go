@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,9 @@ func (sess *session) handover(run func(context.Context, Terminal) error, done fu
 		// program's reader is given the mark and its end.
 		in, drained, told := sess.in.give(busy)
 		if in == nil {
+			if sess.over() {
+				return tell(ErrSessionEnded)
+			}
 			return tell(ErrTerminalBusy)
 		}
 		// The mark arrives when the model has every key that was read
@@ -115,15 +119,40 @@ const minTurn = 10 * time.Millisecond
 // leaves is its own business: a full-screen program that was killed, or
 // a binary file printed, leaves modes that Bubble Tea, which sets only
 // what the program needs, would draw the program in for the rest of the
-// session. Each part undoes one thing; none clears the screen or moves
-// the cursor.
+// session.
+//
+// The screen is not cleared, and the cursor stays where the command left
+// it on the normal screen, so that what is printed next, the next
+// command's output or the session's last message, comes below what is
+// there. Three of the things to undo move the cursor by themselves, and
+// are written so that they do not:
+//
+//   - Leaving the alternate screen restores the cursor that was saved
+//     for the normal screen. When the command left the terminal on the
+//     normal screen, that is a cursor Bubble Tea saved long ago: so the
+//     cursor is saved first, and restored to where it is. (When the
+//     command left the alternate screen on, the cursor saved here is
+//     that screen's, and the one restored is where the command was on
+//     the normal screen when it left it: terminals that keep one saved
+//     cursor for both screens put it where it was on the alternate one.)
+//   - Setting the margins homes the cursor: so it is done between a
+//     save and a restore.
+//   - Resetting origin mode homes the cursor too, and the restore before
+//     would bring the mode back as it brings back everything saved with
+//     the cursor: so origin mode is left as it is. With the margins at
+//     the screen's edges it changes nothing.
+//
+// What a restore of the cursor brings back with it, attributes, the
+// character set and autowrap, is undone after the last restore.
 const terminalReset = "" +
+	"\x1b7" + // save the cursor, for the restore that leaving the alternate screen does
 	"\x1b[?1049l" + // the normal screen, not the alternate one
+	"\x1b7" + // save the cursor,
+	"\x1b[r" + // no scroll region: the margins are the screen's,
+	"\x1b8" + // and the cursor back from the home that puts it in
 	"\x1b[0m" + // no colour, no attribute
 	"\x1b(B" + // G0 is ASCII, not the line-drawing set
 	"\x0f" + // and G0 is the set in use (SI)
-	"\x1b[r" + // no scroll region: the margins are the screen's
-	"\x1b[?6l" + // positions count from the screen's corner, not the region's
 	"\x1b[?7h" + // a line that is full wraps
 	"\x1b[4l" + // characters replace, they are not inserted
 	"\x1b[?1l" + // the cursor keys send their normal sequences
@@ -258,8 +287,23 @@ func (g *gate) close() {
 // which it replaces: a suspension becomes a resumption, since there is
 // no process to suspend. And it takes drainMark out, whoever sent it:
 // the model is never given it.
+//
+// It is also where the session sees what the library makes of the
+// program's input: every event of the library's reader comes through
+// here, in the order it was read. The session counts what it has handed
+// that reader since the last of them (see input.unanswered). And it is
+// where the program's end is held up until its reader has ended (see
+// wind): a quit that comes before that is taken out and sent again
+// after, and what the reader makes meanwhile goes to nobody.
 func (sess *session) filter(_ tea.Model, msg tea.Msg) tea.Msg {
+	input := fromInput(msg)
+	if input {
+		sess.in.eventSeen()
+	}
 	switch msg := msg.(type) {
+	case windProbe:
+		close(msg.taken)
+		return nil
 	case tea.SuspendMsg:
 		return tea.ResumeMsg{}
 	case tea.ModeReportMsg:
@@ -267,8 +311,129 @@ func (sess *session) filter(_ tea.Model, msg tea.Msg) tea.Msg {
 			sess.in.markSeen()
 			return nil
 		}
+	case tea.QuitMsg:
+		if !sess.wound.Load() {
+			// The model's own quit, or kosh's before the reader has
+			// ended. The model has said its last.
+			sess.stopped.Store(true)
+			go sess.quit()
+			return nil
+		}
+	}
+	if input && sess.winding.Load() {
+		return nil
 	}
 	return msg
+}
+
+// fromInput reports whether msg is something the library's reader made
+// of the program's input. A window's size is not: the library makes that
+// of a terminal it has itself, and here it comes from the session's
+// forward, as often as the client changes its window.
+func fromInput(msg tea.Msg) bool {
+	switch msg.(type) {
+	case nil:
+		return false
+	case tea.KeyPressMsg, tea.KeyReleaseMsg,
+		tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg, tea.MouseWheelMsg,
+		tea.PasteMsg, tea.PasteStartMsg, tea.PasteEndMsg,
+		tea.FocusMsg, tea.BlurMsg, tea.ClipboardMsg,
+		tea.ForegroundColorMsg, tea.BackgroundColorMsg, tea.CursorColorMsg, tea.CursorPositionMsg,
+		tea.CapabilityMsg, tea.TerminalVersionMsg, tea.KeyboardEnhancementsMsg, tea.ModeReportMsg:
+		// What Bubble Tea makes of the library's events.
+		return true
+	}
+	// What it passes on as it is: an event it has no message for, such
+	// as a sequence the library does not know.
+	return reflect.TypeOf(msg).PkgPath() == "github.com/charmbracelet/ultraviolet"
+}
+
+// wind ends the program's reading before the program ends, and returns
+// when the library's reader has ended, or after its waits. It does that
+// once; a later call waits for the first.
+//
+// The library's reader gives the program what it has made of its input
+// one event at a time, and waits with each for the program to take it.
+// A program that has ended takes none: the reader would be left for
+// good, holding what it had gathered, which a client can make a quarter
+// of a megabyte and can do again with every session. So the reader is
+// wound down while the program is still there to take what it has: it is
+// given the mark, and waits (endProgram); when the mark has reached the
+// program the library has emptied its buffer into it, and only then is
+// the reader given its end. The filter lets none of it through to the
+// model. If the mark cannot come out, because the reader was in the
+// middle of a sequence, the reader is ended after windWait all the same.
+func (sess *session) wind() {
+	sess.windOnce.Do(func() {
+		defer sess.wound.Store(true)
+		sess.winding.Store(true)
+		// A program that takes nothing now, because it waits for a
+		// client that does not read, would not take the mark either,
+		// and the mark would be what the reader is left with. So the
+		// program is asked first whether it takes a message: one that
+		// does not is given no mark, and its reader its end at once, as
+		// a reader that has gathered nothing needs no more.
+		drained, told := sess.in.endProgram(sess.programTakes())
+		select {
+		case <-drained:
+		case <-time.After(windWait):
+		}
+		sess.in.endProgramEOF()
+		select {
+		case <-told:
+		case <-time.After(windWait):
+		}
+	})
+}
+
+// windProbe is a message that the filter takes out, and tells of.
+type windProbe struct{ taken chan struct{} }
+
+// probeWait is how long a program has to take a windProbe.
+const probeWait = 100 * time.Millisecond
+
+// programTakes reports whether the program takes a message now.
+func (sess *session) programTakes() bool {
+	sess.mu.Lock()
+	p := sess.program
+	sess.mu.Unlock()
+	if p == nil {
+		return false
+	}
+	probe := windProbe{make(chan struct{})}
+	// Send returns when the program takes it, or has ended.
+	go p.Send(probe)
+	select {
+	case <-probe.taken:
+		return true
+	case <-time.After(probeWait):
+		return false
+	}
+}
+
+// quit ends the program: its reader first, and then the program, with a
+// quit that the filter lets through.
+func (sess *session) quit() {
+	sess.wind()
+	sess.mu.Lock()
+	p := sess.program
+	sess.mu.Unlock()
+	if p != nil {
+		// Quit waits for the program to take it, and the program may be
+		// waiting for a client that does not read.
+		p.Quit()
+	}
+}
+
+// flooded is called when the program's reader has been handed
+// eventlessLimit bytes with no event made of them: the session is
+// ended, and the log says why.
+func (sess *session) flooded() {
+	if sess.end(MsgInputFlood) {
+		sess.srv.log.Warn("session's input made no key, paste or report for too long: the session is closed",
+			"transport", sess.conn.transport, "remote", sess.conn.remote,
+			"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "bytes", eventlessLimit)
+	}
 }
 
 // The session channel itself.
@@ -355,6 +520,11 @@ const (
 	drainMark = "\x1b[?28657;0$y"
 	// drainWait is how long a hand-over waits for the mark to arrive.
 	drainWait = 250 * time.Millisecond
+	// windWait is how long the program's end waits for the mark to reach
+	// the program, in each of its two steps, after which it ends the
+	// reader anyway: the reader was in the middle of a sequence the mark
+	// became a part of.
+	windWait = 250 * time.Millisecond
 )
 
 // A paste, as a terminal in bracketed paste mode sends it, and how much
@@ -363,7 +533,14 @@ const (
 	pasteStart = "\x1b[200~"
 	pasteEnd   = "\x1b[201~"
 	// pasteLimit is how many bytes of one paste the program is given.
-	pasteLimit = 1 << 20
+	// The largest thing the program pastes into takes 64 KiB; and the
+	// library makes of a paste many times its size for a moment.
+	pasteLimit = 256 << 10
+	// eventlessLimit is how many bytes the program's reader is handed
+	// with no event made of them, the bytes of a paste that the scanner
+	// knows not counted: see input.unanswered. No terminal sends a
+	// sequence or a report of a tenth of this.
+	eventlessLimit = 64 << 10
 )
 
 // pasteScanner is what the program's input passes on its way to the
@@ -391,6 +568,9 @@ type pasteScanner struct {
 	passed int
 	// pending is what was to be handed on and found no room.
 	pending []byte
+	// outside counts the bytes handed on that were no part of a paste's
+	// body: the caller takes the count and sets it to zero.
+	outside int
 }
 
 // filter hands the bytes of src on into dst. It returns how many bytes
@@ -399,6 +579,9 @@ type pasteScanner struct {
 func (s *pasteScanner) filter(dst, src []byte) (nd, ns int) {
 	nd = copy(dst, s.pending)
 	s.pending = s.pending[nd:]
+	if !s.in {
+		s.outside += nd
+	}
 	for ns < len(src) && len(s.pending) == 0 && nd < len(dst) {
 		if len(s.mark) == 0 && src[ns] != '\x1b' {
 			// A run of bytes that are no part of a mark: all at once.
@@ -418,11 +601,17 @@ func (s *pasteScanner) filter(dst, src []byte) (nd, ns int) {
 			k := copy(dst[nd:], run)
 			if s.in {
 				s.n += k
+			} else {
+				s.outside += k
 			}
 			nd, ns = nd+k, ns+k
 			continue
 		}
+		was := s.in
 		for _, b := range s.step(src[ns]) {
+			if !was {
+				s.outside++
+			}
 			if nd < len(dst) {
 				dst[nd] = b
 				nd++
@@ -483,6 +672,73 @@ func (s *pasteScanner) data(b byte) []byte {
 	return []byte{b}
 }
 
+// maxSeparators is how many separators of parameters, ";" and ":", one
+// control sequence may have on its way to the program.
+const maxSeparators = 24
+
+// paramGuard is what the program's input passes after the pasteScanner.
+// The library's parser of control sequences has room for 32 parameters
+// and, in v0.11.8 of charmbracelet/x/ansi, writes the 33rd beyond it: a
+// control sequence with 32 separators and one digit more is a panic in a
+// goroutine of the library's, which is the end of kosh for everybody.
+// So of the separators of one control sequence the guard hands on
+// maxSeparators and drops the rest; no terminal sends that many.
+//
+// The guard does not parse: it knows when the library may be counting
+// parameters, and errs on the side of thinking it is. The library begins
+// to count after the 8-bit introducers of a control sequence and of a
+// device control string, and after an escape, any intermediate bytes,
+// and "[" or "P"; it stops at the first byte that is no parameter byte.
+type paramGuard struct {
+	// state is where the guard is: guardIdle, guardEscape after an
+	// escape and its intermediate bytes, or guardParams.
+	state uint8
+	// seps is how many separators the sequence has had.
+	seps int
+}
+
+const (
+	guardIdle = iota
+	guardEscape
+	guardParams
+)
+
+// filter takes the separators beyond maxSeparators out of b, in place,
+// and returns how many bytes of b are left.
+func (g *paramGuard) filter(b []byte) int {
+	n := 0
+	for _, c := range b {
+		switch {
+		case c == '\x1b':
+			g.state = guardEscape
+		case c == 0x9b || c == 0x90:
+			g.state, g.seps = guardParams, 0
+		case g.state == guardEscape:
+			switch {
+			case c == '[' || c == 'P':
+				g.state, g.seps = guardParams, 0
+			case c >= 0x20 && c <= 0x2f:
+			default:
+				g.state = guardIdle
+			}
+		case g.state == guardParams:
+			switch {
+			case c == ';' || c == ':':
+				if g.seps >= maxSeparators {
+					continue
+				}
+				g.seps++
+			case c >= 0x30 && c <= 0x3f:
+			default:
+				g.state = guardIdle
+			}
+		}
+		b[n] = c
+		n++
+	}
+	return n
+}
+
 // input is what the client sends on the session channel. One goroutine,
 // pump, reads the channel; the bytes wait in buf, inputBuffer of them at
 // most, for the one who has the terminal: the program, or the command
@@ -514,6 +770,29 @@ type input struct {
 	// own, and a large paste into a shell is the user's business. It
 	// begins anew whenever the terminal changes hands.
 	paste pasteScanner
+	// guard is what they pass after it: see paramGuard.
+	guard paramGuard
+	// unanswered is how many bytes the program's reader has been handed
+	// since the library last made an event of what it read (the
+	// session's filter tells: eventSeen), but for the body of a paste
+	// that the scanner knows, which has its own limit. The library
+	// gathers a sequence or a string that does not end, and a paste in
+	// any spelling it knows, for as long as bytes come, and makes no
+	// event meanwhile; when it does make one, it has let go of all that
+	// came before it. So this and pasteLimit are, to within two of the
+	// library's reads, what the library holds at most, whatever the
+	// bytes are and however the scanner and the library read them.
+	// Beyond eventlessLimit the reader is handed nothing more, and
+	// flood is called, once, in a goroutine of its own: flooded is set
+	// then.
+	unanswered int
+	flooded    bool
+	flood      func()
+	// ended is set when the program is to read no more; endEOF when its
+	// reader, which waits between the mark and its end, may return io.EOF;
+	// ending while that wait is on. ended holds for any reader after the
+	// program's too. See endProgram.
+	ended, ending, endEOF bool
 
 	// turn is the reader of the command that has the terminal, or nil
 	// when the program has it.
@@ -590,12 +869,25 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 	defer in.mu.Unlock()
 	for {
 		switch {
-		case c == nil && in.turn != nil:
-			// The program's reader while a command has the terminal:
-			// the mark once, then the end, and no byte of the client's.
+		case c == nil && (in.turn != nil || in.ended || in.ending):
+			// The program's reader while a command has the terminal, or
+			// when the program is to end: the mark once, then the end,
+			// and no byte of the client's.
 			if in.mark && len(p) >= len(drainMark) {
 				in.mark = false
 				return copy(p, drainMark), nil
+			}
+			if in.ending && !in.endEOF {
+				// The mark was given; the program has it to take. The
+				// reader waits here, not reading the channel and not at
+				// its end, until the mark has reached the program: the
+				// library may hold it until a read does not come. Only
+				// then is the reader's end given, so that the library has
+				// emptied its buffer into the program first and nothing
+				// of the program's is left in the library behind a reader
+				// that has gone.
+				in.cond.Wait()
+				continue
 			}
 			in.mark = false
 			if in.told != nil {
@@ -606,21 +898,30 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 		case c != nil && (in.turn != c || c.over):
 			// A command's reader after its turn.
 			return 0, io.EOF
-		case c == nil && (len(in.buf) > 0 || len(in.paste.pending) > 0):
-			// The program's bytes, through the scanner: see pasteScanner.
+		case c == nil && !in.flooded && (len(in.buf) > 0 || len(in.paste.pending) > 0):
+			// The program's bytes, through the scanner and the guard:
+			// see pasteScanner and paramGuard.
 			nd, ns := in.paste.filter(p, in.buf)
+			nd = in.guard.filter(p[:nd])
 			in.buf = in.buf[ns:]
 			if len(in.buf) == 0 {
 				in.buf = nil
 			}
 			in.cond.Broadcast()
+			in.unanswered, in.paste.outside = in.unanswered+in.paste.outside, 0
+			if in.unanswered > eventlessLimit {
+				in.flooded = true
+				if in.flood != nil {
+					go in.flood()
+				}
+			}
 			if nd > 0 {
 				return nd, nil
 			}
 			// All of it was dropped: the pump has room, and the program
 			// waits for more.
 			continue
-		case len(in.buf) > 0:
+		case c != nil && len(in.buf) > 0:
 			n := copy(p, in.buf)
 			in.buf = in.buf[n:]
 			if len(in.buf) == 0 {
@@ -663,11 +964,11 @@ func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan
 			in.cond.Wait()
 		}
 	}
-	if in.turn != nil {
+	if in.turn != nil || in.ended || in.ending {
 		return nil, nil, nil
 	}
 	c = &commandInput{in: in}
-	in.turn, in.paste = c, pasteScanner{}
+	in.turn, in.paste, in.guard, in.unanswered = c, pasteScanner{}, paramGuard{}, 0
 	d, t := make(chan struct{}), make(chan struct{})
 	if in.gone {
 		close(d)
@@ -677,6 +978,52 @@ func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan
 	}
 	in.cond.Broadcast()
 	return c, d, t
+}
+
+// endProgram ends the program's reading. Without mark the program's
+// reader is given io.EOF at once. With it the reader is given
+// drainMark, and then waits (it reads no channel and is not at its end)
+// until endProgramEOF; a reader that Bubble Tea starts later is at its
+// end at once. drained and told are as give's: drained closes when the
+// mark has reached the program, told when the reader has been given
+// io.EOF. Both are closed already when no reader of the program is
+// reading: a command has the terminal, the program was wound already, or
+// the reader was told the channel's end.
+func (in *input) endProgram(mark bool) (drained, told <-chan struct{}) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	d, t := make(chan struct{}), make(chan struct{})
+	switch {
+	case in.ended || in.ending || in.turn != nil || in.gone:
+		close(d)
+		close(t)
+		in.ended = true
+	case !mark:
+		// No mark, and so nothing to wait for but the reader's end.
+		close(d)
+		in.ended, in.endEOF, in.told = true, true, t
+	default:
+		in.mark, in.ending, in.drained, in.told = true, true, d, t
+	}
+	in.cond.Broadcast()
+	return d, t
+}
+
+// endProgramEOF ends the reader's wait between the mark and its end:
+// from now its Read returns io.EOF.
+func (in *input) endProgramEOF() {
+	in.mu.Lock()
+	in.ended, in.endEOF = true, true
+	in.cond.Broadcast()
+	in.mu.Unlock()
+}
+
+// eventSeen is called when the library has made an event of what the
+// program's reader read.
+func (in *input) eventSeen() {
+	in.mu.Lock()
+	in.unanswered = 0
+	in.mu.Unlock()
 }
 
 // markSeen is called when drainMark has arrived at the program.
@@ -708,7 +1055,7 @@ func (in *input) takeBack(c *commandInput) {
 	c.over = true
 	if in.turn == c {
 		in.turn, in.mark, in.drained, in.told = nil, false, nil, nil
-		in.paste = pasteScanner{}
+		in.paste, in.guard, in.unanswered = pasteScanner{}, paramGuard{}, 0
 	}
 	in.cond.Broadcast()
 }

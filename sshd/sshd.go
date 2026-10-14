@@ -35,6 +35,7 @@ const (
 	MsgGrantChanged  = "kosh: what this key may do has changed; connect again"
 	MsgShuttingDown  = "kosh is shutting down"
 	MsgCrashed       = "kosh: this session has failed and was closed"
+	MsgInputFlood    = "kosh: the terminal sent what is no key, no paste and no report, and too much of it; this session was closed"
 )
 
 // Session is what the server tells the maker of a session's program.
