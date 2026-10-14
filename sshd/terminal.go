@@ -27,6 +27,13 @@ import (
 
 // exec is Session.Exec.
 func (sess *session) exec(run func(context.Context, Terminal) error, done func(error) tea.Msg) tea.Cmd {
+	return sess.handover(run, done, busyWait)
+}
+
+// handover returns the command of a hand-over: exec, which waits busy
+// for a terminal that a command has before it tells done that it is
+// busy.
+func (sess *session) handover(run func(context.Context, Terminal) error, done func(error) tea.Msg, busy time.Duration) tea.Cmd {
 	// tell tells done what became of the command; a nil done is told
 	// nothing, and the program is given no message.
 	tell := func(err error) tea.Msg {
@@ -41,7 +48,7 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 		}
 		// From here on what the client sends is the command's, and the
 		// program's reader is given the mark and its end.
-		in, drained, told := sess.in.give(0)
+		in, drained, told := sess.in.give(busy)
 		if in == nil {
 			return tell(ErrTerminalBusy)
 		}
@@ -78,6 +85,13 @@ func (sess *session) exec(run func(context.Context, Terminal) error, done func(e
 		})()
 	}
 }
+
+// busyWait is how long a hand-over waits for a terminal that a command
+// has. When the model asks, that command can only be the repair of the
+// screen (see watchScreen), which is over in minTurn: the model's
+// command is not to be refused for that. A model that asks twice has its
+// second command wait this long, and refused then.
+const busyWait = 200 * time.Millisecond
 
 // minTurn is how long a turn lasts at least: Run does not return sooner,
 // however soon the command does.
@@ -174,6 +188,10 @@ func (t *turn) Run() error {
 	defer func() {
 		stop()
 		cancel()
+		// First of all: a reader of the command's that is still in Read,
+		// as the copier of a stream is, takes nothing of what the client
+		// sends from here on.
+		sess.in.cut(t.in)
 		// A write of the command's that is under way is waited for: the
 		// program's output must not run into it. One that the client
 		// does not take ends with the channel or the connection.
@@ -195,7 +213,7 @@ func (t *turn) Run() error {
 		}
 		sess.watchScreen()
 	}()
-	if !sess.beginCommand(cancel) {
+	if !sess.beginCommand(cancel, out) {
 		return ErrSessionEnded
 	}
 	called = true
@@ -207,6 +225,10 @@ func (t *turn) Run() error {
 // gate is the writer of one command's turn: it passes what it is given
 // on to w, and after close it passes nothing.
 type gate struct {
+	// writing is how many calls of Write are under way, or wait for
+	// one that is.
+	writing atomic.Int32
+
 	mu     sync.Mutex
 	w      io.Writer
 	closed bool
@@ -214,6 +236,8 @@ type gate struct {
 
 // Write writes p to w, or fails with io.ErrClosedPipe after close.
 func (g *gate) Write(p []byte) (int, error) {
+	g.writing.Add(1)
+	defer g.writing.Add(-1)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
@@ -622,10 +646,23 @@ func (in *input) read(p []byte, c *commandInput) (int, error) {
 // when the mark has arrived at the program (see markSeen), told when the
 // program's reader has been told io.EOF; both are closed already when
 // the program reads no more. give returns nil when a command has the
-// terminal.
+// terminal, and still has it after wait.
 func (in *input) give(wait time.Duration) (c *commandInput, drained, told <-chan struct{}) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	if in.turn != nil && wait > 0 {
+		// The end of a turn is told to cond; so is the end of the wait.
+		deadline := time.Now().Add(wait)
+		wake := time.AfterFunc(wait, func() {
+			in.mu.Lock()
+			in.cond.Broadcast()
+			in.mu.Unlock()
+		})
+		defer wake.Stop()
+		for in.turn != nil && time.Now().Before(deadline) {
+			in.cond.Wait()
+		}
+	}
 	if in.turn != nil {
 		return nil, nil, nil
 	}
@@ -749,17 +786,19 @@ func (sess *session) checkScreen(n int64) {
 		return
 	}
 	// As the program would run the command of a hand-over: it returns
-	// nil when the terminal is busy or the session over.
-	msg := sess.exec(func(ctx context.Context, _ Terminal) error {
-		// Not the server's minTurn, which a test may have made nothing.
-		wait := time.NewTimer(minTurn)
+	// nil when the terminal is busy, for which it does not wait, or the
+	// session over.
+	msg := sess.handover(func(ctx context.Context, _ Terminal) error {
+		// minTurn, and not the server's, which a test may have made
+		// nothing.
+		wait := time.NewTimer(sess.srv.repairTurn)
 		defer wait.Stop()
 		select {
 		case <-wait.C:
 		case <-ctx.Done():
 		}
 		return nil
-	}, nil)()
+	}, nil, 0)()
 	if msg == nil {
 		return
 	}

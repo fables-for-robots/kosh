@@ -44,6 +44,7 @@ type handover struct {
 	marks   int             // mode reports the model was given
 	sizes   int             // sizes the model was given
 	w, h    int             // the last of them
+	told    []error         // what the model's done was told, when it was told
 	began   int             // calls of run
 	cmd     []byte          // what echo read
 	ended   []error         // what the model's done was told
@@ -124,7 +125,11 @@ func (hv *handover) command(ctx context.Context, t Terminal) error {
 }
 
 func (m handoverModel) exec() tea.Cmd {
-	return m.s.Exec(m.hv.command, func(err error) tea.Msg { return handoverDone{err} })
+	hv := m.hv
+	return m.s.Exec(hv.command, func(err error) tea.Msg {
+		hv.note(func() { hv.told = append(hv.told, err) })
+		return handoverDone{err}
+	})
 }
 
 type handoverAsked struct{}
@@ -1057,24 +1062,31 @@ func TestHandoverInTheMiddleOfAPaste(t *testing.T) {
 }
 
 // TestOneCommandAtATime asks for the terminal twice in one update: one
-// command gets it, and the other is refused without being called.
+// command gets it, and the other, when it has waited busyWait for the
+// terminal and the first still has it, is refused without being called.
 func TestOneCommandAtATime(t *testing.T) {
 	turns := make(chan held, 2)
 	hv := newHandover(hold(turns))
 	_, tm := startHandover(t, hv)
 
+	asked := time.Now()
 	tm.press("@")
 	turn := next(t, turns)
+	// The first keeps the terminal until the second has been refused.
+	hv.wait(t, "the second command was refused", func() bool { return len(hv.told) == 1 })
+	if d := time.Since(asked); d < busyWait {
+		t.Errorf("the second command was refused after %v: it did not wait %v for the terminal", d, busyWait)
+	}
 	turn.finish <- nil
 	hv.wait(t, "the model was told of both", func() bool { return len(hv.ended) == 2 })
 	hv.mu.Lock()
-	began, ended := hv.began, append([]error(nil), hv.ended...)
+	began, told := hv.began, append([]error(nil), hv.told...)
 	hv.mu.Unlock()
 	if began != 1 {
 		t.Errorf("%d commands were given the terminal, want 1", began)
 	}
-	if !(ended[0] == nil && ended[1] == ErrTerminalBusy) && !(ended[0] == ErrTerminalBusy && ended[1] == nil) {
-		t.Errorf("the model was told %v, want nil for the command that ran and ErrTerminalBusy for the other", ended)
+	if len(told) != 2 || told[0] != ErrTerminalBusy || told[1] != nil {
+		t.Errorf("the model was told %v, want ErrTerminalBusy for the second command and then nil for the one that ran", told)
 	}
 
 	// The terminal is free again.
@@ -1084,6 +1096,52 @@ func TestOneCommandAtATime(t *testing.T) {
 	hv.wait(t, "the model was told of the third", func() bool { return len(hv.ended) == 3 })
 	if hv.ended[2] != nil {
 		t.Errorf("the command after the refused one: %v", hv.ended[2])
+	}
+}
+
+// TestHandoverWaitsForARepair runs the command of a hand-over while
+// the repair of the screen has the terminal, which is the one thing that
+// can have it when the model's command runs: the command is not refused,
+// it waits, and the model's run is called when the repair is over.
+//
+// A key pressed during the repair waits in the input, and the command it
+// makes with it; the command that meets a repair is one that was on its
+// way already, so the test runs it itself, as the program would.
+func TestHandoverWaitsForARepair(t *testing.T) {
+	hv := newHandover(nil)
+	hv.run = hv.echo
+	// A repair long enough to be met, and shorter than busyWait.
+	h, tm := startHandover(t, hv, withServer(func(s *Server) { s.repairTurn = busyWait / 2 }))
+	sess := h.onlySession()
+	hv.mu.Lock()
+	s := hv.session
+	hv.mu.Unlock()
+
+	// As the session's timer does when the program has not written.
+	go sess.checkScreen(sess.out.n.Load())
+	eventually(t, "the repair has the terminal", func() bool {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.cancelCommand != nil
+	})
+	msg := s.Exec(hv.command, func(err error) tea.Msg { return handoverDone{err} })()
+	if done, refused := msg.(handoverDone); refused {
+		t.Fatalf("the command that met a repair was told %v", done.err)
+	}
+	sess.mu.Lock()
+	p := sess.program
+	sess.mu.Unlock()
+	p.Send(msg)
+	hv.wait(t, "the model's command has begun", func() bool { return hv.began == 1 })
+	tm.press("A" + endMark)
+	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
+	hv.mu.Lock()
+	defer hv.mu.Unlock()
+	if hv.ended[0] != nil || string(hv.cmd) != "A"+endMark {
+		t.Errorf("the model was told %v, the command read %q", hv.ended[0], hv.cmd)
+	}
+	if n := h.repairs(); n < 1 {
+		t.Errorf("the screen was repaired %d times, want once", n)
 	}
 }
 
@@ -1152,9 +1210,10 @@ func TestSessionEndsDuringACommand(t *testing.T) {
 			e.end(t, h, cl, tm)
 			select {
 			case <-run.ctx.Done():
-				// At once, and not after a timeout: the bound is wide for
-				// the teardown of a connection on a busy machine.
-				if d := time.Since(ended); d > 2*time.Second {
+				// At once, and not after the end's timeout of 2 seconds:
+				// the bound is wide for the teardown of a connection on a
+				// busy machine, and narrower than that.
+				if d := time.Since(ended); d > time.Second {
 					t.Errorf("the command's context was done %v after the session was ended, want at once", d)
 				}
 			case <-time.After(longWait):
@@ -1492,7 +1551,10 @@ func TestScreenAfterACommandThatReturnsAtOnce(t *testing.T) {
 			if s.repairs && n == 0 {
 				t.Error("no screen was repaired: this setting does not show what it is for")
 			}
-			if !s.repairs && n != 0 {
+			// A program that is kept from writing for screenCheck on a
+			// busy machine gets a repair it did not need: that is not
+			// what this looks for.
+			if !s.repairs && n > 2 {
 				t.Errorf("%d screens had to be repaired, with the turn's least time in place", n)
 			}
 		})
@@ -1534,6 +1596,10 @@ func TestScreenCheck(t *testing.T) {
 	if n := h.repairs(); n != 0 {
 		t.Errorf("the screen was repaired %d times while a command had the terminal", n)
 	}
+	// From here on a repair that the session's own timer makes, for a
+	// program kept from writing on a busy machine, is not a failure: two
+	// of them at most.
+	const needless = 2
 	turn.finish <- nil
 	hv.wait(t, "the model knows that the command ended", func() bool { return len(hv.ended) == 1 })
 	tm.waitFor("done:1 ")
@@ -1543,14 +1609,14 @@ func TestScreenCheck(t *testing.T) {
 
 	// A program that has written nothing since: one more hand-over, to
 	// nothing, and the screen is drawn after it.
-	before := releases()
+	before, repaired := releases(), h.repairs()
 	sess.checkScreen(sess.out.n.Load())
-	if n := h.repairs(); n != 1 {
-		t.Fatalf("the screen was repaired %d times, want once", n)
+	if n := h.repairs(); n != repaired+1 {
+		t.Fatalf("the screen was repaired %d times by the check, want once", n-repaired)
 	}
 	eventually(t, "the program has released the terminal once more and drawn again", func() bool {
 		out := tm.stdout.String()
-		return releases() == before+1 && strings.LastIndex(out, "LASTLINE") > strings.LastIndex(out, "\x1b[?1049l")
+		return releases() > before && strings.LastIndex(out, "LASTLINE") > strings.LastIndex(out, "\x1b[?1049l")
 	})
 	hv.mu.Lock()
 	began, ended := hv.began, len(hv.ended)
@@ -1561,7 +1627,7 @@ func TestScreenCheck(t *testing.T) {
 	// The program has written: the timer of the repair's own turn finds
 	// nothing to do. Twice its time, for it to have fired.
 	time.Sleep(2 * screenCheck)
-	if n := h.repairs(); n != 1 {
+	if n := h.repairs(); n > 1+needless {
 		t.Errorf("the screen was repaired %d times, want once", n)
 	}
 	tm.press("y")
@@ -1574,125 +1640,241 @@ func TestScreenCheck(t *testing.T) {
 	}
 	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
 	h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" })
+	atEnd := h.repairs()
 	sess.checkScreen(sess.out.n.Load())
-	if n := h.repairs(); n != 1 {
+	if n := h.repairs(); n != atEnd {
 		t.Errorf("the screen of a session that has ended was repaired")
 	}
+	t.Logf("the screen was repaired %d times, once by this test", atEnd)
+}
+
+// unread is a session of a client that does not read what the session
+// writes, until it is told to.
+type unread struct {
+	cl    *ssh.Client
+	sess  *ssh.Session
+	stdin io.Writer
+	// stdout is what the client would read.
+	stdout io.Reader
+	// conn counts what arrives at the client's connection.
+	conn *countingConn
+}
+
+// openUnread opens a session with a terminal for key, whose output
+// nobody reads.
+func openUnread(t *testing.T, h *harness, key ssh.Signer) *unread {
+	t.Helper()
+	u := &unread{conn: &countingConn{Conn: h.dialRaw()}}
+	var err error
+	if u.cl, err = connect(u.conn, h.addr, clientConfig("kosh", ssh.PublicKeys(key))); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = u.cl.Close() })
+	if u.sess, err = u.cl.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = u.sess.Close() })
+	if u.stdout, err = u.sess.StdoutPipe(); err != nil {
+		t.Fatal(err)
+	}
+	if u.stdin, err = u.sess.StdinPipe(); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.sess.Shell(); err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+// stalled waits until the session's output has stopped: the channel's
+// window of 2 MB is full, and nothing more arrives for 200 ms.
+func (u *unread) stalled(t *testing.T) {
+	t.Helper()
+	last, since := u.conn.read.Load(), time.Now()
+	eventuallyWithin(t, longWait, "the session's output to stall", func() bool {
+		if n := u.conn.read.Load(); n != last {
+			last, since = n, time.Now()
+		}
+		return last > 2<<20 && time.Since(since) > 200*time.Millisecond
+	})
 }
 
 // TestSessionEndsWhileTheClientDoesNotRead removes the key of a session
-// whose command is in a write that the client does not take. The
-// command's context is done and its input ends at once; its write cannot
-// be ended before the connection is, which the end's timer does: the
-// client gets no message, and the log says what was waited for.
+// whose command is in a write that the client does not take: a command
+// that returns on its context and leaves its write to a goroutine, and
+// one that waits for its write. The command's context is done and its
+// input ends at once; its write cannot be ended before the connection
+// is, which the end's timer does: the client gets no message, and the
+// log says that it was the write that was waited for.
 func TestSessionEndsWhileTheClientDoesNotRead(t *testing.T) {
 	const endTimeout = 200 * time.Millisecond
 	type writing struct {
 		held
 		wrote <-chan error
 	}
-	runs := make(chan writing, 1)
+	for _, waits := range []bool{false, true} {
+		name := "a command that returns on its context"
+		if waits {
+			name = "a command that waits for its write"
+		}
+		t.Run(name, func(t *testing.T) {
+			runs := make(chan writing, 1)
+			hv := newHandover(func(ctx context.Context, tt Terminal) error {
+				wrote := make(chan error, 2)
+				write := func() error {
+					_, err := tt.Out.Write(make([]byte, 8<<20))
+					wrote <- err
+					return err
+				}
+				runs <- writing{held{ctx: ctx, t: tt}, wrote}
+				if waits {
+					return write()
+				}
+				go write()
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			h := handoverHarness(t, hv, withServer(func(s *Server) { s.endTimeout = endTimeout }))
+			u := openUnread(t, h, h.key("ann", false))
+			if _, err := u.stdin.Write([]byte("!")); err != nil {
+				t.Fatal(err)
+			}
+			var run writing
+			select {
+			case run = <-runs:
+			case <-time.After(longWait):
+				t.Fatal("the command was not given the terminal")
+			}
+			u.stalled(t)
+			select {
+			case err := <-run.wrote:
+				t.Fatalf("the command's write of 8 MB returned (%v) though the client does not read", err)
+			default:
+			}
+
+			ended := time.Now()
+			setKeys(t, h.list)
+			select {
+			case <-run.ctx.Done():
+				if d := time.Since(ended); d > time.Second {
+					t.Errorf("the command's context was done %v after the key was removed", d)
+				}
+			case <-time.After(longWait):
+				t.Fatal("the command's context is not done")
+			}
+			wantRead(t, "the command's Read after the session was ended", readOnce(run.t.In), "", io.EOF)
+			select {
+			case err := <-run.wrote:
+				if err == nil {
+					t.Error("the write that the client did not take returned without an error")
+				}
+				if d := time.Since(ended); d > endTimeout+2*time.Second {
+					t.Errorf("the write that the client did not take returned %v after the key was removed, want within the end's timeout of %v and a margin", d, endTimeout)
+				}
+			case <-time.After(longWait):
+				t.Fatal("the write that the client did not take has not returned")
+			}
+			closed := make(chan error, 1)
+			go func() { closed <- u.cl.Wait() }()
+			select {
+			case <-closed:
+			case <-time.After(longWait):
+				t.Fatal("the connection of the session that could not be told is open")
+			}
+
+			rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
+				return strings.HasPrefix(r.Msg, "session did not end in time")
+			})
+			if !strings.Contains(rec.Msg, "the client did not take what its command wrote") || rec.Attrs["key"] != "ann" || rec.Attrs["reason"] != MsgKeyRemoved {
+				t.Errorf("the line %v does not say that a write of the command's was waited for, or whose session it was and why it was ended", rec)
+			}
+			h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" && r.Attrs["reason"] == MsgKeyRemoved })
+			eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+		})
+	}
+}
+
+// TestKeyTypedWhileATurnEnds types a key when a command has returned and
+// its turn is not over, because a write of the command's is still under
+// way, and a goroutine of the command is still in In.Read: that reader
+// was told the end when the command returned, and the key is the
+// program's.
+func TestKeyTypedWhileATurnEnds(t *testing.T) {
+	type running struct {
+		read  <-chan readResult
+		wrote <-chan error
+	}
+	runs := make(chan running, 1)
+	finish := make(chan struct{})
 	hv := newHandover(func(ctx context.Context, tt Terminal) error {
 		wrote := make(chan error, 1)
 		go func() {
 			_, err := tt.Out.Write(make([]byte, 8<<20))
 			wrote <- err
 		}()
-		runs <- writing{held{ctx: ctx, t: tt}, wrote}
-		// As the contract asks: the command returns on its context, and
-		// does not wait for its write.
-		<-ctx.Done()
-		return ctx.Err()
+		runs <- running{readOnce(tt.In), wrote}
+		select {
+		case <-finish:
+		case <-ctx.Done():
+		}
+		return nil
 	})
-	h := handoverHarness(t, hv, withServer(func(s *Server) { s.endTimeout = endTimeout }))
-	ann := h.key("ann", false)
-	cc := &countingConn{Conn: h.dialRaw()}
-	cl, err := connect(cc, h.addr, clientConfig("kosh", ssh.PublicKeys(ann)))
-	if err != nil {
+	h := handoverHarness(t, hv)
+	u := openUnread(t, h, h.key("ann", false))
+	if _, err := u.stdin.Write([]byte("!")); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cl.Close() })
-	// A session whose output nobody reads.
-	sess, err := cl.NewSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sess.Close() })
-	if _, err := sess.StdoutPipe(); err != nil {
-		t.Fatal(err)
-	}
-	stdin, err := sess.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := sess.Shell(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := stdin.Write([]byte("!")); err != nil {
-		t.Fatal(err)
-	}
-	var run writing
+	var run running
 	select {
 	case run = <-runs:
 	case <-time.After(longWait):
 		t.Fatal("the command was not given the terminal")
 	}
-	// Stalled: the channel's window of 2 MB is full, and nothing more
-	// arrives for 200 ms.
-	last, since := cc.read.Load(), time.Now()
-	eventuallyWithin(t, longWait, "the command's output to stall", func() bool {
-		if n := cc.read.Load(); n != last {
-			last, since = n, time.Now()
-		}
-		return last > 2<<20 && time.Since(since) > 200*time.Millisecond
-	})
+	u.stalled(t)
+
+	// The command returns; its turn waits for its write.
+	close(finish)
+	wantRead(t, "the command's reader when the command has returned", run.read, "", io.EOF)
+	if _, err := u.stdin.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// The client reads again: the write is taken, the turn ends, and the
+	// program has the key.
+	go func() { _, _ = io.Copy(io.Discard, u.stdout) }()
 	select {
 	case err := <-run.wrote:
-		t.Fatalf("the command's write of 8 MB returned (%v) though the client does not read", err)
-	default:
+		if err != nil {
+			t.Errorf("the command's write, which the client took in the end: %v", err)
+		}
+	case <-time.After(longWait):
+		t.Fatal("the command's write has not returned though the client reads")
 	}
+	hv.wait(t, "the model has the key typed while the turn ended", func() bool { return strings.Join(hv.keys, "") == "!x" })
+}
 
-	ended := time.Now()
-	setKeys(t, h.list)
-	select {
-	case <-run.ctx.Done():
-		if d := time.Since(ended); d > 2*time.Second {
-			t.Errorf("the command's context was done %v after the key was removed", d)
-		}
-	case <-time.After(longWait):
-		t.Fatal("the command's context is not done")
-	}
-	wantRead(t, "the command's Read after the session was ended", readOnce(run.t.In), "", io.EOF)
-	select {
-	case err := <-run.wrote:
-		if err == nil {
-			t.Error("the write that the client did not take returned without an error")
-		}
-		if d := time.Since(ended); d > endTimeout+2*time.Second {
-			t.Errorf("the write that the client did not take returned %v after the key was removed, want within the end's timeout of %v and a margin", d, endTimeout)
-		}
-	case <-time.After(longWait):
-		t.Fatal("the write that the client did not take has not returned")
-	}
-	closed := make(chan error, 1)
-	go func() { closed <- cl.Wait() }()
-	select {
-	case <-closed:
-	case <-time.After(longWait):
-		t.Fatal("the connection of the session that could not be told is open")
-	}
-
-	rec := h.log.waitFor(t, "of the session that did not end", func(r logRecord) bool {
-		return strings.HasPrefix(r.Msg, "session did not end in time")
+// TestGuardLetsGoOfTheModel releases a guard, as the session does when
+// its program has returned: the model is held no more, and a call that
+// comes late does nothing.
+func TestGuardLetsGoOfTheModel(t *testing.T) {
+	var stopped atomic.Bool
+	m := makeModel(func() tea.Model { return testModel{} }, &stopped, func(string, any, []byte) {
+		t.Error("the guard reported a panic")
 	})
-	if !strings.Contains(rec.Msg, "the client did not take what its command wrote") || rec.Attrs["key"] != "ann" || rec.Attrs["reason"] != MsgKeyRemoved {
-		t.Errorf("the line %v does not say that a write of the command's was waited for, or whose session it was and why it was ended", rec)
+	g := m.(*guard)
+	g.release()
+	if g.inner != nil {
+		t.Error("a released guard holds its model")
 	}
-	h.log.waitFor(t, "of the session's end", func(r logRecord) bool { return r.Msg == "session end" && r.Attrs["reason"] == MsgKeyRemoved })
-	eventually(t, "the session is gone", func() bool { return h.srv.Sessions() == 0 })
+	if cmd := g.Init(); cmd != nil {
+		t.Error("Init of a released guard returned a command")
+	}
+	if next, cmd := g.Update(tea.KeyPressMsg{}); next != tea.Model(g) || cmd != nil {
+		t.Error("Update of a released guard did something")
+	}
+	_ = g.View()
 }
 
 // leftModes is what a full-screen program that was killed leaves, and

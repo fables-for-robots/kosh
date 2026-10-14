@@ -92,6 +92,9 @@ type session struct {
 	// waitsForWrite, or "" when no turn is under way or nothing is
 	// waited for.
 	waits string
+	// turnOut is the output of the command that has the terminal, or
+	// nil.
+	turnOut *gate
 
 	// in is what the client sends, for whoever has the terminal. It is
 	// read from the channel from the moment the program starts.
@@ -169,6 +172,12 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 			// A reader that Bubble Tea left in Read is told the end, and
 			// gets nothing of what waits; the pump ends with the channel.
 			sess.in.close()
+			// One goroutine of Bubble Tea's can be left, with the keys
+			// that were queued behind the one that ended the program: it
+			// holds the guard, and not the model with all it has.
+			if g, ok := m.(*guard); ok {
+				g.release()
+			}
 			// Taken now: a channel that closes after the program ended
 			// by itself is not why it ended.
 			byClient := sess.channelClosed.Load()
@@ -267,10 +276,16 @@ const (
 func (sess *session) cutOff(reason string) {
 	what := "session did not end in time: its connection is closed"
 	sess.mu.Lock()
-	if sess.waits != "" {
-		what = "session did not end in time, " + sess.waits + ": its connection is closed"
+	waits := sess.waits
+	if waits == waitsForCommand && sess.turnOut.writing.Load() > 0 {
+		// The command has not returned because it waits for its write,
+		// or it will not be long: the write is what holds the session.
+		waits = waitsForWrite
 	}
 	sess.mu.Unlock()
+	if waits != "" {
+		what = "session did not end in time, " + waits + ": its connection is closed"
+	}
 	sess.srv.log.Warn(what,
 		"transport", sess.conn.transport, "remote", sess.conn.remote,
 		"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "reason", reason)
@@ -306,15 +321,16 @@ func (sess *session) overLocked() bool {
 }
 
 // beginCommand makes cancel what ends the context of the command that
-// has the terminal. It reports false, and keeps nothing, when the
-// session is over: end, which would call cancel, has been and gone.
-func (sess *session) beginCommand(cancel context.CancelFunc) bool {
+// has the terminal, and out that command's output. It reports false, and
+// keeps nothing, when the session is over: end, which would call cancel,
+// has been and gone.
+func (sess *session) beginCommand(cancel context.CancelFunc, out *gate) bool {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if sess.overLocked() {
 		return false
 	}
-	sess.cancelCommand, sess.waits = cancel, waitsForCommand
+	sess.cancelCommand, sess.waits, sess.turnOut = cancel, waitsForCommand, out
 	return true
 }
 
@@ -324,6 +340,9 @@ func (sess *session) beginCommand(cancel context.CancelFunc) bool {
 func (sess *session) commandWaits(what string) {
 	sess.mu.Lock()
 	sess.cancelCommand, sess.waits = nil, what
+	if what == "" {
+		sess.turnOut = nil
+	}
 	sess.mu.Unlock()
 }
 
