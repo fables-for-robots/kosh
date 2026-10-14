@@ -456,7 +456,7 @@ func TestConnectionsPerKeyLimit(t *testing.T) {
 	}
 	remote := raw.LocalAddr().String()
 	rec := h.log.waitFor(t, "of the connection over the key's limit", func(r logRecord) bool { return r.Attrs["remote"] == remote })
-	if rec.Attrs["reason"] != reasonTooManyConnectionsOfKey || rec.Attrs["key"] != "alice" ||
+	if rec.Attrs["reason"] != reasonTooManyConnectionsOfKey || rec.Attrs["key"] != admin("alice") ||
 		rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) || rec.Attrs["transport"] != "tcp" {
 		t.Errorf("the connection over the key's limit is logged as %v", rec)
 	}

@@ -171,29 +171,36 @@ program listening for the process's signals.
 ## 6. The key list
 
 `--authorized-keys` (default `/etc/kosh/authorized_keys`) names a file
-in OpenSSH's `authorized_keys` format: one key to a line, options before
-the key type, a comment after the key. Empty lines and lines that begin
-with `#` are skipped.
+in OpenSSH's `authorized_keys` format: one key to a line, a comment after
+the key, which is the key's name and says what it may do. Empty lines and
+lines that begin with `#` are skipped.
 
 ```
-ssh-ed25519 AAAAC3Nza...  dragan@mac
-read-only ssh-ed25519 AAAAC3Nza...  guest@laptop
+ssh-ed25519 AAAAC3Nza...  dragan@mac/admin
+ssh-ed25519 AAAAC3Nza...  guest@laptop
 ```
 
-- **`read-only`** is the one option kosh knows. A key with it is
-  read-only; a key without options is full.
-- **Any other option rejects the line**, and so does a line that does
-  not parse. A misspelled `readonly` thus gives no access and never full
-  access. Rejected lines are logged with their number.
+*(As of 0.3.0. Until then a key was full unless it had the option
+`read-only` in front; the rule below replaced that, on the user's
+request, so that the list and every log line say what a key may do.)*
+
+- **A name that ends in `/admin`** is an admin's: the key may do
+  everything kosh does. Every other key is read-only. The suffix is
+  exactly `/admin`, in lower case, at the end of the name; a name that
+  ends in it in another case (`/Admin`) rejects the line, as an admin
+  written wrongly, rather than making a read-only key that nobody
+  notices. Anything else (`bob-admin`, `admin`, `bob/admin/`) is a
+  read-only key.
+- **Any option rejects the line**, and so does a line that does not
+  parse. The option `read-only` of earlier versions is rejected with its
+  own words, so that a list written for them is not read in silence as
+  something else: a key without the suffix is read-only whatever a line
+  says. A list of keys none of which is an admin is accepted, with a
+  warning in the log that every session is read-only.
 - **The name** of a key is its comment, or its SHA256 fingerprint when
-  it has none.
-- **A key that is listed twice** is read-only if any of its lines says
-  so, and has the name of its first line.
-- **A comment that holds `read-only`** (or `readonly`, `read_only`,
-  `read only`, anywhere, in any case, whatever dash or invisible
-  character it is written with) rejects a line without the option:
-  `ssh-ed25519 AAAA… read-only guest` is how a read-only key is written
-  wrongly, and as the format stands it would be a full key.
+  it has none (such a key is read-only).
+- **A key that is listed twice** is read-only unless every line names it
+  an admin, and has the name of its first line.
 - Every key type `golang.org/x/crypto/ssh` reads is accepted, **except
   certificates**: kosh checks no certificate's validity, principals or
   authority, so a line that holds one is rejected.
@@ -204,8 +211,9 @@ updated in a pod. When the list changes:
 
 - a session whose key is no longer listed is closed, with a line that
   says so;
-- a session whose key went from full to read-only or back is closed the
-  same way: the user connects again and gets the new grant.
+- a session whose key went from admin to read-only or back, by its
+  name, is closed the same way: the user connects again and gets the new
+  grant.
 
 **When the file cannot be read.** At start that is an error and kosh
 exits. Later it means an empty list: nobody is accepted and every
@@ -780,8 +788,10 @@ where it differs from them, this section is what is built. The plan's
   `window-change` and a bounded amount of `env`, and refuses every other
   request, agent forwarding among them. A key that leaves the list loses
   its connections as well as its sessions.
-- **§6.** A full key's comment that holds `read-only`, `readonly`,
-  `read_only` or `read only` anywhere rejects its line.
+- **§6.** Until 0.3.0: a full key's comment that holds `read-only`,
+  `readonly`, `read_only` or `read only` anywhere rejected its line.
+  Since 0.3.0 the name decides (§6 as amended), and that guard is gone
+  with the option.
 - **§8, §12.** The session refuses a query whose namespace is not a name
   or whose resource discovery did not find, as it refuses such a
   reference; no API path is built from an unchecked string. An action

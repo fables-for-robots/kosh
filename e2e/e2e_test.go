@@ -1913,7 +1913,7 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	t.Cleanup(func() {
 		// Back as it was, and waited for, so that a test after this one
 		// does not meet the kubelet's delay.
-		setKeys(t, full.line, "read-only "+ro.line)
+		setKeys(t, full.line, ro.line)
 		var err error
 		eventually(t, 150*time.Second, "the read-only key is accepted again", func() bool {
 			var c *goSession
@@ -2023,11 +2023,11 @@ func waitAccepted(t *testing.T, k key, want bool, within time.Duration) {
 func TestShellEndsWithItsKey(t *testing.T) {
 	inCluster(t)
 	full, ro := fullKey(t), readOnlyKey(t)
-	k := newKey(t, "carol@kosh-e2e")
-	setKeys(t, full.line, "read-only "+ro.line, k.line)
+	k := newKey(t, "carol@kosh-e2e/admin")
+	setKeys(t, full.line, ro.line, k.line)
 	t.Cleanup(func() {
 		// The list as it was, and waited for.
-		setKeys(t, full.line, "read-only "+ro.line)
+		setKeys(t, full.line, ro.line)
 		waitAccepted(t, k, false, 150*time.Second)
 	})
 	waitAccepted(t, k, true, 150*time.Second)
@@ -2044,7 +2044,7 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	end := []string{"key", k.name, "action", "exec", "object", "pods/default/marker", "phase", "end"}
 	shells := len(logLines(t, "action", end...))
 
-	setKeys(t, full.line, "read-only "+ro.line)
+	setKeys(t, full.line, ro.line)
 	changed := time.Now()
 	status := p.exitedWith(120 * time.Second)
 	t.Logf("ssh ended %v after the list changed, with status %d", time.Since(changed).Round(100*time.Millisecond), status)

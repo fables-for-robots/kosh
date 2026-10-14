@@ -167,14 +167,19 @@ func newSigner(t *testing.T) ssh.Signer {
 	return s
 }
 
-// keyLine is a line of a key list for signer, named name.
+// keyLine is a line of a key list for signer, named name, with the
+// admin suffix on the name unless readOnly: the key's name in the list,
+// the log and the header is then admin(name).
 func keyLine(signer ssh.Signer, name string, readOnly bool) string {
-	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
-	if readOnly {
-		line = keys.OptionReadOnly + " " + line
+	if !readOnly {
+		name = admin(name)
 	}
-	return line
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
 }
+
+// admin is the name of an admin's key made with keyLine or harness.key
+// from name.
+func admin(name string) string { return name + keys.AdminSuffix }
 
 // setKeys makes lines the key list.
 func setKeys(t *testing.T, list *keys.List, lines ...string) {
@@ -212,7 +217,7 @@ func flood() tea.Cmd {
 }
 
 func (m testModel) Init() tea.Cmd {
-	if m.s.Grant.Name == panicInitName {
+	if m.s.Grant.Name == admin(panicInitName) {
 		panic("test model: panic in Init")
 	}
 	return nil

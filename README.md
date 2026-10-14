@@ -139,39 +139,48 @@ and reached directly.
 ## Keys
 
 `authorizedKeys` is the text of an OpenSSH `authorized_keys` file: one key
-to a line, the comment after the key is its name.
+to a line, the comment after the key is its name, and the name says what
+the key may do.
 
 ```
-ssh-ed25519 AAAAC3Nza... alice@laptop
-read-only ssh-ed25519 AAAAC3Nza... bob@laptop
+ssh-ed25519 AAAAC3Nza... alice@laptop/admin
+ssh-ed25519 AAAAC3Nza... bob@laptop
 ```
 
-- `read-only` in front makes a key read-only. It is the one option kosh
-  knows: a line with any other option, or one that does not parse, gives
-  no access.
+- **A name that ends in `/admin` is an admin's**, who may do everything
+  kosh does. Every other key is read-only. The suffix is exactly that, in
+  lower case, at the end of the name: `mic92/key-1/admin` is an admin,
+  `bob@laptop`, `bob-admin` and `admin` are read-only, and `bob/Admin` is
+  rejected as an admin written wrongly. The header shows the name, so
+  `Key: alice@laptop/admin` says what the session may do, and so does
+  every line of the log, which names the key.
 - A read-only key has no action: the keys that change the cluster are
-  not bound for it. It sees no Secret's contents: the table of secrets
-  is there, with names, types and the number of entries, and YAML,
-  describe and decode on a secret say `this key is read-only`. It sees
-  everything else the ServiceAccount may read, the environment of pods
-  and the data of ConfigMaps included.
+  not bound for it, and it opens no shell. It sees no Secret's contents:
+  the table of secrets is there, with names, types and the number of
+  entries, and YAML, describe and decode on a secret say `this key is
+  read-only`. It sees everything else the ServiceAccount may read, the
+  environment of pods and the data of ConfigMaps included.
+- A line with an option, such as `no-pty` or `restrict`, or one that does
+  not parse, gives no access. So does a line with `read-only` in front,
+  the mark of a read-only key in kosh before 0.3.0: a list written for
+  those versions is read-only throughout once its keys lose the mark,
+  until the admins' names get the suffix, and kosh warns `key list has no
+  admin: every session is read-only` while that is so.
 - kosh follows the list without a restart: change the value with `helm
   upgrade`, and once the kubelet has updated the mounted file (up to a
   minute or two), a session whose key left the list ends with `this key
-  is no longer accepted`, and one whose key changed between full and
-  read-only ends so that it reconnects with its new rights. The
-  connection of a key that left the list is left for its client to
+  is no longer accepted`, and one whose key changed between admin and
+  read-only, by its name, ends so that it reconnects with its new rights.
+  The connection of a key that left the list is left for its client to
   close, and kosh closes it a second after its last session ended.
-- A certificate is not accepted. A comment may not begin with
-  `read-only`: `ssh-ed25519 AAAA... read-only bob` is a read-only key
-  written wrongly, and the line is rejected.
+- A certificate is not accepted.
 
 ## What a key can do
 
-A full key can do whatever kosh's ServiceAccount can, and by default that
-is bound to `cluster-admin`: a full key is a cluster administrator. The
-ClusterRole it is bound to is `rbac.clusterRole`; to make it less, name a
-narrower one:
+An admin's key can do whatever kosh's ServiceAccount can, and by default
+that is bound to `cluster-admin`: an admin of kosh is a cluster
+administrator. The ClusterRole it is bound to is `rbac.clusterRole`; to
+make it less, name a narrower one:
 
 ```sh
 helm upgrade kosh ./charts/kosh --namespace kosh --reuse-values --set rbac.clusterRole=view
@@ -185,18 +194,18 @@ Kubernetes' audit log names kosh's ServiceAccount for everything kosh
 does; kosh's own log names the key, with a line for every action:
 
 ```
-level=INFO msg=action key=alice@kosh-e2e fingerprint=SHA256:... action=scale object=deployments/default/web replicas=3
+level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=scale object=deployments/default/web replicas=3
 ```
 
-A shell in a pod is an action: full keys only, into whatever container
+A shell in a pod is an action: admins only, into whatever container
 the ServiceAccount's role allows. A narrower role needs `get` and
 `create` on `pods/exec` for it; without them the API refuses, and kosh
 says so. kosh logs who opened a shell in what, with which command, and
 how and when it ended:
 
 ```
-level=INFO msg=action key=alice@kosh-e2e fingerprint=SHA256:... action=exec object=pods/default/marker phase=start container=marker command="\"sh\" \"-c\" \"command -v bash >/dev/null && exec bash || exec sh\""
-level=INFO msg=action key=alice@kosh-e2e fingerprint=SHA256:... action=exec object=pods/default/marker phase=end container=marker duration=1m29.686359728s started=true status=0
+level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=exec object=pods/default/marker phase=start container=marker command="\"sh\" \"-c\" \"command -v bash >/dev/null && exec bash || exec sh\""
+level=INFO msg=action key=alice@kosh-e2e/admin fingerprint=SHA256:... action=exec object=pods/default/marker phase=end container=marker duration=1m29.686359728s started=true status=0
 ```
 
 What is typed in a shell, and what it prints, is never logged, and

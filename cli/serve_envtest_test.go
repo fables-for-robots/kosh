@@ -97,10 +97,10 @@ func newUser(t *testing.T, name string, readOnly bool) user {
 	if err != nil {
 		t.Fatal(err)
 	}
-	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
-	if readOnly {
-		line = keys.OptionReadOnly + " " + line
+	if !readOnly {
+		name += keys.AdminSuffix
 	}
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
 	return user{signer: signer, line: line}
 }
 

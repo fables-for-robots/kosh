@@ -9,8 +9,9 @@ image:
 imagePullSecrets: []
 
 # The key list: the text of an OpenSSH authorized_keys file, one key to a
-# line. A key with the option `read-only` is read-only; any other option
-# rejects the line. Changing it does not restart kosh, which follows the file.
+# line, the comment after the key its name. A key whose name ends in /admin
+# is an admin; every other key is read-only. A line with an option is
+# rejected. Changing it does not restart kosh, which follows the file.
 authorizedKeys: ""
 
 ssh:
@@ -64,7 +65,7 @@ state:
 rbac:
   # Bind the ServiceAccount to a ClusterRole.
   create: true
-  # The ClusterRole. A full key of kosh can do whatever this role can;
+  # The ClusterRole. An admin of kosh can do whatever this role can;
   # cluster-admin says that plainly.
   clusterRole: cluster-admin
 
