@@ -1,8 +1,8 @@
-Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <d> Describe        <ctrl-d> Delete
-Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </> Filter        <y> YAML            <e> Edit
-kosh:    v0.1.0                       <shift-s> Sort Status   <space> Mark      <l> Logs            <ctrl-k> Kill
-                                      <shift-o> Sort Column   <shift-j> Owner   <p> Logs Previous
-                                      <ctrl-w> Wide           <?> Help          <s> Shell
+Key:     alice@laptop   <0> all       <shift-n> Sort Name     <ctrl-z>  Faults   <d> Describe        <ctrl-d> Delete
+Cluster: v1.33.1        <1> default   <shift-a> Sort Age      </>       Filter   <y> YAML            <e>      Edit
+kosh:    v0.1.0                       <shift-s> Sort Status   <space>   Mark     <l> Logs            <ctrl-k> Kill
+                                      <shift-o> Sort Column   <shift-j> Owner    <p> Logs Previous
+                                      <ctrl-w>  Wide          <?>       Help     <s> Shell
 
 ┌────────────────────────────────────────────────── Pods(default)[2] ──────────────────────────────────────────────────┐
 │NAME↑  READY  STATUS   RESTARTS  AGE                                                                                  │

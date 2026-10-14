@@ -158,7 +158,7 @@ func TestHeaderPrefersHelpToMoreShortcuts(t *testing.T) {
 		t.Fatalf("%d recent namespaces", got)
 	}
 	header := strings.Join(hs.lines()[:headerHeight], "\n")
-	if !strings.Contains(header, "<?> Help") {
+	if !showsHint(header, "?", "Help") {
 		t.Errorf("the header does not show <?> Help:\n%s", header)
 	}
 	// The first column of shortcuts: 0 to 4; not the second.
@@ -173,9 +173,9 @@ func TestHeaderPrefersHelpToMoreShortcuts(t *testing.T) {
 	// Wide enough, every shortcut is shown, and the hints too.
 	hs.send(tea.WindowSizeMsg{Width: 200, Height: 24})
 	header = strings.Join(hs.lines()[:headerHeight], "\n")
-	for _, want := range []string{"<9> kube-system", "<?> Help"} {
-		if !strings.Contains(header, want) {
-			t.Errorf("at 200 the header does not show %s:\n%s", want, header)
+	for _, want := range [][2]string{{"9", "kube-system"}, {"?", "Help"}} {
+		if !showsHint(header, want[0], want[1]) {
+			t.Errorf("at 200 the header does not show <%s> %s:\n%s", want[0], want[1], header)
 		}
 	}
 }
@@ -190,7 +190,7 @@ func TestHelpMovesSideways(t *testing.T) {
 	hs.wantFrame("<j/down>")
 	seen := false
 	for range 6 {
-		if strings.Contains(hs.frame(), "<ctrl-c> Quit") {
+		if showsHint(hs.frame(), "ctrl-c", "Quit") {
 			seen = true
 			break
 		}
@@ -202,7 +202,8 @@ func TestHelpMovesSideways(t *testing.T) {
 	for range 6 {
 		hs.press("left")
 	}
-	hs.wantFrame("<j/down>", "<left/right> More Columns")
+	hs.wantFrame("<j/down>")
+	hs.wantHint("left/right", "More Columns")
 
 	// Where every column fits, there is nothing to move, and no hint of
 	// it.

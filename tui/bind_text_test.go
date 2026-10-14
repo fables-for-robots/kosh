@@ -197,8 +197,8 @@ func TestDecodeOpens(t *testing.T) {
 
 func TestDecodeOnlyOnSecrets(t *testing.T) {
 	sess := textPodsAndSecrets(keys.Grant{Name: "alice@laptop"})
-	hs := newHarness(t, sess, 100, 30)
-	hs.wantFrame("<d> Describe")
+	hs := newHarness(t, sess, 120, 30)
+	hs.wantHint("d", "Describe")
 	hs.notFrame("Decode")
 	for _, h := range hs.table().Hints() {
 		if h.Key == "x" {
@@ -287,7 +287,9 @@ func TestReadOnlySecret(t *testing.T) {
 	sess.Secrets[textSecret.String()] = []kube.SecretEntry{{Key: "password", Value: "hunter2"}}
 	hs := newHarness(t, sess, 100, 30)
 	hs.command("secrets")
-	hs.wantFrame("<d> Describe", "<y> YAML", "<x> Decode")
+	hs.wantHint("d", "Describe")
+	hs.wantHint("y", "YAML")
+	hs.wantHint("x", "Decode")
 	before := hs.frame()
 	for _, k := range []string{"d", "y", "x"} {
 		hs.clock.advance(time.Minute) // the flash before is gone

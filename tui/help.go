@@ -84,11 +84,7 @@ func (v *helpView) View(w, h int) string {
 	var cols []column
 	for _, s := range v.sections {
 		for i, hints := range columnsOf(s.hints, h-1) {
-			keyW := 0
-			for _, hn := range hints {
-				keyW = max(keyW, ansi.StringWidth(cleanLine(hn.Key))+2)
-			}
-			part := helpLines(hints, keyW)
+			part := helpLines(hints, keyWidth(hints))
 			title := s.title
 			if i > 0 {
 				title = ""
@@ -141,7 +137,18 @@ func columnsOf(hints []hint, rows int) [][]hint {
 	return out
 }
 
-// helpLines draws hints as "<key> text", the texts in a column.
+// keyWidth is the width of the widest key of hints, in its brackets.
+func keyWidth(hints []hint) int {
+	w := 0
+	for _, h := range hints {
+		w = max(w, ansi.StringWidth(cleanLine(h.Key))+2)
+	}
+	return w
+}
+
+// helpLines draws hints as "<key> text", with every key padded to keyW
+// cells, so that the texts of a column start under each other. The
+// header and the help both draw their columns with it.
 func helpLines(hints []hint, keyW int) []string {
 	out := make([]string, len(hints))
 	for i, h := range hints {

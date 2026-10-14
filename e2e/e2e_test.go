@@ -301,6 +301,19 @@ func row(lines []string, first string, more ...string) string {
 	return ""
 }
 
+// lineWithHint returns whether a line shows the hint of key with text
+// after it: "<key> text", with the padding that lines a header column's
+// texts up between them.
+func lineWithHint(lines []string, key, text string) bool {
+	re := regexp.MustCompile(regexp.QuoteMeta("<"+key+">") + " +" + regexp.QuoteMeta(text))
+	for _, l := range lines {
+		if re.MatchString(l) {
+			return true
+		}
+	}
+	return false
+}
+
 // lineWith returns whether a line holds every one of texts.
 func lineWith(lines []string, texts ...string) bool {
 	for _, l := range lines {
@@ -706,7 +719,7 @@ func TestSSHScales(t *testing.T) {
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
 	// The hint a read-only key is not shown (TestReadOnlyKey).
-	c.waitUntil(wait, "the hint <s> Scale", func(lines []string) bool { return lineWith(lines, "<s> Scale") })
+	c.waitUntil(wait, "the hint <s> Scale", func(lines []string) bool { return lineWithHint(lines, "s", "Scale") })
 	c.send("s")
 	c.waitFor("Scale deployments/default/web?", "Replicas")
 	c.send(scaleTo3...)
@@ -824,7 +837,7 @@ func TestReadOnlyKey(t *testing.T) {
 
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
-	if lineWith(c.scr.lines(), "<s>", "Scale") {
+	if lineWithHint(c.scr.lines(), "s", "Scale") {
 		t.Errorf("a read-only key is offered <s> Scale:\n%s", c.scr)
 	}
 	before := replicas(t)
@@ -1352,7 +1365,7 @@ func TestShell(t *testing.T) {
 	inCluster(t)
 	p := sshPTY(t, fullKey(t), 120, 40)
 	p.waitRow("marker", "Running")
-	p.waitUntil(wait, "the hint <s> Shell", func(lines []string) bool { return lineWith(headerLines(lines), "<s> Shell") })
+	p.waitUntil(wait, "the hint <s> Shell", func(lines []string) bool { return lineWithHint(headerLines(lines), "s", "Shell") })
 	p.openShell()
 	p.shellRun("echo kosh-$((6*7))", "kosh-42")
 	p.shellRun("stty size", "40 120")
@@ -1676,7 +1689,7 @@ func TestShellReadOnlyKey(t *testing.T) {
 	c.waitRow("marker", "Running")
 	c.fills(120, 40)
 	before := c.scr.lines()
-	if lineWith(headerLines(before), "<s> Shell") {
+	if lineWithHint(headerLines(before), "s", "Shell") {
 		t.Errorf("a read-only key is offered <s> Shell:\n%s", c.scr)
 	}
 	c.send("s")

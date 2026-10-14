@@ -99,33 +99,38 @@ func (r *root) header() []string {
 }
 
 // hintColumns returns the columns of the top view's hints that fit
-// whole right of used cells. When not all of them do, and the hint of ?
-// is not among those that do, it takes the last place shown.
+// whole right of used cells, each drawn as the help draws a column: the
+// keys padded to the column's widest, the texts under each other. When
+// not all of them fit, and the hint of ? is not among those that do, it
+// takes the last place shown.
 func (r *root) hintColumns(used int) [][]string {
 	top := r.top()
 	if top == nil {
 		return nil
 	}
-	var hints []string
-	help := -1
-	for i, h := range top.Hints() {
-		if h.Key == "?" {
-			help = i
-		}
-		hints = append(hints, styleKey.Render("<"+cleanLine(h.Key)+">")+" "+styleHint.Render(cleanLine(h.Text)))
-	}
-	cols := columns(hints, hintRows)
+	hints := top.Hints()
+	help := slices.IndexFunc(hints, func(h hint) bool { return h.Key == "?" })
+	cols := hintCells(columnsOf(hints, hintRows))
 	n := fitting(cols, used, r.w)
 	if n == len(cols) || help < 0 || help < n*hintRows {
 		return cols[:n]
 	}
 	for ; n > 0; n-- {
 		shown := append(slices.Clone(hints[:n*hintRows-1]), hints[help])
-		if c := columns(shown, hintRows); fitting(c, used, r.w) == n {
+		if c := hintCells(columnsOf(shown, hintRows)); fitting(c, used, r.w) == n {
 			return c
 		}
 	}
 	return nil
+}
+
+// hintCells draws each column of hints, its keys padded to its widest.
+func hintCells(cols [][]hint) [][]string {
+	out := make([][]string, len(cols))
+	for i, c := range cols {
+		out[i] = helpLines(c, keyWidth(c))
+	}
+	return out
 }
 
 // fitting is how many of cols, from the first, fit whole in a line w

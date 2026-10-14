@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,14 @@ func headerSession(name string) *kubetest.Session {
 
 // longKeyName is a key's name of 60 characters, some of them wide.
 var longKeyName = "alice-" + strings.Repeat("名", 10) + strings.Repeat("x", 43) + "@"
+
+// showsHint reports whether s holds the hint of key with text after it:
+// "<key> text", with the padding that lines a column's texts up between
+// them.
+func showsHint(s, key, text string) bool {
+	re := regexp.MustCompile(regexp.QuoteMeta("<"+key+">") + " +" + regexp.QuoteMeta(text))
+	return re.MatchString(s)
+}
 
 // headerAt returns the header's lines, drawn and plain, in a window w
 // wide.
@@ -82,7 +91,7 @@ func TestHeaderNeverCutsItsPadding(t *testing.T) {
 			all := strings.Join(plain, "\n")
 			for _, h := range hints {
 				key := "<" + h.Key + ">"
-				if strings.Contains(all, key) && !strings.Contains(all, key+" "+h.Text) {
+				if strings.Contains(all, key) && !showsHint(all, h.Key, h.Text) {
 					t.Errorf("name %q, width %d: the hint %s is cut:\n%s", name, w, key, all)
 				}
 			}
@@ -100,11 +109,11 @@ func TestHeaderShowsHelpWhenItShowsHints(t *testing.T) {
 			all := strings.Join(plain, "\n")
 			any := false
 			for _, h := range hints {
-				if h.Key != "?" && strings.Contains(all, "<"+h.Key+"> "+h.Text) {
+				if h.Key != "?" && showsHint(all, h.Key, h.Text) {
 					any = true
 				}
 			}
-			if any && !strings.Contains(all, "<?> Help") {
+			if any && !showsHint(all, "?", "Help") {
 				t.Errorf("name %q, width %d: the header shows hints but not <?> Help:\n%s", name, w, all)
 			}
 			if any {
@@ -113,6 +122,70 @@ func TestHeaderShowsHelpWhenItShowsHints(t *testing.T) {
 		}
 		if shownAt == 0 {
 			t.Errorf("name %q: no width from 40 to 200 shows a hint", name)
+		}
+	}
+}
+
+// textStarts returns, for each column of hints as the header shows
+// them in its plain lines, the cells its texts start at, with the keys
+// that start there. A column whose texts are lined up has one entry.
+func textStarts(t *testing.T, plain []string, hints []hint) []map[int][]string {
+	t.Helper()
+	var out []map[int][]string
+	for _, col := range columnsOf(hints, hintRows) {
+		starts := map[int][]string{}
+		for i, h := range col {
+			key := "<" + h.Key + ">"
+			at := strings.Index(plain[i], key)
+			if at < 0 {
+				t.Fatalf("line %d of the header does not show %s:\n%s", i, key, strings.Join(plain, "\n"))
+			}
+			rest := plain[i][at+len(key):]
+			pad := len(rest) - len(strings.TrimLeft(rest, " "))
+			start := ansi.StringWidth(plain[i][:at]) + ansi.StringWidth(key) + pad
+			starts[start] = append(starts[start], h.Key)
+		}
+		out = append(out, starts)
+	}
+	return out
+}
+
+// In every column of the header, the texts of the hints start under
+// each other, however wide the keys before them: "<ctrl-w> Wide" under
+// "<shift-n> Sort Name" has its text one cell further right than its
+// key's width alone would put it. The same holds in the help, which the
+// header draws its columns with.
+func TestHeaderAlignsTheTextsOfAColumn(t *testing.T) {
+	hs := newHarness(t, headerSession("al"), 200, 24)
+	// The table, and the describe of a pod, whose hints are another
+	// view's: wide enough for every hint, so that the columns are the
+	// hints in order, hintRows to a column.
+	for _, open := range []string{"", "d"} {
+		if open != "" {
+			hs.press(open)
+		}
+		hints := hs.root().top().Hints()
+		_, plain := headerAt(hs, 200)
+		for c, starts := range textStarts(t, plain, hints) {
+			if len(starts) != 1 {
+				t.Errorf("view %q, column %d: its texts start at different cells, %v:\n%s", hs.root().top().Crumb(), c, starts, strings.Join(plain, "\n"))
+			}
+		}
+	}
+	// The help's columns, drawn by the same function.
+	hs.press("esc", "?")
+	for _, s := range hs.root().top().(*helpView).sections {
+		for c, col := range columnsOf(s.hints, 23) {
+			lines := helpLines(col, keyWidth(col))
+			starts := map[int]bool{}
+			for _, l := range lines {
+				p := ansi.Strip(l)
+				rest := p[strings.Index(p, ">")+1:]
+				starts[len(p)-len(strings.TrimLeft(rest, " "))] = true
+			}
+			if len(starts) != 1 {
+				t.Errorf("help section %q, column %d: its texts start at different cells:\n%s", s.title, c, strings.Join(lines, "\n"))
+			}
 		}
 	}
 }
