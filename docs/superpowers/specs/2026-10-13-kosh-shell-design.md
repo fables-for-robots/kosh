@@ -68,12 +68,17 @@ section (§5, §11, §13), it is a section of that document.
    is forbidden: User … cannot create resource "pods/exec"`) is said in
    the flash, as every action's refusal is: another command would not
    help.
-6. **When kosh or the key goes.** A shell's connection ends when its
-   session does (§5 below): the key leaves the list, the client goes
-   away, kosh stops. The user sees what a session sees then (`kosh:
-   this key is no longer accepted`, `kosh is shutting down`), on a
-   terminal that is back in its normal state. What was running in the
-   container at that moment is not ended by this: see §7.
+6. **When kosh or the key goes.** A shell ends when its session does
+   (§5 below): the key leaves the list, the client goes away, kosh
+   stops. The user sees what a session sees then (`kosh: this key is no
+   longer accepted`, `kosh is shutting down`), on a terminal that is
+   back in its normal state. What was running in the container at that
+   moment is not ended by this: see §7. The SSH connection of a key
+   that left the list is then left for its client to close, and kosh
+   closes it a second after its last session ended if the client has
+   not: closed at once, under the client's last writes, it would be
+   reset, and a `kubectl port-forward` ends for all its connections on
+   such an error. In that second it can open no session.
 
 ## 2. The command
 
