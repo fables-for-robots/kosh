@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/keys"
+	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
 )
 
@@ -335,5 +336,25 @@ func TestPromptOverAFullscreenView(t *testing.T) {
 	for _, size := range [][2]int{{100, 1}, {80, 1}, {1, 1}, {80, 12}, {0, 0}} {
 		hs.send(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		hs.drawn()
+	}
+}
+
+// A wait on the usage watch that ends without a signal is not a
+// reading: the arrows stay, and the root waits again.
+func TestAUsageWaitWithoutASignalKeepsTheReadings(t *testing.T) {
+	sess := newSession()
+	hs := newHarness(t, sess, 100, 30)
+	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
+	hs.awaitFrame("CPU:     12%")
+	sess.SetUsage(kube.ClusterUsage{CPU: 14, Mem: 40, Served: true}, true)
+	hs.awaitFrame("CPU:     14% ↑")
+
+	hs.send(usageMsg{})
+	hs.wantFrame("CPU:     14% ↑", "MEM:     40% ↓")
+
+	sess.SetUsage(kube.ClusterUsage{CPU: 9, Mem: 40, Served: true}, true)
+	hs.awaitFrame("CPU:     9% ↓")
+	if l := hs.line("MEM:"); strings.ContainsAny(l, "↑↓") {
+		t.Errorf("a MEM that did not change has an arrow: %q", l)
 	}
 }

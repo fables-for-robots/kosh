@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fables-for-robots/kosh/keys"
+	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
 	"github.com/fables-for-robots/kosh/render"
 )
@@ -188,4 +189,124 @@ func TestHeaderAlignsTheTextsOfAColumn(t *testing.T) {
 			}
 		}
 	}
+}
+
+// usageLines returns lines 3 and 4 of the header, where the CPU and MEM
+// lines are, up to the first key right of the left block.
+func usageLines(plain []string) (cpu, mem string) {
+	left := func(l string) string {
+		if i := strings.Index(l, "<"); i >= 0 {
+			l = l[:i]
+		}
+		return strings.TrimRight(l, " ")
+	}
+	return left(plain[3]), left(plain[4])
+}
+
+func TestHeaderShowsUsageWhenServed(t *testing.T) {
+	sess := headerSession("alice@kosh-e2e")
+	hs := newHarness(t, sess, 80, 24)
+
+	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
+	hs.awaitFrame("CPU:     12%")
+	_, plain := headerAt(hs, 80)
+	if cpu, mem := usageLines(plain); cpu != "CPU:     12%" || mem != "MEM:     47%" {
+		t.Errorf("the first reading: the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     12%", "MEM:     47%")
+	}
+
+	sess.SetUsage(kube.ClusterUsage{CPU: 14, Mem: 40, Served: true}, true)
+	hs.awaitFrame("CPU:     14%")
+	drawn, plain := headerAt(hs, 80)
+	if cpu, mem := usageLines(plain); cpu != "CPU:     14% ↑" || mem != "MEM:     40% ↓" {
+		t.Errorf("a rise and a fall: the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     14% ↑", "MEM:     40% ↓")
+	}
+	if !strings.Contains(drawn[3], sgr(styleUp)+"↑") {
+		t.Errorf("the arrow up is not drawn in styleUp: %q", drawn[3])
+	}
+	if !strings.Contains(drawn[4], sgr(styleDown)+"↓") {
+		t.Errorf("the arrow down is not drawn in styleDown: %q", drawn[4])
+	}
+
+	// The same reading again: nothing changed since the one before.
+	sess.SetUsage(kube.ClusterUsage{CPU: 14, Mem: 40, Served: true}, true)
+	hs.await("the arrows to go", func() bool {
+		cpu, mem := usageLines(hs.lines())
+		return !strings.ContainsAny(cpu+mem, "↑↓")
+	})
+	_, plain = headerAt(hs, 80)
+	if cpu, mem := usageLines(plain); cpu != "CPU:     14%" || mem != "MEM:     40%" {
+		t.Errorf("the same reading again: the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     14%", "MEM:     40%")
+	}
+
+	// The lines do not move the columns right of the left block, and
+	// every line is as wide as the window, at every width.
+	for w := 40; w <= 200; w++ {
+		drawn, plain := headerAt(hs, w)
+		for i, l := range drawn {
+			if got := ansi.StringWidth(l); got != w {
+				t.Errorf("width %d: line %d of the header is %d cells wide: %q", w, i, got, plain[i])
+			}
+		}
+	}
+	_, plain = headerAt(hs, 80)
+	if at, want := strings.Index(plain[3], "<shift-o>"), strings.Index(plain[0], "<shift-n>"); at != want {
+		t.Errorf("the hints of line 3 start at %d, those of line 0 at %d:\n%s", at, want, strings.Join(plain, "\n"))
+	}
+}
+
+func TestHeaderSaysNAWhileServedWithoutAReading(t *testing.T) {
+	sess := headerSession("alice@kosh-e2e")
+	hs := newHarness(t, sess, 80, 24)
+	sess.SetUsage(kube.ClusterUsage{Served: true}, false)
+	hs.awaitFrame("CPU:     n/a")
+	_, plain := headerAt(hs, 80)
+	if cpu, mem := usageLines(plain); cpu != "CPU:     n/a" || mem != "MEM:     n/a" {
+		t.Errorf("the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     n/a", "MEM:     n/a")
+	}
+
+	// A reading after none has no arrow: there is no number before it.
+	sess.SetUsage(kube.ClusterUsage{CPU: 30, Mem: 60, Served: true}, true)
+	hs.awaitFrame("CPU:     30%")
+	_, plain = headerAt(hs, 80)
+	if cpu, mem := usageLines(plain); cpu != "CPU:     30%" || mem != "MEM:     60%" {
+		t.Errorf("a reading after n/a: the usage lines are %q and %q, want %q and %q", cpu, mem, "CPU:     30%", "MEM:     60%")
+	}
+}
+
+func TestHeaderHasNoUsageLinesWithoutTheAPI(t *testing.T) {
+	sess := headerSession("alice@kosh-e2e")
+	hs := newHarness(t, sess, 80, 24)
+	check := func(when string) {
+		t.Helper()
+		drawn, plain := headerAt(hs, 80)
+		for i, l := range drawn {
+			if got := ansi.StringWidth(l); got != 80 {
+				t.Errorf("%s: line %d of the header is %d cells wide: %q", when, i, got, plain[i])
+			}
+		}
+		if cpu, mem := usageLines(plain); cpu != "" || mem != "" {
+			t.Errorf("%s: lines 3 and 4 of the header are not blank on the left: %q and %q", when, cpu, mem)
+		}
+		if strings.Contains(strings.Join(plain, "\n"), "CPU:") {
+			t.Errorf("%s: the header has a CPU line:\n%s", when, strings.Join(plain, "\n"))
+		}
+	}
+	check("the default fake")
+
+	// The API served, and then no longer: the lines go with it.
+	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
+	hs.awaitFrame("CPU:     12%")
+	sess.SetUsage(kube.ClusterUsage{}, false)
+	hs.await("the usage lines to go", func() bool { return !strings.Contains(hs.plain(), "CPU:") })
+	check("the API gone")
+}
+
+func TestHeaderWithUsage80(t *testing.T) {
+	sess := headerSession("alice@kosh-e2e")
+	hs := newHarness(t, sess, 80, 24)
+	sess.SetUsage(kube.ClusterUsage{CPU: 12, Mem: 47, Served: true}, true)
+	hs.awaitFrame("CPU:     12%")
+	sess.SetUsage(kube.ClusterUsage{CPU: 14, Mem: 40, Served: true}, true)
+	hs.awaitFrame("CPU:     14% ↑")
+	hs.golden()
 }

@@ -29,6 +29,10 @@ var (
 	colorWhite          = lipgloss.Color("#FFFFFF")
 )
 
+// colorRed is the red of the arrow of a usage that rose, as k9s draws
+// it: the stock skin has no red of its own.
+var colorRed = lipgloss.Color("#FF0000")
+
 // The styles every part draws with. They paint the foreground and leave
 // the terminal's background alone, except under the cursor and a marked
 // row.
@@ -70,6 +74,10 @@ var (
 	styleRowNew     = lipgloss.NewStyle().Foreground(colorDodgerBlue)
 	styleRowChanged = lipgloss.NewStyle().Foreground(colorGreenYellow)
 	styleSection    = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+	// styleUp and styleDown are the header's arrows of a usage that
+	// rose or fell, red and green as k9s draws them.
+	styleUp   = lipgloss.NewStyle().Foreground(colorRed)
+	styleDown = lipgloss.NewStyle().Foreground(colorGreen)
 )
 
 // healthStyles colour a row by its health, as k9s's status colours do.
