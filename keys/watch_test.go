@@ -3,6 +3,7 @@ package keys
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,7 +130,7 @@ func TestOpenLogsRejectedLinesAndCount(t *testing.T) {
 	key, line := newKey(t)
 	_, other := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, line+" me/admin\nno-pty "+other+"\n# fine\nnot a key\n")
+	writeFile(t, path, line+" me/cluster-admin\nno-pty "+other+" me/view\n# fine\nnot a key\n")
 	log, c := newLog()
 	l, err := Open(path, log)
 	if err != nil {
@@ -153,12 +154,18 @@ func TestOpenLogsRejectedLinesAndCount(t *testing.T) {
 	}
 }
 
-func TestReloadCountsBothKinds(t *testing.T) {
-	_, a := newKey(t)
-	_, b := newKey(t)
-	_, c := newKey(t)
+// The log of a reading counts the keys and the distinct roles they name.
+func TestCounts(t *testing.T) {
+	var list strings.Builder
+	for _, name := range []string{
+		"a/view", "b/view", "c/cluster-admin", "d/edit@team-a", "e/edit@team-a", "f/edit@team-b",
+	} {
+		_, line := newKey(t)
+		list.WriteString(line + " " + name + "\n")
+	}
+	list.WriteString("not a key\n")
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, a+" a/admin\n"+b+" b/admin\n"+c+" c\n")
+	writeFile(t, path, list.String())
 	log, rec := newLog()
 	if _, err := Open(path, log); err != nil {
 		t.Fatal(err)
@@ -167,30 +174,55 @@ func TestReloadCountsBothKinds(t *testing.T) {
 	if len(infos) != 1 {
 		t.Fatalf("info = %+v, want one line", infos)
 	}
-	for k, want := range map[string]string{"keys": "3", "admin": "2", "read_only": "1"} {
-		if got := infos[0].attrs[k]; got != want {
-			t.Errorf("%s = %q, want %s", k, got, want)
-		}
-	}
-	if warns := rec.at(slog.LevelWarn); len(warns) != 0 {
-		t.Errorf("warnings = %+v, want none: the list has admins", warns)
+	want := map[string]string{"path": path, "keys": "6", "clusterroles": "2", "roles": "2", "rejected": "1"}
+	if !maps.Equal(infos[0].attrs, want) {
+		t.Errorf("attrs = %v, want %v", infos[0].attrs, want)
 	}
 }
 
-// A list without an admin is most likely one written for a version where
-// a key was full unless marked: it is accepted, read-only throughout, and
-// the log says so.
-func TestOpenWarnsWithoutAnAdmin(t *testing.T) {
-	_, a := newKey(t)
-	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, a+" a\n")
-	log, rec := newLog()
-	if _, err := Open(path, log); err != nil {
-		t.Fatal(err)
-	}
-	warns := rec.at(slog.LevelWarn)
-	if len(warns) != 1 || warns[0].msg != msgNoAdmin {
-		t.Errorf("warnings = %+v, want one: %s", warns, msgNoAdmin)
+// A list of 0.3 or 0.4 names its admins …/admin, which is now the
+// ClusterRole admin: every reading says so, and names the keys.
+func TestAdminWarning(t *testing.T) {
+	for _, tc := range []struct {
+		names []string
+		keys  string // of the warning; "" for none
+	}{
+		{[]string{"x/admin"}, "x/admin"},
+		{[]string{"y/admin", "a/view", "x/admin"}, "x/admin, y/admin"},
+		{[]string{"x/admin@ns"}, ""},
+		{[]string{"x/cluster-admin", "y/Admin", "z/admin-x"}, ""},
+	} {
+		t.Run(strings.Join(tc.names, ","), func(t *testing.T) {
+			var list strings.Builder
+			for _, name := range tc.names {
+				_, line := newKey(t)
+				list.WriteString(line + " " + name + "\n")
+			}
+			path := filepath.Join(t.TempDir(), "authorized_keys")
+			writeFile(t, path, list.String())
+			log, rec := newLog()
+			l, err := Open(path, log)
+			if err != nil {
+				t.Fatal(err)
+			}
+			warns := rec.at(slog.LevelWarn)
+			if tc.keys == "" {
+				if len(warns) != 0 {
+					t.Errorf("warnings = %+v, want none", warns)
+				}
+				return
+			}
+			if len(warns) != 1 || warns[0].msg != msgAdminRole || warns[0].attrs["keys"] != tc.keys || warns[0].attrs["path"] != path {
+				t.Errorf("warnings = %+v, want one: %s, keys=%s", warns, msgAdminRole, tc.keys)
+			}
+			// At every reading, not only the first.
+			watch(t, l)
+			writeFile(t, path, list.String()+"# changed\n")
+			waitFor(t, "the second reading", func() bool { return len(rec.at(slog.LevelInfo)) == 2 })
+			if warns := rec.at(slog.LevelWarn); len(warns) != 2 || warns[1].msg != msgAdminRole {
+				t.Errorf("warnings = %+v, want the warning again", warns)
+			}
+		})
 	}
 }
 
@@ -226,7 +258,7 @@ func TestWatchTakesOverAChangedFile(t *testing.T) {
 	k1, l1 := newKey(t)
 	k2, l2 := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	writeFile(t, path, l1+" one/admin\n")
+	writeFile(t, path, l1+" one/cluster-admin\n")
 	log, c := newLog()
 	l, err := Open(path, log)
 	if err != nil {
@@ -237,13 +269,13 @@ func TestWatchTakesOverAChangedFile(t *testing.T) {
 	if _, ok := l.Lookup(k2); ok {
 		t.Fatal("k2 found before it is in the file")
 	}
-	writeFile(t, path, l1+" one/admin\n"+l2+" two\nrestrict "+l2+"\n")
+	writeFile(t, path, l1+" one/cluster-admin\n"+l2+" two/view\nrestrict "+l2+" two/view\n")
 	waitFor(t, "k2", func() bool { _, ok := l.Lookup(k2); return ok })
 	waitReads(t, l)
 	if n := changes.Load(); n != 1 {
 		t.Errorf("OnChange called %d times, want 1", n)
 	}
-	if g, _ := l.Lookup(k2); !g.ReadOnly || g.Name != "two" {
+	if g, _ := l.Lookup(k2); g.Role != (Role{Kind: "ClusterRole", Name: "view"}) || g.Name != "two/view" {
 		t.Errorf("k2 = %+v", g)
 	}
 	if _, ok := l.Lookup(k1); !ok {
@@ -262,7 +294,7 @@ func TestWatchTakesOverAChangedFile(t *testing.T) {
 func TestWatchIgnoresAnUnchangedFile(t *testing.T) {
 	key, line := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	content := line + " me\n"
+	content := line + " me/view\n"
 	writeFile(t, path, content)
 	log, _ := newLog()
 	l, err := Open(path, log)
@@ -290,7 +322,7 @@ func TestWatchIgnoresAnUnchangedFile(t *testing.T) {
 func TestWatchUnreadableFileIsEmpty(t *testing.T) {
 	key, line := newKey(t)
 	path := filepath.Join(t.TempDir(), "authorized_keys")
-	content := line + " me\n"
+	content := line + " me/view\n"
 	writeFile(t, path, content)
 	log, c := newLog()
 	l, err := Open(path, log)
@@ -326,7 +358,7 @@ func TestWatchFollowsASwappedSymlink(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(dir, name), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		writeFile(t, filepath.Join(dir, name, "authorized_keys"), line+"\n")
+		writeFile(t, filepath.Join(dir, name, "authorized_keys"), line+" "+name+"/view\n")
 	}
 	if err := os.Symlink("v1", filepath.Join(dir, "..data")); err != nil {
 		t.Fatal(err)
@@ -356,7 +388,7 @@ func TestWatchEndsWithItsContext(t *testing.T) {
 	t.Run("a list that Open made", func(t *testing.T) {
 		_, line := newKey(t)
 		path := filepath.Join(t.TempDir(), "authorized_keys")
-		writeFile(t, path, line+"\n")
+		writeFile(t, path, line+" me/view\n")
 		log, _ := newLog()
 		l, err := Open(path, log)
 		if err != nil {
@@ -395,7 +427,7 @@ func TestWatchWithoutAnIntervalReturns(t *testing.T) {
 		t.Run(interval.String(), func(t *testing.T) {
 			_, line := newKey(t)
 			path := filepath.Join(t.TempDir(), "authorized_keys")
-			writeFile(t, path, line+"\n")
+			writeFile(t, path, line+" me/view\n")
 			log, _ := newLog()
 			l, err := Open(path, log)
 			if err != nil {

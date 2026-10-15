@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,93 +68,223 @@ func noRejected(t *testing.T, rejected []Rejected) {
 	}
 }
 
-func TestParseAdminAndReadOnly(t *testing.T) {
-	admin, adminLine := newKey(t)
-	ro, roLine := newKey(t)
-	set, rejected := parseString(adminLine + " dragan@mac/admin\n" + roLine + " guest@laptop\n")
+func clusterRole(name string) Role { return Role{Kind: "ClusterRole", Name: name} }
+
+func nsRole(namespace, name string) Role {
+	return Role{Kind: "Role", Namespace: namespace, Name: name}
+}
+
+func TestParseGrants(t *testing.T) {
+	alice, aliceLine := newKey(t)
+	carol, carolLine := newKey(t)
+	set, rejected := parseString(aliceLine + " alice@mac/cluster-admin\n" + carolLine + " carol/edit@team-a\n")
 	noRejected(t, rejected)
 	if set.Len() != 2 {
 		t.Fatalf("Len = %d, want 2", set.Len())
 	}
-	g := mustGrant(t, set, admin)
-	if g.ReadOnly || g.Name != "dragan@mac/admin" || g.Fingerprint != ssh.FingerprintSHA256(admin) {
-		t.Errorf("admin grant = %+v", g)
+	want := Grant{Name: "alice@mac/cluster-admin", Fingerprint: ssh.FingerprintSHA256(alice), Role: clusterRole("cluster-admin")}
+	if g := mustGrant(t, set, alice); g != want {
+		t.Errorf("alice = %+v, want %+v", g, want)
 	}
-	g = mustGrant(t, set, ro)
-	if !g.ReadOnly || g.Name != "guest@laptop" || g.Fingerprint != ssh.FingerprintSHA256(ro) {
-		t.Errorf("read-only grant = %+v", g)
+	want = Grant{Name: "carol/edit@team-a", Fingerprint: ssh.FingerprintSHA256(carol), Role: nsRole("team-a", "edit")}
+	if g := mustGrant(t, set, carol); g != want {
+		t.Errorf("carol = %+v, want %+v", g, want)
 	}
 }
 
-// The suffix is /admin, exactly, at the very end of the name. A name that
-// ends in it in another case is a mistake that is pointed out, not a
-// read-only key that nobody notices; anything else is a read-only key.
-func TestParseAdminSuffix(t *testing.T) {
+// The role is after the name's last /: a ClusterRole, or a Role in the
+// namespace after its @. What is not a role a Kubernetes API takes, and a
+// name without a role or a role without a name, gives no access.
+func TestParseRoleForms(t *testing.T) {
 	for _, tc := range []struct {
-		comment  string
-		admin    bool
-		rejected bool
-		why      string
+		comment string
+		name    string
+		role    Role
+		// reason is the exact reason of a rejection; mentions is a part
+		// of one whose words are the validator's.
+		reason, mentions string
 	}{
-		{"dragan/admin", true, false, "the suffix"},
-		{"mic92/key-1/admin", true, false, "after another slash"},
-		{"/admin", true, false, "nothing before it"},
-		{"Dragan's  old laptop/admin", true, false, "spaces in the name"},
-		{"dragan /admin", true, false, "a space before the slash: it is still the end of the name"},
-		{"dragan/admin  ", true, false, "trailing spaces are not part of a name"},
-		{"dragan", false, false, "no suffix"},
-		{"admin", false, false, "the word without the slash"},
-		{"dragan-admin", false, false, "with a dash"},
-		{"dragan_admin", false, false, "with an underscore"},
-		{"dragan@admin", false, false, "with an at"},
-		{"dragan/admin/", false, false, "a slash after it"},
-		{"dragan/admin laptop", false, false, "not at the end"},
-		{"dragan/administrator", false, false, "a longer word"},
-		{"dragan/admin\u200b", false, false, "a zero-width space after it: not the end, and not pointed out"},
-		{"dragan\u2215admin", false, false, "a division slash, not /"},
-		{"dragan/Admin", false, true, "in another case"},
-		{"dragan/ADMIN", false, true, "in capitals"},
-		{"DRAGAN/ADMIN", false, true, "all in capitals"},
+		{comment: "a/cluster-admin", name: "a", role: clusterRole("cluster-admin")},
+		{comment: "bob@laptop/view", name: "bob@laptop", role: clusterRole("view")},
+		{comment: "carol/edit@team-a", name: "carol", role: nsRole("team-a", "edit")},
+		{comment: "mic92/key-1/cluster-admin", name: "mic92/key-1", role: clusterRole("cluster-admin")},
+		{comment: "Dragan's  old laptop/view", name: "Dragan's  old laptop", role: clusterRole("view")},
+		{comment: "dragan /view", name: "dragan ", role: clusterRole("view")},
+		{comment: "a/system:aggregate-to-view", name: "a", role: clusterRole("system:aggregate-to-view")},
+		{comment: "a/admin", name: "a", role: clusterRole("admin")},
+		{comment: "a/Admin", name: "a", role: clusterRole("Admin")},
+		{comment: "alice/view  ", name: "alice", role: clusterRole("view")},
+		{comment: " \talice/edit@team-a \t", name: "alice", role: nsRole("team-a", "edit")},
+
+		{comment: "", reason: reasonNoComment},
+		{comment: "  ", reason: reasonNoComment},
+		{comment: "/view", reason: reasonNoName},
+		{comment: "/edit@team-a", reason: reasonNoName},
+		{comment: "alice", reason: reasonNoRole},
+		{comment: "alice/", reason: reasonNoRole},
+		{comment: "/", reason: reasonNoRole},
+		{comment: "alice/@team-a", reason: reasonNoRole},
+		{comment: "dragan\u2215admin", reason: reasonNoRole},
+		{comment: "a/role@ns@x", mentions: `"role@ns@x"`},
+		{comment: "alice/a b", mentions: `"a b"`},
+		{comment: "dragan/admin laptop", mentions: `"admin laptop"`},
+		{comment: "dragan/admin\u200b", mentions: `"admin\u200b"`},
+		{comment: "alice/..", mentions: `".."`},
+		{comment: "alice/.", mentions: `"."`},
+		{comment: "alice/v%w", mentions: `"v%w"`},
+		{comment: "alice/edit@Team", mentions: `"Team"`},
+		{comment: "alice/edit@team.a", mentions: `"team.a"`},
+		{comment: "alice/edit@" + strings.Repeat("n", 64), mentions: strings.Repeat("n", 64)},
+		{comment: "alice/edit@", mentions: `"edit"`},
 	} {
-		t.Run(tc.comment, func(t *testing.T) {
-			comment, err := strconv.Unquote(`"` + tc.comment + `"`)
-			if err != nil {
-				t.Fatal(err)
-			}
-			key, line := newKey(t)
-			set, rejected := parseString(line + " " + comment + "\n")
-			if tc.rejected {
-				if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reasonAdminCase {
-					t.Fatalf("%s: rejected = %+v, want line 1: %s", tc.why, rejected, reasonAdminCase)
+		t.Run(strconv.Quote(tc.comment), func(t *testing.T) {
+			name, role, reason := ParseRole(tc.comment)
+			switch {
+			case tc.reason != "":
+				if reason != tc.reason {
+					t.Errorf("reason = %q, want %q", reason, tc.reason)
 				}
-				mustNotGrant(t, set, key)
+			case tc.mentions != "":
+				if !strings.Contains(reason, tc.mentions) {
+					t.Errorf("reason = %q, want one that names %s", reason, tc.mentions)
+				}
+			default:
+				if reason != "" {
+					t.Fatalf("rejected: %s", reason)
+				}
+				if name != tc.name || role != tc.role {
+					t.Errorf("= %q, %+v; want %q, %+v", name, role, tc.name, tc.role)
+				}
 				return
 			}
-			noRejected(t, rejected)
-			g := mustGrant(t, set, key)
-			if g.ReadOnly == tc.admin {
-				t.Errorf("%s: ReadOnly = %v, want %v", tc.why, g.ReadOnly, !tc.admin)
+			if name != "" || role != (Role{}) {
+				t.Errorf("a rejection with %q, %+v", name, role)
 			}
-			if want := strings.TrimSpace(comment); g.Name != want {
-				t.Errorf("%s: Name = %q, want %q", tc.why, g.Name, want)
+			// The line of the key list is rejected with the same reason.
+			key, line := newKey(t)
+			set, rejected := parseString(line + " " + tc.comment + "\n")
+			if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reason {
+				t.Errorf("Parse rejected %+v, want line 1: %s", rejected, reason)
 			}
+			mustNotGrant(t, set, key)
 		})
 	}
 }
 
-// The option read-only of earlier versions is refused, so that a list
-// written for them is not read as something else without a word: its
-// keys without /admin are read-only now whatever it says.
-func TestParseRejectsTheReadOnlyOption(t *testing.T) {
+func TestRoleNames(t *testing.T) {
+	for _, tc := range []struct {
+		role          Role
+		group, string string
+	}{
+		{clusterRole("view"), "kosh:clusterrole:view", "ClusterRole/view"},
+		{clusterRole("system:aggregate-to-view"), "kosh:clusterrole:system:aggregate-to-view", "ClusterRole/system:aggregate-to-view"},
+		{nsRole("team-a", "edit"), "kosh:role:team-a:edit", "Role/team-a/edit"},
+	} {
+		if got := tc.role.Group(); got != tc.group {
+			t.Errorf("%+v: Group = %q, want %q", tc.role, got, tc.group)
+		}
+		if got := tc.role.String(); got != tc.string {
+			t.Errorf("%+v: String = %q, want %q", tc.role, got, tc.string)
+		}
+	}
+	g := Grant{Name: "bob@laptop/view", Role: clusterRole("view")}
+	if got := g.User(); got != "kosh:bob@laptop/view" {
+		t.Errorf("User = %q, want kosh:bob@laptop/view", got)
+	}
+}
+
+// A key without a comment has no name, and so no role: it was a read-only
+// key named by its fingerprint before 0.5.0.
+func TestNoCommentIsRejected(t *testing.T) {
+	for _, after := range []string{"", "   ", "\t"} {
+		key, line := newKey(t)
+		set, rejected := parseString(line + after + "\n")
+		if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reasonNoComment {
+			t.Errorf("%q: rejected = %+v, want line 1: %s", after, rejected, reasonNoComment)
+		}
+		mustNotGrant(t, set, key)
+	}
+}
+
+// One key is one user: listed again with its role it is the key of its
+// first line; with another role, the later line is rejected.
+func TestDuplicateKeyWithAnotherRoleIsRejected(t *testing.T) {
+	t.Run("the same role twice", func(t *testing.T) {
+		key, line := newKey(t)
+		set, rejected := parseString(line + " first/view\n" + line + " second/view\n")
+		noRejected(t, rejected)
+		if set.Len() != 1 {
+			t.Errorf("Len = %d, want 1", set.Len())
+		}
+		if g := mustGrant(t, set, key); g.Name != "first/view" || g.Role != clusterRole("view") {
+			t.Errorf("grant = %+v, want first/view", g)
+		}
+	})
+	for _, tc := range []struct{ name, first, second string }{
+		{"another ClusterRole", "first/view", "second/cluster-admin"},
+		{"a Role of the same name", "first/edit", "second/edit@team-a"},
+		{"the Role in another namespace", "first/edit@team-a", "second/edit@team-b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key, line := newKey(t)
+			set, rejected := parseString("# keys\n" + line + " " + tc.first + "\n" + line + " " + tc.second + "\n")
+			const want = "the key is on line 2 with another role"
+			if len(rejected) != 1 || rejected[0].Line != 3 || rejected[0].Reason != want {
+				t.Fatalf("rejected = %+v, want line 3: %s", rejected, want)
+			}
+			if g := mustGrant(t, set, key); g.Name != tc.first {
+				t.Errorf("grant = %+v, want %s", g, tc.first)
+			}
+		})
+	}
+	t.Run("after a line that is rejected", func(t *testing.T) {
+		key, line := newKey(t)
+		set, rejected := parseString(line + " /view\n" + line + " second/cluster-admin\n")
+		if len(rejected) != 1 || rejected[0].Line != 1 {
+			t.Fatalf("rejected = %+v, want line 1", rejected)
+		}
+		if g := mustGrant(t, set, key); g.Name != "second/cluster-admin" {
+			t.Errorf("grant = %+v, want second/cluster-admin", g)
+		}
+	})
+}
+
+// The option read-only of kosh before 0.3.0 is refused with its own words,
+// so that a list written for it is not read as something else unsaid.
+func TestReadOnlyOptionStillRejected(t *testing.T) {
 	for _, opt := range []string{"read-only", "Read-Only", "READ-ONLY", "read-only,no-pty"} {
 		t.Run(opt, func(t *testing.T) {
 			key, line := newKey(t)
-			set, rejected := parseString(opt + " " + line + " guest\n")
+			set, rejected := parseString(opt + " " + line + " guest/view\n")
 			if len(rejected) != 1 || rejected[0].Line != 1 || rejected[0].Reason != reasonReadOnlyOption {
 				t.Fatalf("rejected = %+v, want line 1: %s", rejected, reasonReadOnlyOption)
 			}
 			mustNotGrant(t, set, key)
 		})
+	}
+}
+
+func TestSetRoles(t *testing.T) {
+	var list strings.Builder
+	for _, name := range []string{
+		"a/view", "b/view", "c/edit@team-b", "d/edit@team-a", "e/cluster-admin", "f/admin@team-a", "g/edit",
+	} {
+		_, line := newKey(t)
+		list.WriteString(line + " " + name + "\n")
+	}
+	set, rejected := parseString(list.String())
+	noRejected(t, rejected)
+	want := []Role{
+		clusterRole("cluster-admin"), clusterRole("edit"), clusterRole("view"),
+		nsRole("team-a", "admin"), nsRole("team-a", "edit"), nsRole("team-b", "edit"),
+	}
+	if got := set.Roles(); !slices.Equal(got, want) {
+		t.Errorf("Roles = %+v\nwant %+v", got, want)
+	}
+	for name, set := range map[string]*Set{"nil": nil, "zero": {}} {
+		if got := set.Roles(); len(got) != 0 {
+			t.Errorf("%s set: Roles = %+v", name, got)
+		}
 	}
 }
 
@@ -175,7 +306,7 @@ func TestParseRejectsUnknownOptions(t *testing.T) {
 	} {
 		t.Run(tc.options, func(t *testing.T) {
 			key, line := newKey(t)
-			set, rejected := parseString(tc.options + " " + line + " someone\n")
+			set, rejected := parseString(tc.options + " " + line + " someone/view\n")
 			if len(rejected) != 1 {
 				t.Fatalf("rejected = %+v, want one", rejected)
 			}
@@ -197,7 +328,7 @@ func TestParseRejectsGarbage(t *testing.T) {
 	good, goodLine := newKey(t)
 	_, other := newKey(t)
 	truncated := other[:len("ssh-ed25519 ")+20]
-	set, rejected := parseString("not a key\n" + truncated + "\n" + goodLine + "\n")
+	set, rejected := parseString("not a key\n" + truncated + "\n" + goodLine + " good/view\n")
 	if len(rejected) != 2 || rejected[0].Line != 1 || rejected[1].Line != 2 {
 		t.Fatalf("rejected = %+v, want lines 1 and 2", rejected)
 	}
@@ -214,7 +345,7 @@ func TestParseRejectsGarbage(t *testing.T) {
 
 func TestParseLineNumbers(t *testing.T) {
 	_, line := newKey(t)
-	set, rejected := parseString("# keys\n\n" + line + "\n   \n# next\nno-pty " + line + "\n")
+	set, rejected := parseString("# keys\n\n" + line + " a/view\n   \n# next\nno-pty " + line + " a/view\n")
 	if len(rejected) != 1 || rejected[0].Line != 6 {
 		t.Fatalf("rejected = %+v, want line 6", rejected)
 	}
@@ -223,65 +354,21 @@ func TestParseLineNumbers(t *testing.T) {
 	}
 }
 
-func TestParseNameFallsBackToFingerprint(t *testing.T) {
-	key, line := newKey(t)
-	set, rejected := parseString(line + "\n")
-	noRejected(t, rejected)
-	g := mustGrant(t, set, key)
-	if !strings.HasPrefix(g.Fingerprint, "SHA256:") {
-		t.Errorf("Fingerprint = %q", g.Fingerprint)
-	}
-	if g.Name != g.Fingerprint {
-		t.Errorf("Name = %q, want the fingerprint %q", g.Name, g.Fingerprint)
-	}
-}
-
 func TestParseCommentWithSpaces(t *testing.T) {
 	key, line := newKey(t)
-	set, rejected := parseString(line + "   Dragan's  old laptop  \n")
+	set, rejected := parseString(line + "   Dragan's  old laptop/view  \n")
 	noRejected(t, rejected)
-	if g := mustGrant(t, set, key); g.Name != "Dragan's  old laptop" {
+	if g := mustGrant(t, set, key); g.Name != "Dragan's  old laptop/view" {
 		t.Errorf("Name = %q", g.Name)
 	}
-}
-
-func TestParseDuplicateKey(t *testing.T) {
-	for _, tc := range []struct{ name, first, second string }{
-		{"admin then read-only", "first/admin", "second"},
-		{"read-only then admin", "first", "second/admin"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			key, line := newKey(t)
-			set, rejected := parseString(line + " " + tc.first + "\n" + line + " " + tc.second + "\n")
-			noRejected(t, rejected)
-			if set.Len() != 1 {
-				t.Errorf("Len = %d, want 1", set.Len())
-			}
-			g := mustGrant(t, set, key)
-			if !g.ReadOnly {
-				t.Error("admin, want read-only")
-			}
-			if g.Name != tc.first {
-				t.Errorf("Name = %q, want %q", g.Name, tc.first)
-			}
-		})
-	}
-	t.Run("admin twice", func(t *testing.T) {
-		key, line := newKey(t)
-		set, rejected := parseString(line + " first/admin\n" + line + " second/admin\n")
-		noRejected(t, rejected)
-		if g := mustGrant(t, set, key); g.ReadOnly || g.Name != "first/admin" {
-			t.Errorf("grant = %+v, want admin named first/admin", g)
-		}
-	})
 }
 
 func TestParseAsPeopleWriteThem(t *testing.T) {
 	t.Run("BOM", func(t *testing.T) {
 		key, line := newKey(t)
-		set, rejected := parseString("\xef\xbb\xbf" + line + " bom\n")
+		set, rejected := parseString("\xef\xbb\xbf" + line + " bom/view\n")
 		noRejected(t, rejected)
-		if g := mustGrant(t, set, key); g.Name != "bom" {
+		if g := mustGrant(t, set, key); g.Name != "bom/view" {
 			t.Errorf("Name = %q", g.Name)
 		}
 	})
@@ -295,22 +382,22 @@ func TestParseAsPeopleWriteThem(t *testing.T) {
 	t.Run("CRLF", func(t *testing.T) {
 		k1, l1 := newKey(t)
 		k2, l2 := newKey(t)
-		set, rejected := parseString("# keys\r\n\r\n" + l1 + " one/admin\r\n" + l2 + " two\r\n")
+		set, rejected := parseString("# keys\r\n\r\n" + l1 + " one/cluster-admin\r\n" + l2 + " two/edit@team-a\r\n")
 		noRejected(t, rejected)
-		if g := mustGrant(t, set, k1); g.Name != "one/admin" || g.ReadOnly {
+		if g := mustGrant(t, set, k1); g.Name != "one/cluster-admin" || g.Role != clusterRole("cluster-admin") {
 			t.Errorf("first = %+v", g)
 		}
-		if g := mustGrant(t, set, k2); g.Name != "two" || !g.ReadOnly {
+		if g := mustGrant(t, set, k2); g.Name != "two/edit@team-a" || g.Role != nsRole("team-a", "edit") {
 			t.Errorf("second = %+v", g)
 		}
 	})
 	t.Run("no final line feed", func(t *testing.T) {
 		k1, l1 := newKey(t)
 		k2, l2 := newKey(t)
-		set, rejected := parseString(l1 + " one/admin\n" + l2 + " two")
+		set, rejected := parseString(l1 + " one/cluster-admin\n" + l2 + " two/view")
 		noRejected(t, rejected)
 		mustGrant(t, set, k1)
-		if g := mustGrant(t, set, k2); g.Name != "two" || !g.ReadOnly {
+		if g := mustGrant(t, set, k2); g.Name != "two/view" || g.Role != clusterRole("view") {
 			t.Errorf("last = %+v", g)
 		}
 	})
@@ -318,7 +405,7 @@ func TestParseAsPeopleWriteThem(t *testing.T) {
 		before, beforeLine := newKey(t)
 		after, afterLine := newKey(t)
 		long := beforeLine + " " + strings.Repeat("x", 100_000)
-		set, rejected := parseString(beforeLine + "\n" + long + "\n" + afterLine + "\n")
+		set, rejected := parseString(beforeLine + " before/view\n" + long + "\n" + afterLine + " after/view\n")
 		if len(rejected) != 1 || rejected[0].Line != 2 {
 			t.Fatalf("rejected = %+v, want line 2", rejected)
 		}
@@ -333,7 +420,7 @@ func TestParseAsPeopleWriteThem(t *testing.T) {
 	})
 	t.Run("a long line at the end without a line feed", func(t *testing.T) {
 		_, line := newKey(t)
-		set, rejected := parseString(line + "\n" + line + " " + strings.Repeat("x", 100_000))
+		set, rejected := parseString(line + " a/view\n" + line + " " + strings.Repeat("x", 100_000))
 		if len(rejected) != 1 || rejected[0].Line != 2 || !strings.Contains(rejected[0].Reason, "too long") {
 			t.Fatalf("rejected = %+v, want line 2 too long", rejected)
 		}
@@ -361,7 +448,7 @@ func TestParseKeyTypes(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			key, line := sshKey(t, pub)
-			set, rejected := parseString(line + " " + name + "\n")
+			set, rejected := parseString(line + " " + name + "/view\n")
 			noRejected(t, rejected)
 			mustGrant(t, set, key)
 		})
@@ -373,7 +460,7 @@ func TestParseReaderError(t *testing.T) {
 	k2, l2 := newKey(t)
 	k3, l3 := newKey(t)
 	failure := errors.New("disk on fire")
-	r := io.MultiReader(strings.NewReader(l1+"\n"+l2+"\n"+l3[:20]), iotest.ErrReader(failure))
+	r := io.MultiReader(strings.NewReader(l1+" one/view\n"+l2+" two/view\n"+l3[:20]), iotest.ErrReader(failure))
 	set, rejected := Parse(r)
 	mustGrant(t, set, k1)
 	mustGrant(t, set, k2)
@@ -422,7 +509,7 @@ func newCertificate(t *testing.T, key ssh.PublicKey) string {
 
 func TestParseRejectsCertificates(t *testing.T) {
 	const reason = "certificates are not accepted: list the key itself"
-	for _, comment := range []string{"guest", "guest/admin"} {
+	for _, comment := range []string{"guest/view", "guest/cluster-admin"} {
 		t.Run(comment, func(t *testing.T) {
 			key, _ := newKey(t)
 			line := newCertificate(t, key)
@@ -443,10 +530,10 @@ func TestParseRejectsCertificates(t *testing.T) {
 
 func TestParseCommaOnlyOptionsIsAccepted(t *testing.T) {
 	key, line := newKey(t)
-	set, rejected := parseString(", " + line + " c/admin\n")
+	set, rejected := parseString(", " + line + " c/cluster-admin\n")
 	noRejected(t, rejected)
-	if g := mustGrant(t, set, key); g.ReadOnly || g.Name != "c/admin" {
-		t.Errorf("grant = %+v, want an admin named c/admin", g)
+	if g := mustGrant(t, set, key); g.Role != clusterRole("cluster-admin") || g.Name != "c/cluster-admin" {
+		t.Errorf("grant = %+v, want c/cluster-admin", g)
 	}
 }
 
@@ -461,7 +548,7 @@ func TestNilSetHoldsNothing(t *testing.T) {
 		}
 	}
 	_, line := newKey(t)
-	set, _ := parseString(line + "\n")
+	set, _ := parseString(line + " a/view\n")
 	if _, ok := set.Lookup(nil); ok {
 		t.Error("Lookup(nil) found a key")
 	}
@@ -482,7 +569,7 @@ func TestListReplaceCallsOnChangeAfterTheSetIsInPlace(t *testing.T) {
 		calls = append(calls, "first")
 	})
 	l.OnChange(func() { calls = append(calls, "second") })
-	set, _ := parseString(line + "\n")
+	set, _ := parseString(line + " a/view\n")
 	l.Replace(set)
 	if strings.Join(calls, ",") != "first,second" {
 		t.Errorf("calls = %v", calls)
@@ -500,7 +587,7 @@ func TestListOnChangeMayUseTheList(t *testing.T) {
 		l.Lookup(key)
 		l.OnChange(func() { later.Add(1) })
 	})
-	set, _ := parseString(line + "\n")
+	set, _ := parseString(line + " a/view\n")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -519,8 +606,8 @@ func TestListOnChangeMayUseTheList(t *testing.T) {
 
 func TestListConcurrentUse(t *testing.T) {
 	key, line := newKey(t)
-	full, _ := parseString(line + "\n")
-	ro, _ := parseString(line + " guest\n")
+	full, _ := parseString(line + " me/cluster-admin\n")
+	view, _ := parseString(line + " me/view\n")
 	l := NewList(full)
 	var wg sync.WaitGroup
 	for i := range 8 {
@@ -538,7 +625,7 @@ func TestListConcurrentUse(t *testing.T) {
 			defer wg.Done()
 			for j := range 50 {
 				if (i+j)%2 == 0 {
-					l.Replace(ro)
+					l.Replace(view)
 				} else {
 					l.Replace(full)
 				}
