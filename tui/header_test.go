@@ -15,10 +15,10 @@ import (
 	"github.com/fables-for-robots/kosh/render"
 )
 
-// headerSession returns a session of a full key named name, with three
+// headerSession returns a session of a cluster-admin key named name, with three
 // pods in default.
 func headerSession(name string) *kubetest.Session {
-	sess := kubetest.New(keys.Grant{Name: name, Fingerprint: "SHA256:" + name})
+	sess := newSessionOf(keys.Grant{Name: name, Fingerprint: "SHA256:" + name, Role: clusterAdmin})
 	sess.SetTable(query("pods", "default"), podTable(
 		pod{name: "web-7d9f8b6c4-2xkqp", age: 3 * time.Hour},
 		pod{name: "web-7d9f8b6c4-9zt4m", age: 3 * time.Hour},

@@ -12,13 +12,16 @@ import (
 )
 
 // The keys of the text views: d describes the row, y shows its YAML, x
-// decodes a Secret. They apply to read-only keys too; the session
-// refuses them a Secret's contents, and the flash says so.
+// decodes a Secret. Each needs the right to get the row: describe reads
+// the events too where it may, and shows what it can without them.
 func init() {
 	bind(
-		binding{Key: "d", Hint: hint{"d", "Describe"}, Order: 10, Applies: textOfObjects, Run: textRun(textDescribe)},
-		binding{Key: "y", Hint: hint{"y", "YAML"}, Order: 11, Applies: textOfObjects, Run: textRun(textYAML)},
-		binding{Key: "x", Hint: hint{"x", "Decode"}, Order: 12, Applies: textOfSecrets, Run: textRun(textDecode)},
+		binding{Key: "d", Hint: hint{"d", "Describe"}, Order: 10, Applies: textOfObjects,
+			Needs: []need{{Verb: "get"}}, Run: textRun(textDescribe)},
+		binding{Key: "y", Hint: hint{"y", "YAML"}, Order: 11, Applies: textOfObjects,
+			Needs: []need{{Verb: "get"}}, Run: textRun(textYAML)},
+		binding{Key: "x", Hint: hint{"x", "Decode"}, Order: 12, Applies: textOfSecrets,
+			Needs: []need{{Verb: "get", Resource: needSecrets}}, Run: textRun(textDecode)},
 	)
 }
 

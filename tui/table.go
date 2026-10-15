@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -194,6 +196,14 @@ type tableView struct {
 	lastMark  *rowKey
 
 	ns namespacesMsg
+
+	// rights are the session's answers to the needs of the bindings
+	// that apply to the table, for its namespace: nil until they are in,
+	// and no binding with a need is bound until then. rightsGen numbers
+	// the asking, so that the answers of a namespace the table has left
+	// are dropped.
+	rights    map[need]bool
+	rightsGen int
 }
 
 // newTableView returns the table of a query, with the cursor on the
@@ -221,8 +231,69 @@ func newTable(e env, q kube.Query, selected string) *tableView {
 	return v
 }
 
-// Init opens the watch and reads it.
-func (v *tableView) Init() tea.Cmd { return v.openWatch() }
+// Init opens the watch and reads it, and asks what the session may do
+// in the table.
+func (v *tableView) Init() tea.Cmd { return tea.Batch(v.openWatch(), v.askRights()) }
+
+// rightsMsg is the session's answers to the needs of a table's
+// bindings.
+type rightsMsg struct {
+	id      int64
+	gen     int
+	allowed map[need]bool
+}
+
+// askRights forgets the table's answers and asks the session, in a
+// command, for every need of every binding that applies to the table by
+// its kind, in the table's namespace: all at once, for each is a request
+// to the API the first time. The session keeps its answers, so a second
+// table of the same kind and namespace asks the API nothing.
+func (v *tableView) askRights() tea.Cmd {
+	v.rights = nil
+	v.rightsGen++
+	if v.plain {
+		return nil
+	}
+	var needs []need
+	for _, b := range applying(v.q.Resource, v.grant) {
+		for _, n := range b.Needs {
+			if !slices.Contains(needs, n) {
+				needs = append(needs, n)
+			}
+		}
+	}
+	sess, res, ns, id, gen := v.e.sess, v.q.Resource, v.rightsNamespace(), v.id, v.rightsGen
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		answers := make([]bool, len(needs))
+		var wg sync.WaitGroup
+		for i, n := range needs {
+			wg.Go(func() { answers[i] = sess.Can(ctx, n.Verb, n.resource(res), n.Sub, ns) })
+		}
+		wg.Wait()
+		allowed := make(map[need]bool, len(needs))
+		for i, n := range needs {
+			allowed[n] = answers[i]
+		}
+		return rightsMsg{id: id, gen: gen, allowed: allowed}
+	}
+}
+
+// rightsNamespace is the namespace the table's needs are asked in: the
+// one of the object its rows belong to (a deployment's pods, a pod's
+// containers), or else the query's. It is "" for every namespace and for
+// a resource of the cluster scope.
+func (v *tableView) rightsNamespace() string {
+	if v.q.Of != nil {
+		return v.q.Of.Namespace
+	}
+	return v.q.Namespace
+}
+
+// can reports whether the session's answers meet n; before they are in,
+// nothing is.
+func (v *tableView) can(n need) bool { return v.rights[n] }
 
 // openWatch opens the watch of the query in a command, and reads it.
 func (v *tableView) openWatch() tea.Cmd {
@@ -327,6 +398,11 @@ func (v *tableView) Update(msg tea.Msg) (view, tea.Cmd) {
 		return v, v.bury()
 	case namespacesMsg:
 		v.ns = msg
+		return v, nil
+	case rightsMsg:
+		if msg.id == v.id && msg.gen == v.rightsGen && !v.closed {
+			v.rights = msg.allowed
+		}
 		return v, nil
 	case tea.KeyPressMsg:
 		return v, v.key(msg)

@@ -15,15 +15,18 @@ import (
 	"github.com/fables-for-robots/kosh/kube/kubetest"
 )
 
-func TestReadOnlyIsInTheHeader(t *testing.T) {
-	ro := kubetest.New(keys.Grant{Name: "bob@ci", ReadOnly: true})
-	hs := newHarness(t, ro, 100, 30)
-	if l := hs.line("Key:"); !strings.Contains(l, "bob@ci [read-only]") {
-		t.Errorf("the header of a read-only key says %q", l)
+// The header names the key, whose name ends in its role: the role says
+// what the session may do, and there is no mark of read-only.
+func TestHeaderShowsNoReadOnly(t *testing.T) {
+	view := kubetest.New(viewGrant)
+	allowView(view)
+	hs := newHarness(t, view, 100, 30)
+	if l := hs.line("Key:"); !strings.Contains(l, "Key:     bob@laptop/view") || strings.Contains(l, "read-only") {
+		t.Errorf("the header of a view key says %q", l)
 	}
 	hs = newHarness(t, newSession(), 100, 30)
 	if l := hs.line("Key:"); !strings.Contains(l, "alice@laptop") || strings.Contains(l, "read-only") {
-		t.Errorf("the header of a full key says %q", l)
+		t.Errorf("the header of a cluster-admin key says %q", l)
 	}
 	hs.wantFrame("Cluster: v1.33.1", "kosh:    v0.1.0")
 }

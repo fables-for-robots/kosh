@@ -14,7 +14,7 @@ import (
 
 // logKeyOf reports whether a table of res has key for grant.
 func logKeyOf(res kube.Resource, grant keys.Grant, key string) bool {
-	return slices.ContainsFunc(bindingsFor(res, grant), func(b binding) bool { return b.Key == key })
+	return slices.ContainsFunc(bindingsFor(res, grant, canAll), func(b binding) bool { return b.Key == key })
 }
 
 // logContainers returns a session in the containers of web-1, with the
@@ -106,14 +106,14 @@ func TestLogKeysApply(t *testing.T) {
 	for _, plural := range []string{"pods", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "services"} {
 		kinds = append(kinds, kubetest.Resource(plural))
 	}
-	for _, g := range []keys.Grant{{Name: "alice"}, {Name: "bob", ReadOnly: true}} {
+	for _, g := range []keys.Grant{{Name: "alice", Role: clusterAdmin}, viewGrant} {
 		for _, res := range kinds {
 			if !logKeyOf(res, g, "l") {
-				t.Errorf("a table of %s has not got l (read-only %v)", res.GVR.Resource, g.ReadOnly)
+				t.Errorf("a table of %s has not got l (%s)", res.GVR.Resource, g.Role)
 			}
 			isPod := res.Is("", "pods") || res.GVR == kube.Containers.GVR
 			if logKeyOf(res, g, "p") != isPod {
-				t.Errorf("a table of %s has p: %v (read-only %v)", res.GVR.Resource, !isPod, g.ReadOnly)
+				t.Errorf("a table of %s has p: %v (%s)", res.GVR.Resource, !isPod, g.Role)
 			}
 		}
 		for _, plural := range []string{"configmaps", "cronjobs", "nodes"} {
@@ -122,7 +122,7 @@ func TestLogKeysApply(t *testing.T) {
 			}
 		}
 	}
-	for _, b := range bindingsFor(kubetest.Resource("pods"), keys.Grant{}) {
+	for _, b := range bindingsFor(kubetest.Resource("pods"), keys.Grant{}, canAll) {
 		switch b.Key {
 		case "l":
 			if b.Hint != (hint{"l", "Logs"}) || b.Order != 20 {

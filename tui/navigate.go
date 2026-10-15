@@ -9,29 +9,44 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/kube"
 )
 
-// maxRecent is how many namespaces besides all and default have a
-// shortcut: 2 to 9.
+// maxRecent is how many namespaces besides all and the starting one
+// have a shortcut: 2 to 9.
 const maxRecent = 8
 
 // namespaces are the session's current namespace and the namespaces of
 // its shortcuts.
 type namespaces struct {
+	// start is the namespace the session starts in, whose shortcut is
+	// always 1: the namespace of the key's Role, or default.
+	start string
 	// current is the namespace a command without one goes to. Empty is
 	// all of them.
 	current string
-	// recent are the namespaces other than all and default that the
+	// recent are the namespaces other than all and start that the
 	// session used, the last first.
 	recent []string
+}
+
+// startNamespaces returns the namespaces of a session of grant: it
+// starts in the namespace of the grant's Role when the role is one, and
+// in default when it is a ClusterRole, which holds in every namespace.
+func startNamespaces(grant keys.Grant) namespaces {
+	start := "default"
+	if grant.Role.Namespace != "" {
+		start = grant.Role.Namespace
+	}
+	return namespaces{start: start, current: start}
 }
 
 // use makes ns the current namespace and moves it to the front of the
 // others.
 func (n *namespaces) use(ns string) {
 	n.current = ns
-	if ns == "" || ns == "default" {
+	if ns == "" || ns == n.start {
 		return
 	}
 	n.recent = slices.DeleteFunc(n.recent, func(s string) bool { return s == ns })
@@ -41,10 +56,10 @@ func (n *namespaces) use(ns string) {
 	}
 }
 
-// shortcuts returns the namespace of each shortcut, 0 first: all,
-// default, then the others.
+// shortcuts returns the namespace of each shortcut, 0 first: all, the
+// starting namespace, then the others.
 func (n namespaces) shortcuts() []string {
-	return append([]string{"", "default"}, n.recent...)
+	return append([]string{"", n.start}, n.recent...)
 }
 
 // msg tells the views the namespaces.
@@ -339,5 +354,5 @@ func (v *tableView) useShortcut(i int) tea.Cmd {
 	v.marks, v.lastMark = map[rowKey]bool{}, nil
 	v.cursor, v.cursorKey, v.top = 0, nil, 0
 	v.rebuild()
-	return tea.Batch(v.openWatch(), func() tea.Msg { return useNamespaceMsg{ns} })
+	return tea.Batch(v.openWatch(), v.askRights(), func() tea.Msg { return useNamespaceMsg{ns} })
 }

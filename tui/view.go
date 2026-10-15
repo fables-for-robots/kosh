@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/kube"
+	"github.com/fables-for-robots/kosh/render"
 )
 
 // This file is the frame the parts of the UI are hung in. The root
@@ -142,9 +144,12 @@ type binding struct {
 	// Order places the hint among the others: lower first.
 	Order int
 	// Applies reports whether a table of res has the key for a session
-	// with grant. A key that changes the cluster does not apply to a
-	// read-only grant.
+	// with grant, by the kind of res. Nil applies to every table.
 	Applies func(res kube.Resource, grant keys.Grant) bool
+	// Needs are the rights the key needs on the table's resource, in
+	// the table's namespace, all of them: the key is bound only when
+	// Session.Can says yes to each. Nil needs nothing.
+	Needs []need
 	// Run is called when the key is pressed, with the rows it is for:
 	// the marked rows, or the row under the cursor when none is marked.
 	// It is not called for a table without rows.
@@ -156,6 +161,38 @@ type binding struct {
 	Handover bool
 }
 
+// need is one right: verb on the table's resource, or on sub of it,
+// or on another resource altogether (Resource set). It is asked in the
+// table's namespace, which is "" for a table of every namespace and
+// for one of a resource of the cluster scope: the right in every
+// namespace.
+type need struct {
+	Verb     string
+	Sub      string
+	Resource *kube.Resource // nil: the table's
+}
+
+// The resources that needs name besides the table's own. A need is a
+// key of the answers a table keeps, so each resource is one pointer that
+// every need of it shares; Can reads only its group and resource.
+var (
+	needPods        = &kube.Resource{GVR: render.Pods, Kind: "Pod", Namespaced: true}
+	needSecrets     = &kube.Resource{GVR: render.Secrets, Kind: "Secret", Namespaced: true}
+	needNodes       = &kube.Resource{GVR: render.Nodes, Kind: "Node"}
+	needDeployments = &kube.Resource{GVR: render.Deployments, Kind: "Deployment", Namespaced: true}
+	needReplicaSets = &kube.Resource{GVR: render.ReplicaSets, Kind: "ReplicaSet", Namespaced: true}
+	needJobs        = &kube.Resource{GVR: render.Jobs, Kind: "Job", Namespaced: true}
+	needCronJobs    = &kube.Resource{GVR: render.CronJobs, Kind: "CronJob", Namespaced: true}
+)
+
+// resource returns the resource n is asked of in a table of res.
+func (n need) resource(res kube.Resource) kube.Resource {
+	if n.Resource != nil {
+		return *n.Resource
+	}
+	return res
+}
+
 var bindings []binding
 
 // bind adds keys to the tables.
@@ -164,8 +201,23 @@ func bind(b ...binding) {
 }
 
 // bindingsFor returns the keys a table of res has for grant, by Order
-// and then by Key.
-func bindingsFor(res kube.Resource, grant keys.Grant) []binding {
+// and then by Key: those that apply to res by its kind and whose needs
+// can says are all met. can is the table's answers of Session.Can;
+// a need it has no answer for is not met.
+func bindingsFor(res kube.Resource, grant keys.Grant, can func(need) bool) []binding {
+	var out []binding
+	for _, b := range applying(res, grant) {
+		if !slices.ContainsFunc(b.Needs, func(n need) bool { return !can(n) }) {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// applying returns the keys that apply to a table of res by its kind,
+// whatever they need, by Order and then by Key: those whose needs a
+// table asks of the session.
+func applying(res kube.Resource, grant keys.Grant) []binding {
 	var out []binding
 	for _, b := range bindings {
 		if b.Applies == nil || b.Applies(res, grant) {

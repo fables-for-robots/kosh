@@ -58,11 +58,12 @@ func (s *actionSpySession) entered() []string {
 	return slices.Sorted(maps.Keys(s.left))
 }
 
-func TestReadOnlyHasNoActionKeys(t *testing.T) {
-	ro := keys.Grant{Name: "bob", ReadOnly: true}
+func TestViewKeyHasNoActionKeys(t *testing.T) {
+	view := kubetest.New(viewGrant)
+	allowView(view)
 	for _, res := range append(kubetest.Standard(), kube.Containers, kube.Rules) {
-		if got := actionOwn(bindingsFor(res, ro)); len(got) > 0 {
-			t.Errorf("a read-only key has %d keys of actions in %s", len(got), res.GVR.Resource)
+		if got := actionOwn(bindingsFor(res, viewGrant, canOf(view, res, "default"))); len(got) > 0 {
+			t.Errorf("a view key has %d keys of actions in %s", len(got), res.GVR.Resource)
 		}
 	}
 	tables := map[string]kube.Table{
@@ -71,25 +72,26 @@ func TestReadOnlyHasNoActionKeys(t *testing.T) {
 		"nodes":       clusterTable("n1"),
 	}
 	for _, plural := range []string{"pods", "deployments", "nodes"} {
-		sess := actionSpyOf(kubetest.New(ro))
+		sess := actionSpyOf(kubetest.New(viewGrant))
+		allowView(sess.Session)
 		hs := newHarness(t, sess, 100, 30)
 		actionOpen(hs, sess.Session, plural, tables[plural])
 		hs.notFrame("Delete", "Kill", "Scale", "Restart", "Drain", "Cordon", "Edit")
 		for _, k := range actionKeys {
 			hs.press(k)
 			if hs.root().dlg != nil {
-				t.Fatalf("%s in %s opened a dialog for a read-only key", k, plural)
+				t.Fatalf("%s in %s opened a dialog for a view key", k, plural)
 			}
 			if _, ok := hs.root().top().(*tableView); !ok {
 				t.Fatalf("%s in %s opened a %T", k, plural, hs.root().top())
 			}
 		}
 		if got := sess.entered(); len(got) > 0 {
-			t.Errorf("keys in %s called %v for a read-only key", plural, got)
+			t.Errorf("keys in %s called %v for a view key", plural, got)
 		}
 		for _, c := range sess.Calls() {
 			if c.Method != "Watch" && c.Method != "Resolve" {
-				t.Errorf("keys in %s called %s for a read-only key", plural, c.Method)
+				t.Errorf("keys in %s called %s for a view key", plural, c.Method)
 			}
 		}
 	}
@@ -133,7 +135,7 @@ func TestActionKeysByKind(t *testing.T) {
 		{noDelete, []binding{edit}},
 		{noUpdate, []binding{del}},
 	} {
-		got := actionOwn(bindingsFor(c.res, full))
+		got := actionOwn(bindingsFor(c.res, full, canAll))
 		var gotS, wantS []string
 		for _, b := range got {
 			gotS = append(gotS, fmt.Sprintf("%s %s %s %d", b.Key, b.Hint.Key, b.Hint.Text, b.Order))
@@ -150,7 +152,7 @@ func TestActionKeysByKind(t *testing.T) {
 func TestNoKeyTwiceInATable(t *testing.T) {
 	full := keys.Grant{Name: "alice"}
 	for _, res := range append(kubetest.Standard(), kube.Containers, kube.Rules) {
-		own := actionOwn(bindingsFor(res, full))
+		own := actionOwn(bindingsFor(res, full, canAll))
 		seen := map[string]bool{}
 		for _, b := range own {
 			if seen[b.Key] {
@@ -536,7 +538,7 @@ func TestReadBeforeADialogIsAnAction(t *testing.T) {
 			hs := newHarness(t, sess, 100, 30)
 			q := actionOpen(hs, sess, c.plural, simpleTable("web"))
 			var b binding
-			for _, x := range bindingsFor(q.Resource, sess.Grant()) {
+			for _, x := range bindingsFor(q.Resource, sess.Grant(), canAll) {
 				if x.Key == c.key {
 					b = x
 				}

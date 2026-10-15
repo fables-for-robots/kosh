@@ -29,9 +29,6 @@ const headerGap = "   "
 // room for the hints.
 func (r *root) header() []string {
 	name := cleanLine(r.grant.Name)
-	if r.grant.ReadOnly {
-		name += " [read-only]"
-	}
 	info := [][2]string{
 		{"Key:", styleInfoValue.Render(name)},
 		{"Cluster:", styleInfoValue.Render(cleanLine(r.cluster))},

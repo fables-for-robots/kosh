@@ -20,6 +20,7 @@ package tui
 // middle of a sequence.
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -94,6 +95,21 @@ type harness struct {
 	quit  bool
 	// settleFor bounds a settle.
 	settleFor time.Duration
+	// hold, when set, keeps back the messages it says yes to: they are
+	// put into held instead of delivered, as a message whose command has
+	// not come back yet, until the test hands them over with release.
+	hold func(tea.Msg) bool
+	held []tea.Msg
+}
+
+// release delivers the messages held back, in the order given, and
+// stops holding any.
+func (hs *harness) release(msgs ...tea.Msg) {
+	hs.t.Helper()
+	hs.hold, hs.held = nil, nil
+	for _, msg := range msgs {
+		hs.send(msg)
+	}
 }
 
 // newHarness starts the program of sess in a window of w by h: it runs
@@ -115,9 +131,51 @@ func newHarness(t testing.TB, sess kube.Session, w, h int) *harness {
 	return hs
 }
 
-// newSession returns a session of a full key named alice@laptop.
+// newSession returns a session of a key named alice@laptop whose role is
+// the ClusterRole cluster-admin: it is allowed everything, and has every
+// key.
 func newSession() *kubetest.Session {
-	return kubetest.New(keys.Grant{Name: "alice@laptop", Fingerprint: "SHA256:alice"})
+	return newSessionOf(keys.Grant{Name: "alice@laptop", Fingerprint: "SHA256:alice", Role: clusterAdmin})
+}
+
+// clusterAdmin is the role of the keys the tests use unless they say
+// otherwise.
+var clusterAdmin = keys.Role{Kind: keys.KindClusterRole, Name: "cluster-admin"}
+
+// newSessionOf returns a session of grant that is allowed everything.
+func newSessionOf(grant keys.Grant) *kubetest.Session {
+	sess := kubetest.New(grant)
+	sess.Allow("*", "*", "*", "*", "*")
+	return sess
+}
+
+// viewGrant is a key whose role is the ClusterRole view.
+var viewGrant = keys.Grant{Name: "bob@laptop/view", Fingerprint: "SHA256:bob", Role: keys.Role{Kind: keys.KindClusterRole, Name: "view"}}
+
+// allowView allows sess what the ClusterRole view allows of the
+// resources the tests know: to get, list and watch every one but the
+// Secrets, in every namespace, and to read the logs of pods.
+func allowView(sess *kubetest.Session) {
+	for _, res := range kubetest.Standard() {
+		if res.Is("", "secrets") {
+			continue
+		}
+		for _, verb := range []string{"get", "list", "watch"} {
+			sess.Allow(verb, res.GVR.Group, res.GVR.Resource, "", "")
+		}
+	}
+	sess.Allow("get", "", "pods", "log", "")
+}
+
+// canAll meets every need.
+func canAll(need) bool { return true }
+
+// canOf returns the answers of sess for a table of res in namespace ns,
+// as the table asks them.
+func canOf(sess kube.Session, res kube.Resource, ns string) func(need) bool {
+	return func(n need) bool {
+		return sess.Can(context.Background(), n.Verb, n.resource(res), n.Sub, ns)
+	}
 }
 
 // root returns the model as the root it is.
@@ -195,6 +253,10 @@ func isWait(cmd tea.Cmd) bool {
 // Bubble Tea's own.
 func (hs *harness) deliver(msg tea.Msg) {
 	hs.t.Helper()
+	if msg != nil && hs.hold != nil && hs.hold(msg) {
+		hs.held = append(hs.held, msg)
+		return
+	}
 	switch msg := msg.(type) {
 	case nil:
 		return

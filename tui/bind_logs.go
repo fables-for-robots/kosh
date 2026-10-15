@@ -7,8 +7,9 @@ import (
 	"github.com/fables-for-robots/kosh/kube"
 )
 
-// The keys of the logs: l the log, p the log of the previous run. A
-// read-only grant has both, for reading a log changes nothing.
+// The keys of the logs: l the log, p the log of the previous run. Both
+// need the right to read the logs of pods, whatever the table is of: the
+// logs of a workload or a service are its pods'.
 func init() {
 	bind(
 		binding{
@@ -16,6 +17,7 @@ func init() {
 			Hint:    hint{"l", "Logs"},
 			Order:   20,
 			Applies: logHasLogs,
+			Needs:   logNeeds,
 			Run:     logRun(false),
 		},
 		binding{
@@ -23,10 +25,14 @@ func init() {
 			Hint:    hint{"p", "Logs Previous"},
 			Order:   21,
 			Applies: logHasPrevious,
+			Needs:   logNeeds,
 			Run:     logRun(true),
 		},
 	)
 }
+
+// logNeeds are the needs of l and p: get on the pods' log.
+var logNeeds = []need{{Verb: "get", Sub: "log", Resource: needPods}}
 
 // logIsContainers reports whether res is the containers of a pod.
 func logIsContainers(res kube.Resource) bool {
