@@ -2316,6 +2316,39 @@ func setRole(t *testing.T, role string) {
 	}
 }
 
+// untilKosh waits until kosh itself acts as its ServiceAccount now may,
+// which the API server can tell kosh some time after it tells kubectl:
+// it connects as k, opens the deployments, and waits up to within for
+// ready; a session that does not get there is closed and another opened,
+// until total has passed. Each attempt is a new session, as a session
+// keeps the answers it was given for two minutes: one that was answered
+// before kosh's rights changed is left behind, not waited on. It returns
+// the session that got there and how long it took, and fails the test
+// when none did.
+func untilKosh(t *testing.T, k key, what string, total, within time.Duration, ready func(c *goSession) bool) (*goSession, time.Duration) {
+	t.Helper()
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		c := connect(t, k, wideW, wideH)
+		c.waitFor("Pods(default)")
+		c.send(":deploy" + keyEnter)
+		c.waitFor("Deployments(default)")
+		deadline := time.Now().Add(within)
+		for time.Now().Before(deadline) {
+			if ready(c) {
+				took := time.Since(start)
+				t.Logf("%s: %v, at the session %d", what, took.Round(100*time.Millisecond), attempt)
+				return c, took
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		_ = c.client.Close()
+		if time.Since(start) > total {
+			t.Fatalf("%s: not in %v, after %d sessions.\nthe last screen:\n%s\nkosh's log:\n%s", what, total, attempt, c.scr, koshLog(t))
+		}
+	}
+}
+
 // The ClusterRole of kosh's ServiceAccount can be changed with helm
 // upgrade. One that may not impersonate, as view, leaves every key
 // without its role's rights: the full key's session is given no key that
@@ -2331,6 +2364,12 @@ func TestRoleCanBeChanged(t *testing.T) {
 			return bindingRole(t, release+"-cluster-admin") == "cluster-admin" && bindingRole(t, release+"-view") == "" &&
 				koshMayImpersonate(t) == "yes"
 		}, func() string { return "can-i impersonate: " + koshMayImpersonate(t) })
+		// kosh itself may impersonate again, for the tests after this
+		// one: a new session has the full key's keys.
+		c, _ := untilKosh(t, k, "kosh may impersonate again", 3*time.Minute, 20*time.Second, func(c *goSession) bool {
+			return lineWithHint(headerLines(c.scr.lines()), "s", "Scale")
+		})
+		_ = c.client.Close()
 	})
 	if got := bindingRole(t, release+"-view"); got != "view" {
 		t.Errorf("the binding %s-view binds %q, want view", release, got)
@@ -2341,15 +2380,17 @@ func TestRoleCanBeChanged(t *testing.T) {
 	eventually(t, wait, "kosh may no longer impersonate", func() bool { return koshMayImpersonate(t) == "no" },
 		func() string { return "can-i impersonate: " + koshMayImpersonate(t) })
 
-	warned := len(logLines(t, "the key's rights could not be checked", "key", k.name))
+	// The API server may go on allowing kosh for a while after kubectl
+	// is told no: a session is tried until kosh's log says that its key's
+	// rights could not be checked, which a session says once.
 	before := replicas(t)
-	c := connect(t, k, wideW, wideH)
-	c.waitFor("Pods(default)")
-	c.send(":deploy" + keyEnter)
-	c.waitFor("Deployments(default)")
-	eventually(t, wait, "kosh's log says that the key's rights could not be checked", func() bool {
-		return len(logLines(t, "the key's rights could not be checked", "key", k.name)) > warned
-	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	warned := len(logLines(t, "the key's rights could not be checked", "key", k.name))
+	c, _ := untilKosh(t, k, "kosh is refused the impersonation", 3*time.Minute, 20*time.Second, func(*goSession) bool {
+		n := len(logLines(t, "the key's rights could not be checked", "key", k.name))
+		ok := n > warned
+		warned = n
+		return ok
+	})
 	// The answers are in: no key is bound on a "no".
 	time.Sleep(time.Second)
 	hasHints(t, k.name+" on deployments, kosh's ServiceAccount view", headerLines(c.scr.lines()),
