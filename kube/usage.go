@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/fables-for-robots/kosh/keys"
 )
@@ -55,6 +56,7 @@ type usageWatch struct {
 	stopHold    func()     // ends the forwarding of the poller's signals and the wait for the cache's sync
 	logged      bool       // the watch's failure to take the hold is in the log
 	nodesLogged bool       // the nodes' list's failure is in the log
+	refused     bool       // the API refused the role the nodes: no hold again
 }
 
 func (s *session) ClusterUsage() UsageWatch {
@@ -91,30 +93,57 @@ func (w *usageWatch) notify() {
 }
 
 // follow takes the hold, the nodes' poller and the nodes' cache, when
-// the API serves the metrics of nodes and the cluster has nodes kosh can
-// read, and gives it back when not; it returns what is held, nil while
-// nothing is. It logs once for the watch when the nodes cannot be
-// listed, which leaves Current without a percentage.
+// the API serves the metrics of nodes and the role may list the nodes,
+// and gives it back when not; it returns what is held, nil while nothing
+// is. A role the API refuses the list of the nodes, as view, has no
+// lines in the header, rather than lines that never get a number: the
+// watch gives the hold back for good, and the log says it once for the
+// role. Any other failure to list the nodes is logged once for the
+// watch, and leaves Current without a percentage.
 func (w *usageWatch) follow() (*metricsPoller, *kindCache) {
 	nodes, ok := w.c.resourceFor("", "Node")
 	served := w.clusterRole && ok && nodes.Typed && w.c.metricsServed(NodeMetrics)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	switch {
-	case w.closed:
+	if w.closed {
 		return nil, nil
+	}
+	if w.cache != nil {
+		if synced, _, err := w.cache.status(); err != nil && !synced {
+			switch {
+			case apierrors.IsForbidden(err):
+				w.refused = true
+				w.c.logNodesRefused(w.role, err)
+			case !w.nodesLogged:
+				w.nodesLogged = true
+				w.c.log.Warn("the nodes cannot be listed: the cluster's CPU and memory are n/a", "err", err)
+			}
+		}
+	}
+	served = served && !w.refused
+	switch {
 	case served && w.poller == nil:
 		w.take(nodes)
 	case !served && w.poller != nil:
 		w.drop()
 	}
-	if w.cache != nil && !w.nodesLogged {
-		if synced, _, err := w.cache.status(); err != nil && !synced {
-			w.nodesLogged = true
-			w.c.log.Warn("the nodes cannot be listed: the cluster's CPU and memory are n/a", "err", err)
-		}
-	}
 	return w.poller, w.cache
+}
+
+// logNodesRefused logs, once for the role of id, that the API refuses it
+// the list of the nodes, and so the header's lines.
+func (c *Cluster) logNodesRefused(id identity, err error) {
+	c.refusedMu.Lock()
+	if c.nodesRefused == nil {
+		c.nodesRefused = map[identity]bool{}
+	}
+	first := !c.nodesRefused[id]
+	c.nodesRefused[id] = true
+	c.refusedMu.Unlock()
+	if first {
+		c.log.Info("the role may not list the nodes: its header has no CPU and MEM lines", "as", id.user,
+			"err", loggableError("list nodes", err).Error())
+	}
 }
 
 // take acquires the nodes' cache and their poller, and signals. w.mu is
@@ -172,21 +201,37 @@ func (w *usageWatch) held() bool {
 	return w.poller != nil
 }
 
-// synced signals Changed once k has its first list, from a goroutine the
-// Cluster runs, until the returned function is called or the Cluster is
-// closed: a reading that came before the nodes has no percentage, and
-// the next list may be a whole MetricsPoll away. Before that Current was
-// never ok, so the signal moves no arrow. The function returns once the
-// goroutine has ended.
+// synced signals Changed once k has its first list, or once the API has
+// refused the role that list, from a goroutine the Cluster runs, until
+// the returned function is called or the Cluster is closed: a reading
+// that came before the nodes has no percentage, and the next list may be
+// a whole MetricsPoll away; a refusal takes the lines away (follow).
+// Before either Current was never ok, so the signal moves no arrow. The
+// function returns once the goroutine has ended.
 func (w *usageWatch) synced(k *kindCache) (stop func()) {
-	return w.c.goUntil(func(quit <-chan struct{}) {
-		select {
-		case <-k.informer.HasSyncedChecker().Done():
-			w.notify()
-		case <-quit:
-		case <-w.c.ctx.Done():
+	sub, unsubscribe := k.subscribe()
+	stopGo := w.c.goUntil(func(quit <-chan struct{}) {
+		for {
+			select {
+			case <-k.informer.HasSyncedChecker().Done():
+				w.notify()
+				return
+			case <-sub:
+				if _, _, err := k.status(); apierrors.IsForbidden(err) {
+					w.notify()
+					return
+				}
+			case <-quit:
+				return
+			case <-w.c.ctx.Done():
+				return
+			}
 		}
 	})
+	return func() {
+		stopGo()
+		unsubscribe()
+	}
 }
 
 // tick takes the hold or gives it back as discovery says, every

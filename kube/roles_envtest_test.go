@@ -24,8 +24,11 @@ import (
 // of §7 of the roles design. Its log is kept.
 type rolesEnv struct {
 	admin *rest.Config
-	c     *Cluster
-	log   *auditLog
+	// kosh is the configuration of the user of §7's least rights, which
+	// c is of.
+	kosh *rest.Config
+	c    *Cluster
+	log  *auditLog
 }
 
 func newRolesEnv(t *testing.T) *rolesEnv {
@@ -47,7 +50,7 @@ func newRolesEnv(t *testing.T) *rolesEnv {
 		}
 	}
 	log := newAuditLog()
-	return &rolesEnv{admin: admin, c: newEnvCluster(t, kosh, Options{Log: log.logger()}), log: log}
+	return &rolesEnv{admin: admin, kosh: kosh, c: newEnvCluster(t, kosh, Options{Log: log.logger()}), log: log}
 }
 
 func (r *rolesEnv) session(t *testing.T, grant keys.Grant) *session {
@@ -155,8 +158,8 @@ func TestRoleSeesItsNamespaceOnly(t *testing.T) {
 		name, user string
 		q          Query
 	}{
-		{"default", "kosh:role:team-a:edit", Query{Resource: pods, Namespace: "default"}},
-		{"every namespace", "kosh:role:team-a:edit", Query{Resource: pods}},
+		{"default", "kosh:kosh:role:team-a:edit", Query{Resource: pods, Namespace: "default"}},
+		{"every namespace", "kosh:kosh:role:team-a:edit", Query{Resource: pods}},
 		{"the nodes", "kosh:carol/edit@team-a", Query{Resource: readEnvResolve(t, s, "nodes")}},
 	} {
 		w := open(tc.q)
@@ -195,11 +198,11 @@ func TestImpersonatedUserInTheAPIsAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	info := review.Status.UserInfo
-	if info.Username != "kosh:alice/view" || !slices.Contains(info.Groups, "kosh:clusterrole:view") || !slices.Contains(info.Groups, "system:authenticated") {
+	if info.Username != "kosh:alice/view" || !slices.Contains(info.Groups, "kosh:kosh:clusterrole:view") || !slices.Contains(info.Groups, "system:authenticated") {
 		t.Errorf("the API sees %+v, want the key with its role's group", info)
 	}
 	// The role's caches are made as the role.
-	api, err := r.c.clientsFor(roleIdentity(viewGrant.Role))
+	api, err := r.c.clientsFor(roleIdentity(viewGrant.Role, keys.DefaultInstance))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +210,7 @@ func TestImpersonatedUserInTheAPIsAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := review.Status.UserInfo.Username; got != "kosh:clusterrole:view" {
+	if got := review.Status.UserInfo.Username; got != "kosh:kosh:clusterrole:view" {
 		t.Errorf("the role's cache is %q to the API", got)
 	}
 }
@@ -221,10 +224,10 @@ func TestBindingsWorkForReal(t *testing.T) {
 	r := newRolesEnv(t)
 	ctx := context.Background()
 	rbac := kubernetes.NewForConfigOrDie(r.admin).RbacV1()
-	if err := rbac.ClusterRoleBindings().Delete(ctx, viewGrant.Role.Group(), metav1.DeleteOptions{}); err != nil {
+	if err := rbac.ClusterRoleBindings().Delete(ctx, viewGrant.Role.Group(keys.DefaultInstance), metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := rbac.RoleBindings(testTeamNamespace).Delete(ctx, "kosh:role:edit", metav1.DeleteOptions{}); err != nil {
+	if err := rbac.RoleBindings(testTeamNamespace).Delete(ctx, "kosh:kosh:role:edit", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	listPods := func(s *session, namespace string) error {
@@ -257,20 +260,22 @@ func TestBindingsWorkForReal(t *testing.T) {
 	eventually(t, "view may list pods", func() bool { return listPods(view, "default") == nil })
 	eventually(t, "edit@team-a may list the pods of team-a", func() bool { return listPods(team, testTeamNamespace) == nil })
 
-	crb, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:clusterrole:view", metav1.GetOptions{})
+	crb, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:kosh:clusterrole:view", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if crb.Labels["app.kubernetes.io/managed-by"] != "kosh" || crb.Annotations["kosh.fables-for-robots.dev/role"] != "ClusterRole/view" ||
-		crb.RoleRef.Name != "view" || len(crb.Subjects) != 1 || crb.Subjects[0].Name != "kosh:clusterrole:view" {
+	if crb.Labels["app.kubernetes.io/managed-by"] != "kosh" || crb.Labels["kosh.fables-for-robots.dev/instance"] != "kosh" ||
+		crb.Annotations["kosh.fables-for-robots.dev/role"] != "ClusterRole/view" ||
+		crb.RoleRef.Name != "view" || len(crb.Subjects) != 1 || crb.Subjects[0].Name != "kosh:kosh:clusterrole:view" {
 		t.Errorf("the binding of view: %+v", crb)
 	}
-	rb, err := rbac.RoleBindings(testTeamNamespace).Get(ctx, "kosh:role:edit", metav1.GetOptions{})
+	rb, err := rbac.RoleBindings(testTeamNamespace).Get(ctx, "kosh:kosh:role:edit", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rb.Labels["app.kubernetes.io/managed-by"] != "kosh" || rb.Annotations["kosh.fables-for-robots.dev/role"] != "Role/team-a/edit" ||
-		rb.RoleRef.Kind != "Role" || rb.RoleRef.Name != "edit" || len(rb.Subjects) != 1 || rb.Subjects[0].Name != "kosh:role:team-a:edit" {
+	if rb.Labels["app.kubernetes.io/managed-by"] != "kosh" || rb.Labels["kosh.fables-for-robots.dev/instance"] != "kosh" ||
+		rb.Annotations["kosh.fables-for-robots.dev/role"] != "Role/team-a/edit" ||
+		rb.RoleRef.Kind != "Role" || rb.RoleRef.Name != "edit" || len(rb.Subjects) != 1 || rb.Subjects[0].Name != "kosh:kosh:role:team-a:edit" {
 		t.Errorf("the binding of edit in team-a: %+v", rb)
 	}
 	// kosh may read the roles (§7): the one that does not exist is told,
@@ -288,21 +293,21 @@ func TestBindingsWorkForReal(t *testing.T) {
 	if recs := r.log.with("the role of a key cannot be checked"); len(recs) != 0 {
 		t.Errorf("records %+v", recs)
 	}
-	if _, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:clusterrole:nobody-made-this", metav1.GetOptions{}); err != nil {
+	if _, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:kosh:clusterrole:nobody-made-this", metav1.GetOptions{}); err != nil {
 		t.Errorf("the missing role's binding: %v", err)
 	}
 
 	// A second Make, against the API's own defaulting, changes nothing.
 	versions := func() []string {
 		var out []string
-		for _, name := range []string{"kosh:clusterrole:view", "kosh:clusterrole:nobody-made-this"} {
+		for _, name := range []string{"kosh:kosh:clusterrole:view", "kosh:kosh:clusterrole:nobody-made-this"} {
 			b, err := rbac.ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			out = append(out, b.ResourceVersion)
 		}
-		b, err := rbac.RoleBindings(testTeamNamespace).Get(ctx, "kosh:role:edit", metav1.GetOptions{})
+		b, err := rbac.RoleBindings(testTeamNamespace).Get(ctx, "kosh:kosh:role:edit", metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -323,7 +328,7 @@ func TestBindingsWorkForReal(t *testing.T) {
 		t.Fatalf("Prune: %v", err)
 	}
 	eventually(t, "view is refused again", func() bool { return apierrors.IsForbidden(listPods(view, "default")) })
-	for _, name := range []string{"kosh:clusterrole:view", "kosh:clusterrole:nobody-made-this"} {
+	for _, name := range []string{"kosh:kosh:clusterrole:view", "kosh:kosh:clusterrole:nobody-made-this"} {
 		if _, err := rbac.ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 			t.Errorf("%s after Prune: %v", name, err)
 		}
@@ -331,11 +336,68 @@ func TestBindingsWorkForReal(t *testing.T) {
 	if err := listPods(team, testTeamNamespace); err != nil {
 		t.Errorf("edit@team-a, which a role needs, after Prune: %v", err)
 	}
-	if _, err := rbac.ClusterRoleBindings().Get(ctx, fullGrant.Role.Group(), metav1.GetOptions{}); err != nil {
+	if _, err := rbac.ClusterRoleBindings().Get(ctx, fullGrant.Role.Group(keys.DefaultInstance), metav1.GetOptions{}); err != nil {
 		t.Errorf("the fixture's binding of cluster-admin, without kosh's label: %v", err)
 	}
 	if recs := r.log.with("the bindings of the key list could not be made"); len(recs) != 0 {
 		t.Errorf("failures %+v", recs)
+	}
+}
+
+// TestWarnEditorsForReal: with kosh in its own namespace, the Role edit
+// of team-a, which may do anything there and nothing in kosh's, is not
+// warned of; the ClusterRole edit, bound across the cluster, may update
+// ConfigMaps in kosh's namespace too, and is.
+func TestWarnEditorsForReal(t *testing.T) {
+	r := newRolesEnv(t)
+	ctx := context.Background()
+	typed := kubernetes.NewForConfigOrDie(r.admin)
+	const home = "kosh-home"
+	if _, err := typed.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: home}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// envtest runs no controller-manager: edit is given the rules it
+	// aggregates, as view is in bindRoles.
+	rbac := typed.RbacV1()
+	aggregated, err := rbac.ClusterRoles().Get(ctx, "system:aggregate-to-edit", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit, err := rbac.ClusterRoles().Get(ctx, "edit", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit.Rules = aggregated.Rules
+	if _, err := rbac.ClusterRoles().Update(ctx, edit, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	log := newAuditLog()
+	c := newEnvCluster(t, r.kosh, Options{Log: log.logger(), Namespace: home})
+	editCluster := keys.Role{Kind: keys.KindClusterRole, Name: "edit"}
+	b := NewBindings(c, func() []keys.RoleKeys {
+		return []keys.RoleKeys{
+			{Role: teamGrant.Role, Keys: []string{teamGrant.Name}},
+			{Role: editCluster, Keys: []string{"erin/edit"}},
+			{Role: fullGrant.Role, Keys: []string{fullGrant.Name}},
+		}
+	}, log.logger())
+	if err := b.Make(ctx); err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	b.WarnEditors(ctx)
+	recs := log.with(msgMayEditList)
+	if len(recs) != 1 {
+		t.Fatalf("records %+v, want the ClusterRole edit's alone", log.all())
+	}
+	if role, _ := recs[0].attr("role"); role != "ClusterRole/edit" {
+		t.Errorf("role %q", role)
+	}
+	if k, _ := recs[0].attr("keys"); k != "erin/edit" {
+		t.Errorf("keys %q", k)
+	}
+	if recs := log.with("whether a key's role may edit the key list could not be asked"); len(recs) != 0 {
+		t.Errorf("records %+v", recs)
 	}
 }
 

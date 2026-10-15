@@ -465,4 +465,10 @@ func TestReadAgainAsksTheRightsAgain(t *testing.T) {
 	rightsWant(t, hs, []string{"Delete", "Kill", "Describe"}, nil)
 	hs.release(hs.held...)
 	rightsWant(t, hs, []string{"Delete", "Kill", "Describe"}, nil)
+
+	// Each time, the session forgot the answers it keeps to the table's
+	// questions: of pods (and of pods/log, pods/exec), in default.
+	if got, want := sess.Forgotten(), []string{"pods in default", "pods in default"}; !slices.Equal(got, want) {
+		t.Errorf("ctrl-r had the session forget %q, want %q", got, want)
+	}
 }

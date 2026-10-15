@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -86,7 +87,7 @@ func (f *bindingsFixture) setRoles(roles ...keys.Role) {
 }
 
 // writes returns the creates, updates and deletes of bindings sent so far,
-// as "create clusterrolebindings kosh:clusterrole:view".
+// as "create clusterrolebindings kosh:kosh:clusterrole:view".
 func (f *bindingsFixture) writes() []string {
 	var out []string
 	for _, a := range f.e.typed.Actions() {
@@ -145,21 +146,21 @@ var (
 )
 
 // kosh's mark on a binding it made.
-var koshLabels = map[string]string{"app.kubernetes.io/managed-by": "kosh"}
+var koshLabels = map[string]string{"app.kubernetes.io/managed-by": "kosh", "kosh.fables-for-robots.dev/instance": "kosh"}
 
 func TestMakeCreatesClusterRoleBinding(t *testing.T) {
 	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
 	if err := f.b.Make(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	b, ok := f.crb(t, "kosh:clusterrole:view")
+	b, ok := f.crb(t, "kosh:kosh:clusterrole:view")
 	if !ok {
-		t.Fatal("no ClusterRoleBinding kosh:clusterrole:view")
+		t.Fatal("no ClusterRoleBinding kosh:kosh:clusterrole:view")
 	}
 	if want := (rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "view"}); b.RoleRef != want {
 		t.Errorf("roleRef %+v, want %+v", b.RoleRef, want)
 	}
-	if want := []rbacv1.Subject{{APIGroup: "rbac.authorization.k8s.io", Kind: "Group", Name: "kosh:clusterrole:view"}}; !slices.Equal(b.Subjects, want) {
+	if want := []rbacv1.Subject{{APIGroup: "rbac.authorization.k8s.io", Kind: "Group", Name: "kosh:kosh:clusterrole:view"}}; !slices.Equal(b.Subjects, want) {
 		t.Errorf("subjects %+v, want %+v", b.Subjects, want)
 	}
 	if b.Labels["app.kubernetes.io/managed-by"] != "kosh" {
@@ -178,14 +179,14 @@ func TestMakeCreatesRoleBindingInNamespace(t *testing.T) {
 	if err := f.b.Make(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	b, ok := f.rb(t, "team-a", "kosh:role:edit")
+	b, ok := f.rb(t, "team-a", "kosh:kosh:role:edit")
 	if !ok {
-		t.Fatal("no RoleBinding kosh:role:edit in team-a")
+		t.Fatal("no RoleBinding kosh:kosh:role:edit in team-a")
 	}
 	if want := (rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "edit"}); b.RoleRef != want {
 		t.Errorf("roleRef %+v, want %+v", b.RoleRef, want)
 	}
-	if want := []rbacv1.Subject{{APIGroup: "rbac.authorization.k8s.io", Kind: "Group", Name: "kosh:role:team-a:edit"}}; !slices.Equal(b.Subjects, want) {
+	if want := []rbacv1.Subject{{APIGroup: "rbac.authorization.k8s.io", Kind: "Group", Name: "kosh:kosh:role:team-a:edit"}}; !slices.Equal(b.Subjects, want) {
 		t.Errorf("subjects %+v, want %+v", b.Subjects, want)
 	}
 	if b.Labels["app.kubernetes.io/managed-by"] != "kosh" {
@@ -194,7 +195,7 @@ func TestMakeCreatesRoleBindingInNamespace(t *testing.T) {
 	if got := b.Annotations["kosh.fables-for-robots.dev/role"]; got != "Role/team-a/edit" {
 		t.Errorf("annotation %q", got)
 	}
-	if _, ok := f.crb(t, "kosh:role:edit"); ok {
+	if _, ok := f.crb(t, "kosh:kosh:role:edit"); ok {
 		t.Error("a Role got a ClusterRoleBinding")
 	}
 }
@@ -220,9 +221,9 @@ func TestMakeReplacesAnotherRoleRef(t *testing.T) {
 	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
 	ctx := context.Background()
 	wrong := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: "kosh:clusterrole:view", Labels: koshLabels},
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh:kosh:clusterrole:view", Labels: koshLabels},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "cluster-admin"},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:clusterrole:view"}},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:kosh:clusterrole:view"}},
 	}
 	if _, err := f.e.typed.RbacV1().ClusterRoleBindings().Create(ctx, wrong, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -231,11 +232,11 @@ func TestMakeReplacesAnotherRoleRef(t *testing.T) {
 	if err := f.b.Make(ctx); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"delete clusterrolebindings kosh:clusterrole:view", "create clusterrolebindings kosh:clusterrole:view"}
+	want := []string{"delete clusterrolebindings kosh:kosh:clusterrole:view", "create clusterrolebindings kosh:kosh:clusterrole:view"}
 	if w := f.writes(); !slices.Equal(w, want) {
 		t.Errorf("writes %v, want %v", w, want)
 	}
-	if b, _ := f.crb(t, "kosh:clusterrole:view"); b == nil || b.RoleRef.Name != "view" {
+	if b, _ := f.crb(t, "kosh:kosh:clusterrole:view"); b == nil || b.RoleRef.Name != "view" {
 		t.Errorf("binding %+v, want the roleRef view", b)
 	}
 	if recs := f.log.with("a binding of the key list is replaced: its roleRef was another"); len(recs) != 1 {
@@ -249,11 +250,11 @@ func TestMakeSetsSubjects(t *testing.T) {
 	// Someone added a subject, and the binding lost kosh's annotation: the
 	// subjects are set, the mark is put back, and other labels stay.
 	wrong := &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "kosh:role:edit",
-			Labels: map[string]string{"app.kubernetes.io/managed-by": "kosh", "team": "a"}},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "kosh:kosh:role:edit",
+			Labels: map[string]string{"app.kubernetes.io/managed-by": "kosh", "kosh.fables-for-robots.dev/instance": "kosh", "team": "a"}},
 		RoleRef: rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "Role", Name: "edit"},
 		Subjects: []rbacv1.Subject{
-			{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:role:team-a:edit"},
+			{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:kosh:role:team-a:edit"},
 			{APIGroup: rbacGroup, Kind: "User", Name: "mallory"},
 		},
 	}
@@ -264,11 +265,11 @@ func TestMakeSetsSubjects(t *testing.T) {
 	if err := f.b.Make(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if w := f.writes(); !slices.Equal(w, []string{"update rolebindings team-a/kosh:role:edit"}) {
+	if w := f.writes(); !slices.Equal(w, []string{"update rolebindings team-a/kosh:kosh:role:edit"}) {
 		t.Errorf("writes %v, want one update", w)
 	}
-	b, _ := f.rb(t, "team-a", "kosh:role:edit")
-	if want := []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:role:team-a:edit"}}; !slices.Equal(b.Subjects, want) {
+	b, _ := f.rb(t, "team-a", "kosh:kosh:role:edit")
+	if want := []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:kosh:role:team-a:edit"}}; !slices.Equal(b.Subjects, want) {
 		t.Errorf("subjects %+v, want %+v", b.Subjects, want)
 	}
 	if b.Labels["team"] != "a" || b.Labels["app.kubernetes.io/managed-by"] != "kosh" {
@@ -286,9 +287,9 @@ func TestMakeMarksABindingAtItsName(t *testing.T) {
 	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
 	ctx := context.Background()
 	bare := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: "kosh:clusterrole:view"},
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh:kosh:clusterrole:view"},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "view"},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:clusterrole:view"}},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:kosh:clusterrole:view"}},
 	}
 	if _, err := f.e.typed.RbacV1().ClusterRoleBindings().Create(ctx, bare, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -296,7 +297,7 @@ func TestMakeMarksABindingAtItsName(t *testing.T) {
 	if err := f.b.Make(ctx); err != nil {
 		t.Fatal(err)
 	}
-	b, _ := f.crb(t, "kosh:clusterrole:view")
+	b, _ := f.crb(t, "kosh:kosh:clusterrole:view")
 	if b.Labels["app.kubernetes.io/managed-by"] != "kosh" || b.Annotations["kosh.fables-for-robots.dev/role"] != "ClusterRole/view" {
 		t.Errorf("labels %v, annotations %v", b.Labels, b.Annotations)
 	}
@@ -310,7 +311,7 @@ func TestMakeLeavesAnotherManagersBinding(t *testing.T) {
 	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
 	ctx := context.Background()
 	theirs := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: "kosh:clusterrole:view", Labels: map[string]string{"app.kubernetes.io/managed-by": "argocd"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh:kosh:clusterrole:view", Labels: map[string]string{"app.kubernetes.io/managed-by": "argocd"}},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "edit"},
 		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "ops"}},
 	}
@@ -330,7 +331,7 @@ func TestMakeLeavesAnotherManagersBinding(t *testing.T) {
 	if w := f.writes(); len(w) != 0 {
 		t.Errorf("writes %v to another manager's binding", w)
 	}
-	b, ok := f.crb(t, "kosh:clusterrole:view")
+	b, ok := f.crb(t, "kosh:kosh:clusterrole:view")
 	if !ok || b.Labels["app.kubernetes.io/managed-by"] != "argocd" || b.RoleRef.Name != "edit" {
 		t.Errorf("binding %+v, want argocd's as it was", b)
 	}
@@ -368,15 +369,20 @@ func TestPruneDeletesOnlyLabelledUnneeded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	crb("kosh:clusterrole:view", "view", koshLabels)                                          // needed
-	crb("kosh:clusterrole:x", "x", nil)                                                       // not kosh's: stays
-	crb("kosh:clusterrole:cluster-admin", "cluster-admin", koshLabels)                        // unneeded: goes
-	crb("someone-elses", "edit", map[string]string{"app": "other"})                           // not kosh's: stays
-	rb("team-a", "kosh:role:edit", koshLabels)                                                // needed
-	rb("team-a", "kosh:role:admin", koshLabels)                                               // unneeded: goes
-	rb("team-b", "kosh:role:edit", koshLabels)                                                // unneeded: goes, though team-a's of that name is needed
-	rb("team-b", "kosh:role:view", nil)                                                       // not kosh's: stays
-	rb("team-c", "kosh:role:edit", map[string]string{"app.kubernetes.io/managed-by": "helm"}) // not kosh's: stays
+	crb("kosh:kosh:clusterrole:view", "view", koshLabels)                                          // needed
+	crb("kosh:kosh:clusterrole:x", "x", nil)                                                       // not kosh's: stays
+	crb("kosh:kosh:clusterrole:cluster-admin", "cluster-admin", koshLabels)                        // unneeded: goes
+	crb("someone-elses", "edit", map[string]string{"app": "other"})                                // not kosh's: stays
+	rb("team-a", "kosh:kosh:role:edit", koshLabels)                                                // needed
+	rb("team-a", "kosh:kosh:role:admin", koshLabels)                                               // unneeded: goes
+	rb("team-b", "kosh:kosh:role:edit", koshLabels)                                                // unneeded: goes, though team-a's of that name is needed
+	rb("team-b", "kosh:kosh:role:view", nil)                                                       // not kosh's: stays
+	rb("team-c", "kosh:kosh:role:edit", map[string]string{"app.kubernetes.io/managed-by": "helm"}) // not kosh's: stays
+	// Another instance's, and one with kosh's label and no instance:
+	// neither is this instance's to delete.
+	crb("kosh:other:clusterrole:cluster-admin", "cluster-admin", map[string]string{"app.kubernetes.io/managed-by": "kosh", "kosh.fables-for-robots.dev/instance": "other"})
+	rb("team-a", "kosh:other:role:edit", map[string]string{"app.kubernetes.io/managed-by": "kosh", "kosh.fables-for-robots.dev/instance": "other"})
+	crb("kosh:kosh:clusterrole:edit", "edit", map[string]string{"app.kubernetes.io/managed-by": "kosh"})
 	f.e.typed.ClearActions()
 
 	if err := f.b.Prune(ctx); err != nil {
@@ -385,19 +391,19 @@ func TestPruneDeletesOnlyLabelledUnneeded(t *testing.T) {
 	got := f.writes()
 	slices.Sort(got)
 	want := []string{
-		"delete clusterrolebindings kosh:clusterrole:cluster-admin",
-		"delete rolebindings team-a/kosh:role:admin",
-		"delete rolebindings team-b/kosh:role:edit",
+		"delete clusterrolebindings kosh:kosh:clusterrole:cluster-admin",
+		"delete rolebindings team-a/kosh:kosh:role:admin",
+		"delete rolebindings team-b/kosh:kosh:role:edit",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("writes %v\nwant %v", got, want)
 	}
-	for _, name := range []string{"kosh:clusterrole:view", "kosh:clusterrole:x", "someone-elses"} {
+	for _, name := range []string{"kosh:kosh:clusterrole:view", "kosh:kosh:clusterrole:x", "someone-elses", "kosh:other:clusterrole:cluster-admin", "kosh:kosh:clusterrole:edit"} {
 		if _, ok := f.crb(t, name); !ok {
 			t.Errorf("the ClusterRoleBinding %s is gone", name)
 		}
 	}
-	for _, nn := range [][2]string{{"team-a", "kosh:role:edit"}, {"team-b", "kosh:role:view"}, {"team-c", "kosh:role:edit"}} {
+	for _, nn := range [][2]string{{"team-a", "kosh:kosh:role:edit"}, {"team-b", "kosh:kosh:role:view"}, {"team-c", "kosh:kosh:role:edit"}, {"team-a", "kosh:other:role:edit"}} {
 		if _, ok := f.rb(t, nn[0], nn[1]); !ok {
 			t.Errorf("the RoleBinding %s/%s is gone", nn[0], nn[1])
 		}
@@ -426,10 +432,10 @@ func TestMissingRoleIsLoggedAndBound(t *testing.T) {
 		t.Errorf("missing %v, want %v", missing, want)
 	}
 	// Bound all the same: the role works the moment it is made.
-	if _, ok := f.crb(t, "kosh:clusterrole:cluster-admin"); !ok {
+	if _, ok := f.crb(t, "kosh:kosh:clusterrole:cluster-admin"); !ok {
 		t.Error("the missing ClusterRole is not bound")
 	}
-	if _, ok := f.rb(t, "team-b", "kosh:role:edit"); !ok {
+	if _, ok := f.rb(t, "team-b", "kosh:kosh:role:edit"); !ok {
 		t.Error("the missing Role is not bound")
 	}
 	// At every reading.
@@ -463,7 +469,7 @@ func TestRoleThatCannotBeRead(t *testing.T) {
 			if (err != nil) != tc.failure {
 				t.Errorf("Make: %v, want a failure: %v", err, tc.failure)
 			}
-			if _, ok := f.crb(t, "kosh:clusterrole:view"); !ok {
+			if _, ok := f.crb(t, "kosh:kosh:clusterrole:view"); !ok {
 				t.Error("not bound")
 			}
 			if recs := f.log.with("the role of a key does not exist"); len(recs) != 0 {
@@ -497,20 +503,20 @@ func TestRunRetriesAFailure(t *testing.T) {
 	f.b.retry = 5 * time.Millisecond
 	var creates atomic.Int32
 	f.e.typed.PrependReactor("create", "clusterrolebindings", func(a k8stesting.Action) (bool, runtime.Object, error) {
-		if a.(k8stesting.CreateAction).GetObject().(metav1.Object).GetName() != "kosh:clusterrole:view" {
+		if a.(k8stesting.CreateAction).GetObject().(metav1.Object).GetName() != "kosh:kosh:clusterrole:view" {
 			return false, nil, nil
 		}
 		// The start's Make and three ticks fail; the fourth tick works.
 		if creates.Add(1) <= 4 {
 			// A webhook's text, which the log must not hold.
-			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: rbacGroup, Resource: "clusterrolebindings"}, "kosh:clusterrole:view", errors.New("the webhook says s3cr3t"))
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: rbacGroup, Resource: "clusterrolebindings"}, "kosh:kosh:clusterrole:view", errors.New("the webhook says s3cr3t"))
 		}
 		return false, nil, nil
 	})
 	// The first reconcile, as kosh serve makes it at start.
 	f.b.MakeNow()
 	f.b.PruneNow()
-	if _, ok := f.crb(t, "kosh:clusterrole:view"); ok {
+	if _, ok := f.crb(t, "kosh:kosh:clusterrole:view"); ok {
 		t.Fatal("made despite the failure")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -520,7 +526,7 @@ func TestRunRetriesAFailure(t *testing.T) {
 		f.b.Run(ctx)
 	}()
 	eventually(t, "the binding, made on a retry", func() bool {
-		_, ok := f.crb(t, "kosh:clusterrole:view")
+		_, ok := f.crb(t, "kosh:kosh:clusterrole:view")
 		return ok
 	})
 	// Once it worked, nothing is retried.
@@ -538,7 +544,7 @@ func TestRunRetriesAFailure(t *testing.T) {
 	for _, r := range f.log.with("the bindings of the key list could not be made") {
 		levels = append(levels, r.Level.String())
 		e, _ := r.attr("err")
-		if strings.Contains(e, "s3cr3t") || !strings.Contains(e, "the API answered Forbidden (403)") || !strings.Contains(e, "kosh:clusterrole:view") {
+		if strings.Contains(e, "s3cr3t") || !strings.Contains(e, "the API answered Forbidden (403)") || !strings.Contains(e, "kosh:kosh:clusterrole:view") {
 			t.Errorf("err %q: the binding and the API's code, and nothing of its text", e)
 		}
 	}
@@ -595,7 +601,7 @@ func TestOrderOnChange(t *testing.T) {
 	if err := f.b.Prune(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := f.crb(t, "kosh:clusterrole:cluster-admin"); !ok {
+	if _, ok := f.crb(t, "kosh:kosh:clusterrole:cluster-admin"); !ok {
 		t.Fatal("the first Make made no binding")
 	}
 
@@ -620,13 +626,13 @@ func TestOrderOnChange(t *testing.T) {
 
 	list.Replace(keySet(t, pub, "alice/view"))
 	slices.Sort(ended)
-	if want := []string{"kosh:clusterrole:cluster-admin", "kosh:clusterrole:view"}; !slices.Equal(ended, want) {
+	if want := []string{"kosh:kosh:clusterrole:cluster-admin", "kosh:kosh:clusterrole:view"}; !slices.Equal(ended, want) {
 		t.Errorf("when the sessions end: %v, want %v", ended, want)
 	}
-	if _, ok := f.crb(t, "kosh:clusterrole:cluster-admin"); ok {
+	if _, ok := f.crb(t, "kosh:kosh:clusterrole:cluster-admin"); ok {
 		t.Error("the binding alice lost is there after the change")
 	}
-	if _, ok := f.crb(t, "kosh:clusterrole:view"); !ok {
+	if _, ok := f.crb(t, "kosh:kosh:clusterrole:view"); !ok {
 		t.Error("the binding alice needs is not there after the change")
 	}
 }
@@ -653,4 +659,209 @@ func keySet(t *testing.T, key ssh.PublicKey, name string) *keys.Set {
 		t.Fatalf("rejected %+v", rejected)
 	}
 	return set
+}
+
+// Two instances of kosh on one cluster each make and prune their own
+// bindings, named and labelled with their instance, and never touch the
+// other's, though their key lists name the same roles.
+func TestTwoInstancesKeepTheirOwn(t *testing.T) {
+	f := newBindingsFixture(t, []keys.Role{viewRole, editTeamA}, viewRole, editTeamA)
+	other := NewBindings(f.e.c, func() []keys.RoleKeys {
+		return []keys.RoleKeys{{Role: viewRole, Keys: []string{"bob/view"}}}
+	}, f.log.logger())
+	other.instance = "other"
+	ctx := context.Background()
+	if err := f.b.Make(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Make(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b, ok := f.crb(t, "kosh:other:clusterrole:view")
+	if !ok || b.Labels["kosh.fables-for-robots.dev/instance"] != "other" || b.Labels["app.kubernetes.io/managed-by"] != "kosh" ||
+		len(b.Subjects) != 1 || b.Subjects[0].Name != "kosh:other:clusterrole:view" {
+		t.Fatalf("the other instance's binding %+v", b)
+	}
+	if b, _ := f.crb(t, "kosh:kosh:clusterrole:view"); b == nil || b.Labels["kosh.fables-for-robots.dev/instance"] != "kosh" {
+		t.Fatalf("this instance's binding %+v", b)
+	}
+
+	// The other instance names no role any more, and prunes: its own go,
+	// this one's stay; this one prunes, and the other's stay gone.
+	f.e.typed.ClearActions()
+	other.roles = func() []keys.RoleKeys { return nil }
+	if err := other.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := f.writes(); !slices.Equal(w, []string{"delete clusterrolebindings kosh:other:clusterrole:view"}) {
+		t.Errorf("the other instance's prune: writes %v", w)
+	}
+	f.e.typed.ClearActions()
+	if err := f.b.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Errorf("this instance's prune: writes %v", w)
+	}
+	if _, ok := f.crb(t, "kosh:kosh:clusterrole:view"); !ok {
+		t.Error("this instance's ClusterRoleBinding is gone")
+	}
+	if _, ok := f.rb(t, "team-a", "kosh:kosh:role:edit"); !ok {
+		t.Error("this instance's RoleBinding is gone")
+	}
+}
+
+// A binding at kosh's name that nobody's label claims and that binds
+// something else is left as it is, said once, and never pruned.
+func TestMakeLeavesAnUnmarkedBindingThatIsNotRight(t *testing.T) {
+	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
+	ctx := context.Background()
+	theirs := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh:kosh:clusterrole:view"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "view"},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "User", Name: "mallory"}},
+	}
+	if _, err := f.e.typed.RbacV1().ClusterRoleBindings().Create(ctx, theirs, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.e.typed.ClearActions()
+	for range 2 {
+		if err := f.b.Make(ctx); err != nil {
+			t.Fatalf("Make: %v", err)
+		}
+	}
+	f.setRoles()
+	if err := f.b.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Errorf("writes %v to a binding that is not kosh's", w)
+	}
+	if b, ok := f.crb(t, "kosh:kosh:clusterrole:view"); !ok || len(b.Labels) != 0 || b.Subjects[0].Name != "mallory" {
+		t.Errorf("binding %+v, want it as it was", b)
+	}
+	if recs := f.log.with("a binding at kosh's name is not kosh's: it is left as it is"); len(recs) != 1 {
+		t.Errorf("records %+v, want one", f.log.all())
+	}
+	if recs := f.log.with(msgBindingsFailed); len(recs) != 0 {
+		t.Errorf("a failure is logged: %+v", recs)
+	}
+}
+
+// A binding at kosh's name that binds what kosh would, made by hand for a
+// role kosh may not bind, is no failure when kosh may not label it: it
+// works as it is, and is said once.
+func TestMakeLeavesABindingItMayNotAdopt(t *testing.T) {
+	f := newBindingsFixture(t, []keys.Role{adminRole}, adminRole)
+	ctx := context.Background()
+	byHand := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh:kosh:clusterrole:cluster-admin"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "cluster-admin"},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "kosh:kosh:clusterrole:cluster-admin"}},
+	}
+	if _, err := f.e.typed.RbacV1().ClusterRoleBindings().Create(ctx, byHand, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.e.typed.PrependReactor("update", "clusterrolebindings", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: rbacGroup, Resource: "clusterrolebindings"}, "", errors.New("no bind"))
+	})
+	for range 2 {
+		if err := f.b.Make(ctx); err != nil {
+			t.Fatalf("Make: %v", err)
+		}
+	}
+	if recs := f.log.with("a binding at kosh's name is not kosh's: it is left as it is"); len(recs) != 1 {
+		t.Errorf("records %+v, want one", f.log.all())
+	}
+	if recs := f.log.with(msgBindingsFailed); len(recs) != 0 {
+		t.Errorf("a failure is logged: %+v", recs)
+	}
+}
+
+// editorsFixture is a Bindings over a Cluster whose identities' reviews
+// the reviewer answers, with kosh's namespace ns, and roles as the key
+// list's.
+func editorsFixture(t *testing.T, ns string, roles ...keys.Role) (*Bindings, *reviewer, *auditLog) {
+	t.Helper()
+	log := newAuditLog()
+	e, r := reviewEnv(t, Options{Log: log.logger(), Namespace: ns})
+	b := NewBindings(e.c, func() []keys.RoleKeys {
+		var out []keys.RoleKeys
+		for _, role := range roles {
+			out = append(out, keys.RoleKeys{Role: role, Keys: []string{keyOf(role)}})
+		}
+		return out
+	}, log.logger())
+	return b, r, log
+}
+
+// A role that may update or patch ConfigMaps in kosh's namespace is warned
+// of, with its keys, at every reading; one that may not is not, and
+// cluster-admin is not asked: it may name any role anyway.
+func TestWarnEditors(t *testing.T) {
+	editCluster := keys.Role{Kind: keys.KindClusterRole, Name: "edit"}
+	editKosh := keys.Role{Kind: keys.KindRole, Namespace: "kosh", Name: "edit"}
+	b, r, log := editorsFixture(t, "kosh", adminRole, viewRole, editCluster, editTeamA, editKosh)
+	r.allowFor("kosh:kosh:clusterrole:edit", authorizationv1.ResourceAttributes{Verb: "update", Resource: "configmaps", Namespace: "kosh"})
+	r.allowFor("kosh:kosh:role:kosh:edit", authorizationv1.ResourceAttributes{Verb: "patch", Resource: "configmaps", Namespace: "kosh"})
+	b.WarnEditors(context.Background())
+	b.WarnEditors(context.Background())
+
+	recs := log.with(msgMayEditList)
+	var got []string
+	for _, rec := range recs {
+		role, _ := rec.attr("role")
+		keys, _ := rec.attr("keys")
+		ns, _ := rec.attr("namespace")
+		if rec.Level != slog.LevelWarn || ns != "kosh" {
+			t.Errorf("record %+v", rec)
+		}
+		got = append(got, role+" "+keys)
+	}
+	want := []string{
+		"ClusterRole/edit alice/edit", "Role/kosh/edit alice/edit@kosh",
+		"ClusterRole/edit alice/edit", "Role/kosh/edit alice/edit@kosh",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("warnings %q\nwant %q", got, want)
+	}
+	for _, rv := range r.reviews() {
+		if rv.user == "kosh:kosh:clusterrole:cluster-admin" {
+			t.Errorf("cluster-admin was asked: %+v", rv)
+		}
+		if rv.attrs.Resource != "configmaps" || rv.attrs.Namespace != "kosh" {
+			t.Errorf("asked %+v", rv)
+		}
+	}
+}
+
+// Without kosh's namespace nothing is asked, and the log says it once, at
+// debug level; a question the API does not answer is said once, and is no
+// failure.
+func TestWarnEditorsWithoutTheNamespaceOrTheAPI(t *testing.T) {
+	b, r, log := editorsFixture(t, "", viewRole)
+	b.WarnEditors(context.Background())
+	b.WarnEditors(context.Background())
+	if n := len(r.reviews()); n != 0 {
+		t.Errorf("%d reviews without kosh's namespace", n)
+	}
+	recs := log.with("kosh's namespace is not known: whether a key's role may edit the key list is not checked")
+	if len(recs) != 1 || recs[0].Level != slog.LevelDebug {
+		t.Errorf("records %+v, want one at debug level", log.all())
+	}
+
+	b, r, log = editorsFixture(t, "kosh", viewRole, editTeamA)
+	r.setErr(apierrors.NewInternalError(errors.New("webhook said something")))
+	b.WarnEditors(context.Background())
+	b.WarnEditors(context.Background())
+	recs = log.with("whether a key's role may edit the key list could not be asked")
+	if len(recs) != 1 || recs[0].Level != slog.LevelWarn {
+		t.Fatalf("records %+v, want one warning", log.all())
+	}
+	if e, _ := recs[0].attr("err"); strings.Contains(e, "webhook") {
+		t.Errorf("the API's text is in the log: %s", e)
+	}
+	if recs := log.with(msgMayEditList); len(recs) != 0 {
+		t.Errorf("a role is warned of on an error: %+v", recs)
+	}
 }

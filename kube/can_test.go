@@ -32,8 +32,10 @@ type review struct {
 type reviewer struct {
 	mu      sync.Mutex
 	allowed map[authorizationv1.ResourceAttributes]bool
-	err     error
-	asked   []review
+	// byUser are the answers to one identity alone, by its user.
+	byUser map[string]map[authorizationv1.ResourceAttributes]bool
+	err    error
+	asked  []review
 }
 
 // reviewEnv returns an env whose identities' typed clients are the
@@ -59,7 +61,7 @@ func reviewEnv(t *testing.T, opts Options) (*env, *reviewer) {
 				return true, nil, r.err
 			}
 			out := ssar.DeepCopy()
-			out.Status.Allowed = r.allowed[attrs]
+			out.Status.Allowed = r.allowed[attrs] || r.byUser[user][attrs]
 			return true, out, nil
 		})
 		own := *cl
@@ -73,6 +75,19 @@ func (r *reviewer) allow(attrs authorizationv1.ResourceAttributes) {
 	r.mu.Lock()
 	r.allowed[attrs] = true
 	r.mu.Unlock()
+}
+
+// allowFor answers yes to attrs asked by the identity of user alone.
+func (r *reviewer) allowFor(user string, attrs authorizationv1.ResourceAttributes) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byUser == nil {
+		r.byUser = map[string]map[authorizationv1.ResourceAttributes]bool{}
+	}
+	if r.byUser[user] == nil {
+		r.byUser[user] = map[authorizationv1.ResourceAttributes]bool{}
+	}
+	r.byUser[user][attrs] = true
 }
 
 func (r *reviewer) setErr(err error) {
@@ -123,7 +138,7 @@ func TestCanAsksAsTheKey(t *testing.T) {
 		}
 	}
 	imp, ok := e.madeWith("kosh:alice/view")
-	if wantImp := (rest.ImpersonationConfig{UserName: "kosh:alice/view", Groups: []string{"kosh:clusterrole:view"}}); !ok || !reflect.DeepEqual(imp, wantImp) {
+	if wantImp := (rest.ImpersonationConfig{UserName: "kosh:alice/view", Groups: []string{"kosh:kosh:clusterrole:view"}}); !ok || !reflect.DeepEqual(imp, wantImp) {
 		t.Errorf("the key's clients impersonate %+v, want %+v", imp, wantImp)
 	}
 }

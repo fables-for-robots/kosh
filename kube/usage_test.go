@@ -143,10 +143,10 @@ func TestUsageWatchHoldsTheNodesOnlyWhileServed(t *testing.T) {
 	}
 }
 
-// Nodes that kosh may not list leave the header n/a, and the log says
-// why, once for the watch however often it is read.
-func TestUsageWatchLogsNodesItMayNotList(t *testing.T) {
-	log := newAuditLog()
+// usageEnvWithNodes makes an env whose list of the nodes (core) the API
+// answers with err, with the metrics API served.
+func usageEnvWithNodes(t *testing.T, log *auditLog, err error) (*env, *metricsAPI) {
+	t.Helper()
 	api := newMetricsAPI()
 	api.set(NodeMetrics, nodeMetrics("n1", "1", "2Gi"))
 	e := newEnv(t, envConfig{
@@ -157,10 +157,49 @@ func TestUsageWatchLogsNodesItMayNotList(t *testing.T) {
 				if a.GetResource().Group != "" {
 					return false, nil, nil
 				}
-				return true, nil, apierrors.NewForbidden(a.GetResource().GroupResource(), "", errors.New("RBAC"))
+				return true, nil, err
 			})
 		},
 	}, allocNode("n1", "4", "8Gi"))
+	return e, api
+}
+
+// A role the API refuses the list of the nodes, as view, has no lines in
+// the header: the watch gives the hold back, nodes and poller, and the log
+// says it once for the role, however many sessions of it read.
+func TestUsageWatchHasNoLinesForARoleRefusedTheNodes(t *testing.T) {
+	log := newAuditLog()
+	e, _ := usageEnvWithNodes(t, log, apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "", errors.New("RBAC")))
+	u := e.session(t).ClusterUsage()
+	defer u.Close()
+	const msg = "the role may not list the nodes: its header has no CPU and MEM lines"
+	eventually(t, "the watch is not served", func() bool {
+		got, _ := u.Current()
+		return !got.Served && len(log.with(msg)) > 0
+	})
+	eventually(t, "the hold is given back", func() bool {
+		return e.c.pollerCount() == 0 && e.c.idle(render.Nodes)
+	})
+	u2 := e.session(t).ClusterUsage()
+	defer u2.Close()
+	eventually(t, "the second watch is not served", func() bool {
+		u2.Current()
+		got, _ := u2.Current()
+		return !got.Served && !u2.(*usageWatch).held()
+	})
+	if got, ok := u.Current(); ok || got.Served {
+		t.Errorf("%+v, %v; want not served", got, ok)
+	}
+	if recs := log.with(msg); len(recs) != 1 || !strings.Contains(recs[0].Attrs["err"].String(), "Forbidden") {
+		t.Errorf("records %+v, want one with the API's reason", recs)
+	}
+}
+
+// Nodes that cannot be listed for another reason leave the header n/a,
+// and the log says why, once for the watch however often it is read.
+func TestUsageWatchLogsNodesItCannotList(t *testing.T) {
+	log := newAuditLog()
+	e, api := usageEnvWithNodes(t, log, apierrors.NewInternalError(errors.New("etcd is down")))
 	u := e.session(t).ClusterUsage()
 	defer u.Close()
 	const msg = "the nodes cannot be listed: the cluster's CPU and memory are n/a"
@@ -176,8 +215,8 @@ func TestUsageWatchLogsNodesItMayNotList(t *testing.T) {
 	if got, ok := u.Current(); ok || !got.Served {
 		t.Errorf("%+v, %v; want served and n/a", got, ok)
 	}
-	if recs := log.with(msg); len(recs) != 1 || recs[0].Level != slog.LevelWarn || !strings.Contains(recs[0].Attrs["err"].String(), "forbidden") {
-		t.Errorf("records %+v, want one WARN with the API's refusal", recs)
+	if recs := log.with(msg); len(recs) != 1 || recs[0].Level != slog.LevelWarn || !strings.Contains(recs[0].Attrs["err"].String(), "etcd") {
+		t.Errorf("records %+v, want one WARN with the error", recs)
 	}
 }
 

@@ -73,9 +73,9 @@ func bindRoles(t *testing.T, admin *rest.Config) {
 	rbac := typed.RbacV1()
 	for _, r := range []keys.Role{fullGrant.Role, viewGrant.Role} {
 		b := &rbacv1.ClusterRoleBinding{
-			ObjectMeta: metav1.ObjectMeta{Name: r.Group()},
+			ObjectMeta: metav1.ObjectMeta{Name: r.Group(keys.DefaultInstance)},
 			RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: r.Name},
-			Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: r.Group()}},
+			Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: r.Group(keys.DefaultInstance)}},
 		}
 		if _, err := rbac.ClusterRoleBindings().Create(ctx, b, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
@@ -108,9 +108,9 @@ func bindRoles(t *testing.T, admin *rest.Config) {
 		t.Fatal(err)
 	}
 	rb := &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Namespace: testTeamNamespace, Name: "kosh:role:" + teamGrant.Role.Name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: testTeamNamespace, Name: "kosh:kosh:role:" + teamGrant.Role.Name},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "Role", Name: teamGrant.Role.Name},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: teamGrant.Role.Group()}},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: teamGrant.Role.Group(keys.DefaultInstance)}},
 	}
 	if _, err := rbac.RoleBindings(testTeamNamespace).Create(ctx, rb, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)

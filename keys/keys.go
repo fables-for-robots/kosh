@@ -23,6 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,13 +67,32 @@ type Role struct {
 	Name      string
 }
 
-// Group returns the group that carries the role's binding:
-// "kosh:clusterrole:<role>" or "kosh:role:<namespace>:<role>".
-func (r Role) Group() string {
+// Group returns the group that carries the role's binding for the kosh
+// instance named instance: "kosh:<instance>:clusterrole:<role>" or
+// "kosh:<instance>:role:<namespace>:<role>". Two instances of kosh that
+// serve one cluster never share a group, nor so a binding.
+func (r Role) Group(instance string) string {
 	if r.Kind == KindRole {
-		return "kosh:role:" + r.Namespace + ":" + r.Name
+		return "kosh:" + instance + ":role:" + r.Namespace + ":" + r.Name
 	}
-	return "kosh:clusterrole:" + r.Name
+	return "kosh:" + instance + ":clusterrole:" + r.Name
+}
+
+// DefaultInstance is the name of a kosh instance that is given none.
+const DefaultInstance = "kosh"
+
+// instanceName is what an instance's name may be made of.
+var instanceName = regexp.MustCompile(`^[a-z0-9.-]{1,63}$`)
+
+// CheckInstance returns why name cannot name a kosh instance, or nil: it
+// is a path segment without ":", of lower-case letters, digits, "." and
+// "-", 63 at most, and neither "." nor "..", since it is in the names of
+// groups and bindings.
+func CheckInstance(name string) error {
+	if !instanceName.MatchString(name) || name == "." || name == ".." {
+		return fmt.Errorf("the instance %q is not a name: lower-case letters, digits, . and -, 63 at most, not . or ..", name)
+	}
+	return nil
 }
 
 // String returns the role as kosh's log shows it: "ClusterRole/view" or

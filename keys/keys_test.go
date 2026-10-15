@@ -179,11 +179,11 @@ func TestRoleNames(t *testing.T) {
 		role          Role
 		group, string string
 	}{
-		{clusterRole("view"), "kosh:clusterrole:view", "ClusterRole/view"},
-		{clusterRole("system:aggregate-to-view"), "kosh:clusterrole:system:aggregate-to-view", "ClusterRole/system:aggregate-to-view"},
-		{nsRole("team-a", "edit"), "kosh:role:team-a:edit", "Role/team-a/edit"},
+		{clusterRole("view"), "kosh:ops:clusterrole:view", "ClusterRole/view"},
+		{clusterRole("system:aggregate-to-view"), "kosh:ops:clusterrole:system:aggregate-to-view", "ClusterRole/system:aggregate-to-view"},
+		{nsRole("team-a", "edit"), "kosh:ops:role:team-a:edit", "Role/team-a/edit"},
 	} {
-		if got := tc.role.Group(); got != tc.group {
+		if got := tc.role.Group("ops"); got != tc.group {
 			t.Errorf("%+v: Group = %q, want %q", tc.role, got, tc.group)
 		}
 		if got := tc.role.String(); got != tc.string {
@@ -193,6 +193,19 @@ func TestRoleNames(t *testing.T) {
 	g := Grant{Name: "bob@laptop/view", Role: clusterRole("view")}
 	if got := g.User(); got != "kosh:bob@laptop/view" {
 		t.Errorf("User = %q, want kosh:bob@laptop/view", got)
+	}
+}
+
+func TestCheckInstance(t *testing.T) {
+	for _, good := range []string{"kosh", "kosh-kosh", "mdns", "a", "team.a", strings.Repeat("a", 63)} {
+		if err := CheckInstance(good); err != nil {
+			t.Errorf("%q: %v", good, err)
+		}
+	}
+	for _, bad := range []string{"", ".", "..", "a:b", "a/b", "Kosh", "a b", "a_b", strings.Repeat("a", 64), "é"} {
+		if err := CheckInstance(bad); err == nil {
+			t.Errorf("%q is taken for an instance's name", bad)
+		}
 	}
 }
 

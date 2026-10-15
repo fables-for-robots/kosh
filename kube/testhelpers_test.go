@@ -532,7 +532,7 @@ var (
 // fullKey is the key of the cache of gvr that the sessions of fullGrant
 // share.
 func fullKey(gvr schema.GroupVersionResource) cacheKey {
-	return cacheKey{id: roleIdentity(fullGrant.Role), gvr: gvr}
+	return cacheKey{id: roleIdentity(fullGrant.Role, keys.DefaultInstance), gvr: gvr}
 }
 
 // session returns a session of the Cluster with fullGrant, which ends

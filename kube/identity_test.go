@@ -27,14 +27,14 @@ func TestIdentities(t *testing.T) {
 		got  identity
 		want identity
 	}{
-		{"a key of view", identityOf(viewGrant), identity{user: "kosh:alice/view", group: "kosh:clusterrole:view"}},
-		{"a key of a Role", identityOf(teamGrant), identity{user: "kosh:carol/edit@team-a", group: "kosh:role:team-a:edit"}},
-		{"the ClusterRole view", roleIdentity(viewGrant.Role), identity{user: "kosh:clusterrole:view", group: "kosh:clusterrole:view"}},
-		{"the Role edit of team-a", roleIdentity(teamGrant.Role), identity{user: "kosh:role:team-a:edit", group: "kosh:role:team-a:edit"}},
+		{"a key of view", identityOf(viewGrant, keys.DefaultInstance), identity{user: "kosh:alice/view", group: "kosh:kosh:clusterrole:view"}},
+		{"a key of a Role", identityOf(teamGrant, keys.DefaultInstance), identity{user: "kosh:carol/edit@team-a", group: "kosh:kosh:role:team-a:edit"}},
+		{"the ClusterRole view", roleIdentity(viewGrant.Role, keys.DefaultInstance), identity{user: "kosh:kosh:clusterrole:view", group: "kosh:kosh:clusterrole:view"}},
+		{"the Role edit of team-a", roleIdentity(teamGrant.Role, keys.DefaultInstance), identity{user: "kosh:kosh:role:team-a:edit", group: "kosh:kosh:role:team-a:edit"}},
 		// A ClusterRole whose name holds a colon is not the Role of the
 		// namespace before it.
-		{"the ClusterRole team-a:edit", roleIdentity(keys.Role{Kind: keys.KindClusterRole, Name: "team-a:edit"}),
-			identity{user: "kosh:clusterrole:team-a:edit", group: "kosh:clusterrole:team-a:edit"}},
+		{"the ClusterRole team-a:edit", roleIdentity(keys.Role{Kind: keys.KindClusterRole, Name: "team-a:edit"}, keys.DefaultInstance),
+			identity{user: "kosh:kosh:clusterrole:team-a:edit", group: "kosh:kosh:clusterrole:team-a:edit"}},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s: %+v, want %+v", tc.name, tc.got, tc.want)
@@ -49,7 +49,7 @@ func TestSessionClientsImpersonateTheKey(t *testing.T) {
 	if !ok {
 		t.Fatal("no clients were made for the key")
 	}
-	want := rest.ImpersonationConfig{UserName: "kosh:alice/view", Groups: []string{"kosh:clusterrole:view"}}
+	want := rest.ImpersonationConfig{UserName: "kosh:alice/view", Groups: []string{"kosh:kosh:clusterrole:view"}}
 	if !reflect.DeepEqual(imp, want) {
 		t.Errorf("the key's clients impersonate %+v, want %+v", imp, want)
 	}
@@ -171,7 +171,7 @@ func TestARequestCarriesTheImpersonation(t *testing.T) {
 		{"/api/v1/namespaces/default/pods/web", "", key},                                 // Logs: typed
 		{"/api/v1/namespaces/default/pods/web/log", "", key},                             // Logs: the opener
 		{"/api/v1/configmaps", "Table", key},                                             // the tables
-		{"/api/v1/pods", "", "kosh:clusterrole:view"},                                    // the role's cache
+		{"/api/v1/pods", "", "kosh:kosh:clusterrole:view"},                               // the role's cache
 	}
 	for _, r := range want {
 		if !slices.Contains(requests, r) {
@@ -184,7 +184,7 @@ func TestARequestCarriesTheImpersonation(t *testing.T) {
 		}
 	}
 	for user, g := range groups {
-		if !reflect.DeepEqual(g, []string{"kosh:clusterrole:view"}) {
+		if !reflect.DeepEqual(g, []string{"kosh:kosh:clusterrole:view"}) {
 			t.Errorf("%s impersonates the groups %v", user, g)
 		}
 	}
@@ -200,7 +200,7 @@ func TestNoConfigNoClients(t *testing.T) {
 	t.Cleanup(c.Close)
 	e.typed.ClearActions() // the discovery of newEnv's own Cluster
 	e.dyn.ClearActions()
-	if _, err := c.clientsFor(identityOf(fullGrant)); !errors.Is(err, errNoIdentityConfig) {
+	if _, err := c.clientsFor(identityOf(fullGrant, keys.DefaultInstance)); !errors.Is(err, errNoIdentityConfig) {
 		t.Errorf("clientsFor: %v, want errNoIdentityConfig", err)
 	}
 	s := c.Session(context.Background(), fullGrant)
@@ -268,7 +268,7 @@ func TestCachesArePerRole(t *testing.T) {
 	if watchCache(t, alice) == watchCache(t, admin) {
 		t.Error("a key of view and one of cluster-admin share a cache")
 	}
-	if got, want := watchCache(t, alice).key, (cacheKey{id: roleIdentity(viewGrant.Role), gvr: render.Pods}); got != want {
+	if got, want := watchCache(t, alice).key, (cacheKey{id: roleIdentity(viewGrant.Role, keys.DefaultInstance), gvr: render.Pods}); got != want {
 		t.Errorf("the cache of view is %+v, want %+v", got, want)
 	}
 
@@ -280,11 +280,11 @@ func TestCachesArePerRole(t *testing.T) {
 			t.Errorf("a ClusterRole's cache listed %q, not every namespace", r.namespace)
 		}
 	}
-	if !reflect.DeepEqual(users, map[string]bool{"kosh:clusterrole:view": true, "kosh:clusterrole:cluster-admin": true}) {
+	if !reflect.DeepEqual(users, map[string]bool{"kosh:kosh:clusterrole:view": true, "kosh:kosh:clusterrole:cluster-admin": true}) {
 		t.Errorf("the pods were listed as %v, want as each role", users)
 	}
-	imp, ok := e.madeWith("kosh:clusterrole:view")
-	if want := (rest.ImpersonationConfig{UserName: "kosh:clusterrole:view", Groups: []string{"kosh:clusterrole:view"}}); !ok || !reflect.DeepEqual(imp, want) {
+	imp, ok := e.madeWith("kosh:kosh:clusterrole:view")
+	if want := (rest.ImpersonationConfig{UserName: "kosh:kosh:clusterrole:view", Groups: []string{"kosh:kosh:clusterrole:view"}}); !ok || !reflect.DeepEqual(imp, want) {
 		t.Errorf("the cache's clients impersonate %+v, want %+v", imp, want)
 	}
 }
@@ -293,7 +293,7 @@ func TestRoleCacheIsNamespaced(t *testing.T) {
 	e := newEnv(t, envConfig{}, pod(testTeamNamespace, "api", nil), pod("default", "web", nil))
 	s := e.sessionOf(t, teamGrant)
 	w := openWatch(t, s, Query{Resource: e.resource(t, "", "pods"), Namespace: testTeamNamespace})
-	if got, want := watchCache(t, w).key, (cacheKey{id: roleIdentity(teamGrant.Role), gvr: render.Pods, namespace: testTeamNamespace}); got != want {
+	if got, want := watchCache(t, w).key, (cacheKey{id: roleIdentity(teamGrant.Role, keys.DefaultInstance), gvr: render.Pods, namespace: testTeamNamespace}); got != want {
 		t.Errorf("the cache is %+v, want %+v", got, want)
 	}
 	var tab Table
@@ -312,7 +312,7 @@ func TestRoleCacheIsNamespaced(t *testing.T) {
 		t.Fatal("nothing was listed")
 	}
 	for _, r := range lists {
-		if r.namespace != testTeamNamespace || r.user != "kosh:role:team-a:edit" {
+		if r.namespace != testTeamNamespace || r.user != "kosh:kosh:role:team-a:edit" {
 			t.Errorf("listed %+v, want team-a as the Role's user", r)
 		}
 	}
@@ -325,7 +325,7 @@ func TestAnotherNamespaceIsAnotherCache(t *testing.T) {
 	own := openWatch(t, team, Query{Resource: pods, Namespace: testTeamNamespace})
 	other := openWatch(t, team, Query{Resource: pods, Namespace: "default"})
 	all := openWatch(t, team, Query{Resource: pods})
-	id := roleIdentity(teamGrant.Role)
+	id := roleIdentity(teamGrant.Role, keys.DefaultInstance)
 	for _, tc := range []struct {
 		w    Watch
 		want cacheKey
@@ -391,9 +391,9 @@ func TestMetricsPollersPerRole(t *testing.T) {
 	}
 	got := e.c.pollerKeys()
 	want := []cacheKey{
-		{id: roleIdentity(viewGrant.Role), gvr: PodMetrics},
-		{id: roleIdentity(fullGrant.Role), gvr: PodMetrics},
-		{id: roleIdentity(teamGrant.Role), gvr: PodMetrics, namespace: testTeamNamespace},
+		{id: roleIdentity(viewGrant.Role, keys.DefaultInstance), gvr: PodMetrics},
+		{id: roleIdentity(fullGrant.Role, keys.DefaultInstance), gvr: PodMetrics},
+		{id: roleIdentity(teamGrant.Role, keys.DefaultInstance), gvr: PodMetrics, namespace: testTeamNamespace},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("pollers %+v, want %+v", got, want)
@@ -406,7 +406,7 @@ func TestMetricsPollersPerRole(t *testing.T) {
 	eventually(t, "each poller's list", func() bool { return len(listsOf(e, PodMetrics)) >= 3 })
 	for _, r := range listsOf(e, PodMetrics) {
 		wantNS := ""
-		if r.user == "kosh:role:team-a:edit" {
+		if r.user == "kosh:kosh:role:team-a:edit" {
 			wantNS = testTeamNamespace
 		}
 		if r.namespace != wantNS {
@@ -432,8 +432,8 @@ func TestClusterUsagePerRole(t *testing.T) {
 			return ok && got == ClusterUsage{CPU: 25, Mem: 25, Served: true}
 		})
 	}
-	wantPollers := []cacheKey{{id: roleIdentity(viewGrant.Role), gvr: NodeMetrics}, {id: roleIdentity(fullGrant.Role), gvr: NodeMetrics}}
-	wantCaches := []cacheKey{{id: roleIdentity(viewGrant.Role), gvr: render.Nodes}, {id: roleIdentity(fullGrant.Role), gvr: render.Nodes}}
+	wantPollers := []cacheKey{{id: roleIdentity(viewGrant.Role, keys.DefaultInstance), gvr: NodeMetrics}, {id: roleIdentity(fullGrant.Role, keys.DefaultInstance), gvr: NodeMetrics}}
+	wantCaches := []cacheKey{{id: roleIdentity(viewGrant.Role, keys.DefaultInstance), gvr: render.Nodes}, {id: roleIdentity(fullGrant.Role, keys.DefaultInstance), gvr: render.Nodes}}
 	if got := e.c.pollerKeys(); len(got) != 2 || !slices.Contains(got, wantPollers[0]) || !slices.Contains(got, wantPollers[1]) {
 		t.Errorf("pollers %+v, want %+v", got, wantPollers)
 	}
@@ -449,7 +449,7 @@ func TestClusterUsagePerRole(t *testing.T) {
 		t.Errorf("a Role's usage %+v, %v; want not served", got, ok)
 	}
 	for _, k := range append(e.c.pollerKeys(), e.c.cacheKeys()...) {
-		if k.id == roleIdentity(teamGrant.Role) {
+		if k.id == roleIdentity(teamGrant.Role, keys.DefaultInstance) {
 			t.Errorf("a Role's usage holds %+v", k)
 		}
 	}

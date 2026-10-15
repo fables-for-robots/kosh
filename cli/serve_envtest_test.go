@@ -166,6 +166,9 @@ func envOptions(t *testing.T, cfg *rest.Config, users ...user) serveOptions {
 		stateDir:       filepath.Join(t.TempDir(), "state"),
 		authorizedKeys: keyList,
 		kubeconfig:     kubeconfigOf(t, cfg),
+		// Not the namespace of a pod the tests may run in: a test sets
+		// namespace when it wants one.
+		namespaceFile: filepath.Join(t.TempDir(), "no-namespace"),
 	}
 }
 
@@ -398,15 +401,18 @@ func TestServeEndToEnd(t *testing.T) {
 	}
 }
 
-// managedBy is the label kosh puts on the bindings it makes.
-const managedBy = "app.kubernetes.io/managed-by"
+// The labels kosh puts on the bindings it makes.
+const (
+	managedBy     = "app.kubernetes.io/managed-by"
+	instanceLabel = "kosh.fables-for-robots.dev/instance"
+)
 
 // clusterBinding returns the ClusterRoleBinding kosh makes for the
 // ClusterRole role, checked against §4 of the roles design, or nil when
 // there is none.
 func clusterBinding(t *testing.T, typed kubernetes.Interface, role string) *rbacv1.ClusterRoleBinding {
 	t.Helper()
-	name := "kosh:clusterrole:" + role
+	name := "kosh:kosh:clusterrole:" + role
 	b, err := typed.RbacV1().ClusterRoleBindings().Get(context.Background(), name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -416,7 +422,7 @@ func clusterBinding(t *testing.T, typed kubernetes.Interface, role string) *rbac
 	}
 	want := []rbacv1.Subject{{APIGroup: "rbac.authorization.k8s.io", Kind: "Group", Name: name}}
 	if b.RoleRef != (rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: role}) ||
-		len(b.Subjects) != 1 || b.Subjects[0] != want[0] || b.Labels[managedBy] != "kosh" ||
+		len(b.Subjects) != 1 || b.Subjects[0] != want[0] || b.Labels[managedBy] != "kosh" || b.Labels[instanceLabel] != "kosh" ||
 		b.Annotations["kosh.fables-for-robots.dev/role"] != "ClusterRole/"+role {
 		t.Errorf("the binding of %s: roleRef %+v, subjects %+v, labels %v, annotations %v", role, b.RoleRef, b.Subjects, b.Labels, b.Annotations)
 	}
@@ -445,6 +451,12 @@ func TestServeViewKey(t *testing.T) {
 	a.waitFor(t, "Pods(default)", "alice/cluster-admin", "<ctrl-d>", "Delete", "<d>", "Describe")
 	c := dialTCPSized(t, k, bob, 260, 30)
 	c.waitFor(t, "Pods(default)", "bob/view", "<d>", "Describe")
+	// The help lists what is bound: it is open once it shows Read Again,
+	// a key of every table's.
+	a.send(t, "?")
+	a.waitFor(t, "Read Again", "Delete", "Shell", "Kill")
+	c.send(t, "?")
+	c.waitFor(t, "Read Again", "Describe")
 	for _, not := range []string{"<ctrl-d>", "Delete", "<e>", "<s>", "Shell", "<ctrl-k>", "[read-only]"} {
 		if text := c.screen.text(); strings.Contains(text, not) {
 			t.Errorf("a view key's screen has %q:\n%s", not, text)
@@ -480,7 +492,8 @@ func TestServeBindingsFollowTheList(t *testing.T) {
 	if text := c.screen.text(); !strings.Contains(text, "kosh: what this key may do has changed") {
 		t.Errorf("the session was not told:\n%s", text)
 	}
-	// The binding of the new role was made before the session ended.
+	// The binding of the new role exists once the session has ended (that
+	// it is made before the end is kube's TestOrderOnChange).
 	if clusterBinding(t, typed, "view") == nil {
 		t.Errorf("no binding of view when the session ended:\n%s", k.log.dump())
 	}
@@ -488,6 +501,37 @@ func TestServeBindingsFollowTheList(t *testing.T) {
 		return clusterBinding(t, typed, "cluster-admin") == nil
 	})
 	dialTCP(t, k, alice).waitFor(t, "Pods(default)", "alice/view")
+}
+
+// A key whose role may update ConfigMaps in kosh's namespace is warned of
+// at the start, with its key and role: it could edit the key list.
+func TestServeWarnsOfAnEditorOfTheList(t *testing.T) {
+	cfg := startAPIServer(t)
+	rbac := kubernetes.NewForConfigOrDie(cfg).RbacV1()
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-editor"},
+		Rules:      []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "update"}}},
+	}
+	if _, err := rbac.Roles("default").Create(context.Background(), role, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	alice := newUser(t, "alice", "cluster-admin")
+	bob := newUser(t, "bob", "view")
+	carol := newUser(t, "carol", "cm-editor@default")
+	o := envOptions(t, cfg, alice, bob, carol)
+	o.namespace = "default"
+	k := startKosh(t, o)
+	const msg = "a key's role may edit the key list, and so grant itself any role"
+	var warned []record
+	for _, r := range k.log.records() {
+		if r.Msg == msg {
+			warned = append(warned, r)
+		}
+	}
+	if len(warned) != 1 || warned[0].Level != slog.LevelWarn || warned[0].Attrs["role"] != "Role/default/cm-editor" ||
+		warned[0].Attrs["keys"] != "carol/cm-editor@default" {
+		t.Errorf("warnings %+v, want carol's alone:\n%s", warned, k.log.dump())
+	}
 }
 
 // A kosh whose user may not make the bindings logs it and serves all the

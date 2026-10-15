@@ -72,6 +72,18 @@ func (c *canCache) put(q canQuestion, allowed bool) {
 	c.answers[q] = canAnswer{allowed: allowed, until: c.clock().Add(canFor)}
 }
 
+// forget drops the answers to the questions on group/resource in
+// namespace.
+func (c *canCache) forget(group, resource, namespace string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for q := range c.answers {
+		if q.group == group && q.resource == resource && q.namespace == namespace {
+			delete(c.answers, q)
+		}
+	}
+}
+
 // warnOnce reports whether no error has been logged yet, and from then
 // on that one has.
 func (c *canCache) warnOnce() bool {
@@ -111,6 +123,12 @@ func (s *session) Can(ctx context.Context, verb string, res Resource, subresourc
 	}
 	s.can.put(q, allowed)
 	return allowed
+}
+
+// ForgetRights drops the answers Can keeps to the questions on res in
+// namespace.
+func (s *session) ForgetRights(res Resource, namespace string) {
+	s.can.forget(res.GVR.Group, res.GVR.Resource, namespace)
 }
 
 // ask sends q to the API as a SelfSubjectAccessReview of the session's

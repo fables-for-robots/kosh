@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,11 +19,13 @@ import (
 	"github.com/fables-for-robots/kosh/keys"
 )
 
-// What marks a binding as kosh's (§4 of the roles design): the label by
-// which Prune finds them, and the annotation that says whose role it binds.
+// What marks a binding as kosh's (§4 of the roles design): the labels by
+// which Prune finds an instance's own, and the annotation that says whose
+// role it binds.
 const (
 	managedByLabel = "app.kubernetes.io/managed-by"
 	managedByKosh  = "kosh"
+	instanceLabel  = "kosh.fables-for-robots.dev/instance"
 	roleAnnotation = "kosh.fables-for-robots.dev/role"
 )
 
@@ -41,6 +44,8 @@ const (
 const (
 	msgBindingsFailed = "the bindings of the key list could not be made"
 	msgBindingsMade   = "the bindings of the key list are made"
+	// msgMayEditList is the warning of §4.1 of the roles design.
+	msgMayEditList = "a key's role may edit the key list, and so grant itself any role"
 )
 
 // Bindings makes the ClusterRoleBindings and RoleBindings the roles of the
@@ -49,9 +54,12 @@ const (
 // All methods may be called from any goroutine; one Make or Prune runs at
 // a time.
 type Bindings struct {
-	c     *Cluster
-	roles func() []keys.RoleKeys
-	log   *slog.Logger
+	c *Cluster
+	// instance is the Cluster's instance, whose name is in the bindings'
+	// names, groups and labels.
+	instance string
+	roles    func() []keys.RoleKeys
+	log      *slog.Logger
 	// retry and timeout are retryEvery and reconcileTimeout; tests set
 	// less.
 	retry, timeout time.Duration
@@ -66,32 +74,42 @@ type Bindings struct {
 	// uncheckable is set once the log has said that kosh may not read
 	// the roles.
 	uncheckable bool
-	// foreign holds the bindings at kosh's names that another manager
-	// has, which the log has named: each is named once.
+	// foreign holds the bindings at kosh's names that another manager,
+	// or no one, has, which the log has named: each is named once.
 	foreign map[string]bool
+
+	// edMu guards what WarnEditors has said once.
+	edMu sync.Mutex
+	// noNamespace is set once the log has said that kosh's namespace is
+	// not known; editorsUnchecked once it has said that a role's rights
+	// on the key list could not be asked.
+	noNamespace, editorsUnchecked bool
 }
 
 // NewBindings returns the reconciler of c's bindings, which reads the roles
 // to bind, with their keys, from roles at every Make and Prune: the key
 // list's Roles.
 func NewBindings(c *Cluster, roles func() []keys.RoleKeys, log *slog.Logger) *Bindings {
-	return &Bindings{c: c, roles: roles, log: log, retry: retryEvery, timeout: reconcileTimeout, foreign: map[string]bool{}}
+	return &Bindings{c: c, instance: c.opts.Instance, roles: roles, log: log, retry: retryEvery, timeout: reconcileTimeout, foreign: map[string]bool{}}
 }
 
 // Make makes the bindings every role of roles() needs: it creates a missing
 // one, replaces one whose roleRef is another (a roleRef cannot be changed),
-// and sets the subjects and kosh's marks of one that has others. A binding
-// at kosh's name that another manager's label claims is left as it is. It
-// logs a role that does not exist, with its keys, and binds it all the
-// same. It goes on past a failure, and returns them all.
+// and sets the subjects and kosh's annotation of one that has others. A
+// binding at kosh's name that another manager's label, or another
+// instance's, claims is left as it is; one that nobody's label claims is
+// adopted when it already binds what kosh would, and otherwise left as it
+// is. It logs a role that does not exist, with its keys, and binds it all
+// the same. It goes on past a failure, and returns them all.
 func (b *Bindings) Make(ctx context.Context) error {
 	return b.locked(ctx, 0, b.makeReading, &b.makeFailure)
 }
 
-// Prune deletes the bindings that carry kosh's label and that no role of
-// roles() needs: the ClusterRoleBindings, and the RoleBindings of every
-// namespace. A binding without the label is never deleted, whatever its
-// name.
+// Prune deletes the bindings that carry kosh's labels with this
+// instance's name and that no role of roles() needs: the
+// ClusterRoleBindings, and the RoleBindings of every namespace. A binding
+// without the labels, or another instance's, is never deleted, whatever
+// its name.
 func (b *Bindings) Prune(ctx context.Context) error {
 	return b.locked(ctx, 0, b.prune, &b.pruneFailure)
 }
@@ -133,6 +151,78 @@ func (b *Bindings) Run(ctx context.Context) {
 		_ = b.locked(ctx, b.timeout, b.makeRetry, &b.makeFailure)
 		_ = b.locked(ctx, b.timeout, b.prune, &b.pruneFailure)
 	}
+}
+
+// WarnEditors logs, for each role of the key list but the ClusterRole
+// cluster-admin, whether the role may update or patch ConfigMaps in kosh's
+// own namespace: a key of such a role can edit the key list, and so name
+// any role kosh may bind (§4.1 of the roles design). It asks the API
+// server as the role, as the role's caches read. Without kosh's
+// namespace it says once, at debug level, that it checks nothing; a
+// question the API does not answer is said once, and is no failure.
+func (b *Bindings) WarnEditors(ctx context.Context) {
+	ns := b.c.opts.Namespace
+	if ns == "" {
+		b.edMu.Lock()
+		first := !b.noNamespace
+		b.noNamespace = true
+		b.edMu.Unlock()
+		if first {
+			b.log.Debug("kosh's namespace is not known: whether a key's role may edit the key list is not checked")
+		}
+		return
+	}
+	for _, rk := range b.roles() {
+		r := rk.Role
+		if r.Kind == keys.KindClusterRole && r.Name == "cluster-admin" {
+			continue
+		}
+		may, err := b.mayEditList(ctx, r, ns)
+		if err != nil {
+			b.edMu.Lock()
+			first := !b.editorsUnchecked
+			b.editorsUnchecked = true
+			b.edMu.Unlock()
+			if first {
+				b.log.Warn("whether a key's role may edit the key list could not be asked", "role", r.String(),
+					"err", canError(err).Error())
+			}
+			continue
+		}
+		if may {
+			b.log.Warn(msgMayEditList, "role", r.String(), "keys", strings.Join(rk.Keys, ", "), "namespace", ns)
+		}
+	}
+}
+
+// WarnEditorsNow is WarnEditors within reconcileTimeout: what the key
+// list's change calls after PruneNow, and serve at start.
+func (b *Bindings) WarnEditorsNow() {
+	ctx, cancel := context.WithTimeout(b.c.ctx, b.timeout)
+	defer cancel()
+	b.WarnEditors(ctx)
+}
+
+// mayEditList asks the API server, as r's identity, whether r may update
+// or patch ConfigMaps in namespace.
+func (b *Bindings) mayEditList(ctx context.Context, r keys.Role, namespace string) (bool, error) {
+	api, err := b.c.clientsFor(roleIdentity(r, b.instance))
+	if err != nil {
+		return false, err
+	}
+	for _, verb := range []string{"update", "patch"} {
+		review := &authorizationv1.SelfSubjectAccessReview{Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authorizationv1.ResourceAttributes{Verb: verb, Resource: "configmaps", Namespace: namespace},
+		}}
+		got, err := api.typed.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
+		if err != nil {
+			return false, err
+		}
+		if got.Status.Allowed {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // locked runs step under b.mu, within timeout of taking it when timeout is
@@ -221,14 +311,15 @@ func (b *Bindings) checkRole(ctx context.Context, rk keys.RoleKeys, reading bool
 // makeBinding makes the binding of r right, unless another manager has it.
 func (b *Bindings) makeBinding(ctx context.Context, r keys.Role) error {
 	rbac := b.c.typed.RbacV1()
+	instance := b.instance
 	meta := metav1.ObjectMeta{
-		Name:        bindingName(r),
+		Name:        bindingName(r, instance),
 		Namespace:   r.Namespace,
-		Labels:      map[string]string{managedByLabel: managedByKosh},
+		Labels:      map[string]string{managedByLabel: managedByKosh, instanceLabel: instance},
 		Annotations: map[string]string{roleAnnotation: r.String()},
 	}
 	ref := rbacv1.RoleRef{APIGroup: rbacGroup, Kind: r.Kind, Name: r.Name}
-	subjects := []rbacv1.Subject{{APIGroup: rbacGroup, Kind: rbacv1.GroupKind, Name: r.Group()}}
+	subjects := []rbacv1.Subject{{APIGroup: rbacGroup, Kind: rbacv1.GroupKind, Name: r.Group(instance)}}
 	var done string
 	var err error
 	if r.Kind == keys.KindRole {
@@ -240,11 +331,20 @@ func (b *Bindings) makeBinding(ctx context.Context, r keys.Role) error {
 	}
 	path := bindingPath(r.Namespace, meta.Name)
 	var other *otherManager
-	if errors.As(err, &other) {
+	var left *notKoshs
+	switch {
+	case errors.As(err, &other):
 		if !b.foreign[path] {
 			b.foreign[path] = true
 			b.log.Warn("a binding at kosh's name has another manager: it is left as it is", "binding", path,
 				"manager", other.manager, "role", r.String())
+		}
+		return nil
+	case errors.As(err, &left):
+		if !b.foreign[path] {
+			b.foreign[path] = true
+			b.log.Warn("a binding at kosh's name is not kosh's: it is left as it is", "binding", path,
+				"reason", left.reason, "role", r.String())
 		}
 		return nil
 	}
@@ -258,13 +358,14 @@ func (b *Bindings) makeBinding(ctx context.Context, r keys.Role) error {
 	return nil
 }
 
-// bindingName is the name of r's binding: "kosh:clusterrole:<role>" for a
-// ClusterRole, "kosh:role:<role>" for a Role, in its namespace.
-func bindingName(r keys.Role) string {
+// bindingName is the name of r's binding for the kosh instance named
+// instance: "kosh:<instance>:clusterrole:<role>" for a ClusterRole,
+// "kosh:<instance>:role:<role>" for a Role, in its namespace.
+func bindingName(r keys.Role, instance string) string {
 	if r.Kind == keys.KindRole {
-		return "kosh:role:" + r.Name
+		return "kosh:" + instance + ":role:" + r.Name
 	}
-	return "kosh:clusterrole:" + r.Name
+	return "kosh:" + instance + ":clusterrole:" + r.Name
 }
 
 // bindingPath is how the log names a binding: "<namespace>/<name>" for a
@@ -305,11 +406,32 @@ func reconcile[B metav1.Object](ctx context.Context, api bindingAPI[B], want B, 
 	if err != nil {
 		return "", err
 	}
-	if m, ok := got.GetLabels()[managedByLabel]; ok && m != managedByKosh {
-		return "", &otherManager{manager: m}
+	instance := want.GetLabels()[instanceLabel]
+	manager, managed := got.GetLabels()[managedByLabel]
+	theirs := got.GetLabels()[instanceLabel]
+	switch {
+	case managed && manager != managedByKosh:
+		return "", &otherManager{manager: manager}
+	case managed && theirs != "" && theirs != instance:
+		return "", &otherManager{manager: "kosh, instance " + theirs}
 	}
 	gotRef, gotSubjects := parts(got)
 	wantRef, wantSubjects := parts(want)
+	if !managed || theirs == "" {
+		// A binding at kosh's name that nobody marked is kosh's to take
+		// when it already binds what kosh would: someone made it by hand,
+		// as one may for a role kosh may not bind. Any other is left to
+		// whoever made it.
+		if *gotRef != *wantRef || !slices.Equal(*gotSubjects, *wantSubjects) {
+			return "", &notKoshs{reason: "it binds another role or other subjects, and has no kosh label"}
+		}
+		mark(got, want)
+		_, err = api.Update(ctx, got, metav1.UpdateOptions{})
+		if apierrors.IsForbidden(err) {
+			return "", &notKoshs{reason: "kosh may not update it to put its labels on it; it binds what kosh would"}
+		}
+		return "a binding at kosh's name is adopted", err
+	}
 	if *gotRef != *wantRef {
 		// The API refuses to change a roleRef: the binding is deleted,
 		// the one it was, and made again.
@@ -320,15 +442,20 @@ func reconcile[B metav1.Object](ctx context.Context, api bindingAPI[B], want B, 
 		_, err = api.Create(ctx, want, metav1.CreateOptions{})
 		return "a binding of the key list is replaced: its roleRef was another", err
 	}
-	// A binding without the label is kosh's to take: §4 gives it the name.
-	marked := got.GetLabels()[managedByLabel] == managedByKosh &&
-		got.GetAnnotations()[roleAnnotation] == want.GetAnnotations()[roleAnnotation]
-	if marked && slices.Equal(*gotSubjects, *wantSubjects) {
+	if got.GetAnnotations()[roleAnnotation] == want.GetAnnotations()[roleAnnotation] && slices.Equal(*gotSubjects, *wantSubjects) {
 		return "", nil
 	}
 	// The subjects are set, and kosh's marks added to whatever labels
 	// and annotations it has.
 	*gotSubjects = *wantSubjects
+	mark(got, want)
+	_, err = api.Update(ctx, got, metav1.UpdateOptions{})
+	return "a binding of the key list is set right", err
+}
+
+// mark adds want's labels and annotations, kosh's marks, to whatever
+// labels and annotations got has.
+func mark(got, want metav1.Object) {
 	labels, annotations := maps.Clone(got.GetLabels()), maps.Clone(got.GetAnnotations())
 	if labels == nil {
 		labels = map[string]string{}
@@ -340,17 +467,17 @@ func reconcile[B metav1.Object](ctx context.Context, api bindingAPI[B], want B, 
 	maps.Copy(annotations, want.GetAnnotations())
 	got.SetLabels(labels)
 	got.SetAnnotations(annotations)
-	_, err = api.Update(ctx, got, metav1.UpdateOptions{})
-	return "a binding of the key list is set right", err
 }
 
 func (b *Bindings) prune(ctx context.Context) error {
+	instance := b.instance
 	needed := map[string]bool{} // by bindingPath
 	for _, rk := range b.roles() {
-		needed[bindingPath(rk.Role.Namespace, bindingName(rk.Role))] = true
+		needed[bindingPath(rk.Role.Namespace, bindingName(rk.Role, instance))] = true
 	}
 	rbac := b.c.typed.RbacV1()
-	byLabel := metav1.ListOptions{LabelSelector: managedByLabel + "=" + managedByKosh}
+	// This instance's own: another kosh's bindings are never touched.
+	byLabel := metav1.ListOptions{LabelSelector: managedByLabel + "=" + managedByKosh + "," + instanceLabel + "=" + instance}
 	var errs []error
 	del := func(namespace, name string, api func() error) {
 		path := bindingPath(namespace, name)
@@ -395,7 +522,7 @@ func deleteThis(uid types.UID) metav1.DeleteOptions {
 // bindingError is the failure of one request of a reconcile: what was
 // asked, and the error.
 type bindingError struct {
-	what string // "making the binding kosh:clusterrole:view"
+	what string // "making the binding kosh:kosh:clusterrole:view"
 	err  error
 }
 
@@ -408,6 +535,13 @@ func (e *bindingError) Unwrap() error { return e.err }
 type otherManager struct{ manager string }
 
 func (e *otherManager) Error() string { return "the binding is managed by " + e.manager }
+
+// notKoshs is what reconcile answers for a binding at kosh's name that
+// nobody's label claims and that kosh did not adopt, and why: it binds
+// something else, or kosh may not label it. kosh leaves it as it is.
+type notKoshs struct{ reason string }
+
+func (e *notKoshs) Error() string { return "the binding is not kosh's: " + e.reason }
 
 // loggableBindingsError returns a failed Make or Prune as the log says it:
 // each failure with what was asked, and of an error of the API only its

@@ -41,6 +41,8 @@ type serveOptions struct {
 	stateDir       string // the two keys
 	authorizedKeys string // the key list
 	kubeconfig     string // empty for the pod's ServiceAccount
+	instance       string // the instance's name, in kosh's groups and bindings; empty for keys.DefaultInstance
+	namespace      string // kosh's namespace, when the pod does not say it
 
 	// What tests set; the command line sets none of it.
 
@@ -59,6 +61,28 @@ type serveOptions struct {
 	// started, when it is set, is called once kosh serves, with what it
 	// serves on.
 	started func(serving)
+	// namespaceFile is the file of the pod's own namespace. Empty means
+	// the ServiceAccount's, saNamespaceFile.
+	namespaceFile string
+}
+
+// saNamespaceFile is where a pod finds its namespace, beside its
+// ServiceAccount's token.
+const saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// koshNamespace returns kosh's own namespace: the pod's, when the
+// ServiceAccount's file says it, else --namespace, else "" for unknown.
+func (o serveOptions) koshNamespace() string {
+	file := o.namespaceFile
+	if file == "" {
+		file = saNamespaceFile
+	}
+	if b, err := os.ReadFile(file); err == nil {
+		if ns := strings.TrimSpace(string(b)); ns != "" {
+			return ns
+		}
+	}
+	return o.namespace
 }
 
 // serving is what serve tells a test once it serves.
@@ -91,6 +115,10 @@ func serveCommand(runServe func(context.Context, serveOptions) error) *ucli.Comm
 				Usage: "the key list"},
 			&ucli.StringFlag{Name: "kubeconfig", EnvVars: []string{"KUBECONFIG"},
 				Usage: "a kubeconfig instead of the pod's ServiceAccount, for running kosh outside a cluster"},
+			&ucli.StringFlag{Name: "instance", EnvVars: []string{"KOSH_INSTANCE"}, Value: keys.DefaultInstance,
+				Usage: "the name of this kosh among those that serve the cluster, in its groups and bindings: lower-case letters, digits, . and -"},
+			&ucli.StringFlag{Name: "namespace", EnvVars: []string{"KOSH_NAMESPACE"},
+				Usage: "kosh's own namespace, where its key list is, when it does not run in a pod (default: the pod's)"},
 		},
 		Action: func(c *ucli.Context) error {
 			return runServe(c.Context, serveOptions{
@@ -102,6 +130,8 @@ func serveCommand(runServe func(context.Context, serveOptions) error) *ucli.Comm
 				stateDir:       c.String("state-dir"),
 				authorizedKeys: c.String("authorized-keys"),
 				kubeconfig:     c.String("kubeconfig"),
+				instance:       c.String("instance"),
+				namespace:      c.String("namespace"),
 			})
 		},
 	}
@@ -115,6 +145,12 @@ func (o serveOptions) check() (bind netip.AddrPort, err error) {
 	}
 	if o.iroh && !o.irohRelay && !o.irohMDNS {
 		return bind, errors.New("iroh is on and nobody could find it: set --iroh-relay or --iroh-mdns")
+	}
+	// Empty is the default instance, as kube.Options has it.
+	if o.instance != "" {
+		if err := keys.CheckInstance(o.instance); err != nil {
+			return bind, fmt.Errorf("--instance: %w", err)
+		}
 	}
 	if o.irohBind != "" {
 		if bind, err = netip.ParseAddrPort(o.irohBind); err != nil {
@@ -243,7 +279,8 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		return fmt.Errorf("the cluster's configuration could not be read: %w", err)
 	}
 	kctx, cancel := context.WithTimeout(ctx, clusterTimeout)
-	r.cluster, err = kube.New(kctx, cfg, kube.Options{Log: log, UserAgent: "kosh/" + Version, IdleStop: o.idleStop})
+	r.cluster, err = kube.New(kctx, cfg, kube.Options{Log: log, UserAgent: "kosh/" + Version, IdleStop: o.idleStop,
+		Instance: o.instance, Namespace: o.koshNamespace()})
 	cancel()
 	if err != nil {
 		return fmt.Errorf("the cluster could not be reached: %w", err)
@@ -276,6 +313,10 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	}
 	list.OnChange(bindings.PruneNow)
 	bindings.PruneNow()
+	// The roles that may edit the key list, and so name any role, are
+	// warned of at every reading (§4.1 of the roles design).
+	list.OnChange(bindings.WarnEditorsNow)
+	bindings.WarnEditorsNow()
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()

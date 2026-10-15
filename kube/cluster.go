@@ -45,6 +45,15 @@ type Options struct {
 	// UserAgent is what the API server is told kosh is. Empty means
 	// "kosh".
 	UserAgent string
+	// Instance is the name of this kosh among those that serve the
+	// cluster, which is in every group, binding and cache user it makes
+	// (§2 of the roles design). Empty means keys.DefaultInstance. It
+	// must pass keys.CheckInstance.
+	Instance string
+	// Namespace is kosh's own namespace, where its key list is: the roles
+	// that may edit ConfigMaps there are warned of (§4.1 of the roles
+	// design). Empty means that it is not known, and nothing is checked.
+	Namespace string
 }
 
 // Cluster is the cluster for the whole process.
@@ -87,6 +96,11 @@ type Cluster struct {
 	missMu   sync.Mutex
 	lastMiss time.Time // of the last discovery that Resolve asked for
 
+	// nodesRefused holds the roles whose refused list of the nodes the
+	// log has said.
+	refusedMu    sync.Mutex
+	nodesRefused map[identity]bool
+
 	mu      sync.Mutex
 	caches  map[cacheKey]*kindCache
 	pollers map[cacheKey]*metricsPoller
@@ -125,6 +139,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.UserAgent == "" {
 		o.UserAgent = defaultUserAgent
+	}
+	if o.Instance == "" {
+		o.Instance = keys.DefaultInstance
 	}
 	return o
 }
@@ -211,6 +228,9 @@ func RESTConfig(kubeconfig string) (*rest.Config, error) {
 // Close.
 func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) {
 	opts = opts.withDefaults()
+	if err := keys.CheckInstance(opts.Instance); err != nil {
+		return nil, err
+	}
 	cfg = rest.CopyConfig(cfg)
 	cfg.UserAgent = opts.UserAgent
 	quietWarnings(cfg, opts.Log)
@@ -248,7 +268,7 @@ func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) 
 // its role's group, and its tables are read from the caches of its role.
 // Everything it opens ends when ctx is done.
 func (c *Cluster) Session(ctx context.Context, grant keys.Grant) Session {
-	s := &session{c: c, ctx: ctx, grant: grant, self: identityOf(grant), role: roleIdentity(grant.Role)}
+	s := &session{c: c, ctx: ctx, grant: grant, self: identityOf(grant, c.opts.Instance), role: roleIdentity(grant.Role, c.opts.Instance)}
 	s.clients, s.clientsErr = c.clientsFor(s.self)
 	if s.clientsErr != nil {
 		c.log.Error("the clients of a session cannot be made", "key", grant.Name, "fingerprint", grant.Fingerprint,

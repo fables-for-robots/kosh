@@ -87,8 +87,10 @@ func (v *tableView) key(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return popView()
 	case "ctrl+r":
-		// The rights too: a question the API did not answer was answered
-		// no, and is asked again.
+		// The rights too, the answers the session keeps forgotten: a
+		// question the API did not answer was answered no, and a key's
+		// binding may have been made, or its role changed, since.
+		v.forgetRights()
 		return tea.Batch(v.readNow(), v.askRights())
 	case "enter":
 		return v.enter()

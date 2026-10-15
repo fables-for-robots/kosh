@@ -362,6 +362,11 @@ type Reader interface {
 	// SelfSubjectAccessReview, and keeps the answer for two minutes. An
 	// error is answered as false and logged once per session.
 	Can(ctx context.Context, verb string, res Resource, subresource, namespace string) bool
+	// ForgetRights drops the answers Can keeps to the questions on res,
+	// any verb or subresource, in namespace, so that the next Can of them
+	// asks the API server again: what reading a table again asks for, as
+	// a role's binding or rules may have changed since.
+	ForgetRights(res Resource, namespace string)
 
 	// Watch opens the table of q. The table of a resource the session
 	// may not list is a Watch whose Table has Err, not an error here.

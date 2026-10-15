@@ -24,22 +24,23 @@ type identity struct {
 	user, group string
 }
 
-// identityOf returns the identity a session of grant acts as: the key's
-// own user, "kosh:<key name>", with its role's group.
-func identityOf(grant keys.Grant) identity {
-	return identity{user: grant.User(), group: grant.Role.Group()}
+// identityOf returns the identity a session of grant acts as, for the
+// kosh instance named instance: the key's own user, "kosh:<key name>",
+// with its role's group, which holds the instance's name.
+func identityOf(grant keys.Grant, instance string) identity {
+	return identity{user: grant.User(), group: grant.Role.Group(instance)}
 }
 
-// roleIdentity returns the identity of a role's caches and pollers: the
-// role's own user, which is the same string as its group,
-// "kosh:clusterrole:<name>" for a ClusterRole and
-// "kosh:role:<namespace>:<name>" for a Role, with that group. The reads
-// that fill a cache that every key of the role shares are not put down
-// to the key that happened to open it. The prefixes are the group's so
-// that a ClusterRole named "team-a:edit" and the Role "edit" of team-a
-// are two users, not one.
-func roleIdentity(r keys.Role) identity {
-	return identity{user: r.Group(), group: r.Group()}
+// roleIdentity returns the identity of a role's caches and pollers, for
+// the kosh instance named instance: the role's own user, which is the
+// same string as its group, "kosh:<instance>:clusterrole:<name>" for a
+// ClusterRole and "kosh:<instance>:role:<namespace>:<name>" for a Role,
+// with that group. The reads that fill a cache that every key of the
+// role shares are not put down to the key that happened to open it. The
+// prefixes are the group's so that a ClusterRole named "team-a:edit" and
+// the Role "edit" of team-a are two users, not one.
+func roleIdentity(r keys.Role, instance string) identity {
+	return identity{user: r.Group(instance), group: r.Group(instance)}
 }
 
 // clients are the clients of one identity: what a session or a cache

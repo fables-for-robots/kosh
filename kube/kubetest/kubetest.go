@@ -6,6 +6,7 @@ package kubetest
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -67,6 +68,8 @@ type Session struct {
 	usageOK bool
 	usages  []*UsageWatch
 	allowed []right
+	// forgotten is what ForgetRights was asked, as Forgotten returns it.
+	forgotten []string
 }
 
 // right is one right Allow gave: each field is a value or "*" for any.
@@ -288,6 +291,23 @@ func (s *Session) Can(_ context.Context, verb string, res kube.Resource, subreso
 		}
 	}
 	return false
+}
+
+// ForgetRights records what it was asked to forget, as Forgotten returns
+// it; the fake keeps no answer to forget. It is not among the calls, as
+// Can is not.
+func (s *Session) ForgetRights(res kube.Resource, namespace string) {
+	s.mu.Lock()
+	s.forgotten = append(s.forgotten, res.GVR.GroupResource().String()+" in "+namespace)
+	s.mu.Unlock()
+}
+
+// Forgotten returns what ForgetRights was asked, in order:
+// "deployments.apps in default", "pods in " for every namespace.
+func (s *Session) Forgotten() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.forgotten)
 }
 
 func (s *Session) Watch(q kube.Query) (kube.Watch, error) {

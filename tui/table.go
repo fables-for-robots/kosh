@@ -284,6 +284,28 @@ func (v *tableView) askRights() tea.Cmd {
 	}
 }
 
+// forgetRights has the session forget the answers it keeps to the
+// questions askRights asks: of each resource a right is on, in the
+// table's namespace.
+func (v *tableView) forgetRights() {
+	if v.plain {
+		return
+	}
+	res := v.q.Resource
+	var done []right
+	for _, b := range applying(res, v.grant) {
+		for _, n := range b.Needs {
+			r := n.right(res)
+			r.verb, r.sub = "", ""
+			if slices.Contains(done, r) {
+				continue
+			}
+			done = append(done, r)
+			v.e.sess.ForgetRights(kube.Resource{GVR: schema.GroupVersionResource{Group: r.group, Resource: r.resource}}, v.rightsNamespace())
+		}
+	}
+}
+
 // rightsNamespace is the namespace the table's needs are asked in: the
 // one of the object its rows belong to (a deployment's pods, a pod's
 // containers), or else the query's. It is "" for every namespace and for
