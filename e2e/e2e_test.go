@@ -848,6 +848,15 @@ func (c *term) keysIn() []string {
 	return headerLines(c.scr.lines())
 }
 
+// help opens the help of the view, and waits until it shows: Read Again
+// is a key of every table's, and of the help alone among what a table's
+// header shows at this width.
+func (c *term) help() {
+	c.t.Helper()
+	c.send("?")
+	c.waitUntil(wait, "the help", func(lines []string) bool { return lineWith(lines, "Read Again") })
+}
+
 // The hints of the keys that change the cluster, on a table of pods and
 // on a table of deployments.
 var (
@@ -879,6 +888,8 @@ func TestViewHasNoActionKeys(t *testing.T) {
 	a.send(":deploy" + keyEnter)
 	a.waitRow("web")
 	hasHints(t, full.name+" on deployments", a.keysIn(), deploymentActions, true)
+	a.help()
+	hasHints(t, full.name+" in the help of deployments", a.scr.lines(), deploymentActions, true)
 
 	c := connect(t, k, wideW, wideH)
 	c.waitRow("marker", "Running")
@@ -890,6 +901,14 @@ func TestViewHasNoActionKeys(t *testing.T) {
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
 	hasHints(t, k.name+" on deployments", c.keysIn(), deploymentActions, false)
+	// The help lists what is bound, and nothing more.
+	c.help()
+	hasHints(t, k.name+" in the help of deployments", c.scr.lines(), deploymentActions, false)
+	if !lineWithHint(c.scr.lines(), "d", "Describe") {
+		t.Errorf("the help of a view key has no <d> Describe:\n%s", c.scr)
+	}
+	c.send(keyEsc)
+	c.waitRow("web")
 
 	before := replicas(t)
 	// What TestSSHScales types to scale web to 3.
@@ -963,7 +982,7 @@ func TestViewCannotDecodeASecret(t *testing.T) {
 	// The API server decides: it refuses the key's user, in the role's
 	// group, the Secret.
 	out, err := run("kubectl", "--namespace", "default", "get", "secret", "hidden", "-o", "yaml",
-		"--as", "kosh:"+k.name, "--as-group", "kosh:clusterrole:view")
+		"--as", "kosh:"+k.name, "--as-group", viewBinding(t).group)
 	if err == nil || !strings.Contains(err.Error(), "forbidden") {
 		t.Errorf("kubectl as the view key's user: %v, want forbidden", err)
 	}
@@ -2351,21 +2370,21 @@ func TestRoleCanBeChanged(t *testing.T) {
 // back.
 func TestKeyRemovedEndsTheSession(t *testing.T) {
 	inCluster(t)
-	full, ro, team := fullKey(t), viewKey(t), teamKey(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
 	f := connect(t, full, 120, 40)
 	f.waitFor("Pods(default)", full.name)
-	r := connect(t, ro, 120, 40)
-	r.waitFor("Pods(default)", ro.name)
+	r := connect(t, view, 120, 40)
+	r.waitFor("Pods(default)", view.name)
 
 	setKeys(t, full.line)
 	t.Cleanup(func() {
 		// Back as it was, and waited for, so that a test after this one
 		// does not meet the kubelet's delay.
-		setKeys(t, full.line, ro.line, team.line)
+		setKeys(t, full.line, view.line, team.line)
 		var err error
 		eventually(t, 150*time.Second, "the view key is accepted again", func() bool {
 			var c *goSession
-			if c, err = dialSSH(t, ro, 120, 40); err == nil {
+			if c, err = dialSSH(t, view, 120, 40); err == nil {
 				_ = c.client.Close()
 				return true
 			}
@@ -2393,7 +2412,7 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	f.waitFor("Namespaces(all)")
 	f.waitRow("kosh")
 
-	if c, err := dialSSH(t, ro, 120, 40); err == nil {
+	if c, err := dialSSH(t, view, 120, 40); err == nil {
 		_ = c.client.Close()
 		t.Error("the view key is still accepted for a new connection")
 	} else if !strings.Contains(err.Error(), "unable to authenticate") {
@@ -2470,12 +2489,12 @@ func waitAccepted(t *testing.T, k key, want bool, within time.Duration) {
 // it did, and does not require either.
 func TestShellEndsWithItsKey(t *testing.T) {
 	inCluster(t)
-	full, ro, team := fullKey(t), viewKey(t), teamKey(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
 	k := newKey(t, "erin@kosh-e2e/cluster-admin")
-	setKeys(t, full.line, ro.line, team.line, k.line)
+	setKeys(t, full.line, view.line, team.line, k.line)
 	t.Cleanup(func() {
 		// The list as it was, and waited for.
-		setKeys(t, full.line, ro.line, team.line)
+		setKeys(t, full.line, view.line, team.line)
 		waitAccepted(t, k, false, 150*time.Second)
 	})
 	waitAccepted(t, k, true, 150*time.Second)
@@ -2492,7 +2511,7 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	end := []string{"key", k.name, "action", "exec", "object", "pods/default/marker", "phase", "end"}
 	shells := len(logLines(t, "action", end...))
 
-	setKeys(t, full.line, ro.line, team.line)
+	setKeys(t, full.line, view.line, team.line)
 	changed := time.Now()
 	status := p.exitedWith(120 * time.Second)
 	t.Logf("ssh ended %v after the list changed, with status %d", time.Since(changed).Round(100*time.Millisecond), status)
@@ -2580,14 +2599,44 @@ type koshBinding struct {
 	roleKind, role string // the roleRef
 	group          string // the one subject, a Group
 	annotation     string // kosh.fables-for-robots.dev/role
+	instance       string // kosh.fables-for-robots.dev/instance
+}
+
+// koshInstance is the name of kosh's instance as the chart gave it: the
+// --instance of kosh serve in the Deployment.
+func koshInstance(t *testing.T) string {
+	t.Helper()
+	var args []string
+	out := kubectl(t, "--namespace", namespace, "get", "deployment", release, "-o", "jsonpath={.spec.template.spec.containers[0].args}")
+	if err := json.Unmarshal([]byte(out), &args); err != nil {
+		t.Fatalf("the arguments of kosh serve, %q: %v", out, err)
+	}
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(a, "--instance="); ok {
+			return v
+		}
+	}
+	t.Fatalf("kosh serve has no --instance: %q", args)
+	return ""
+}
+
+// bindingOf is the binding kosh makes for the ClusterRole role, or with a
+// namespace for the Role role there.
+func bindingOf(t *testing.T, role, ns string) koshBinding {
+	t.Helper()
+	inst := koshInstance(t)
+	if ns == "" {
+		name := "kosh:" + inst + ":clusterrole:" + role
+		return koshBinding{"clusterrolebinding", "", name, "ClusterRole", role, name, "ClusterRole/" + role, inst}
+	}
+	return koshBinding{"rolebinding", ns, "kosh:" + inst + ":role:" + role, "Role", role,
+		"kosh:" + inst + ":role:" + ns + ":" + role, "Role/" + ns + "/" + role, inst}
 }
 
 // The bindings of the three keys of scripts/test-e2e.sh.
-var (
-	fullBinding = koshBinding{"clusterrolebinding", "", "kosh:clusterrole:cluster-admin", "ClusterRole", "cluster-admin", "kosh:clusterrole:cluster-admin", "ClusterRole/cluster-admin"}
-	viewBinding = koshBinding{"clusterrolebinding", "", "kosh:clusterrole:view", "ClusterRole", "view", "kosh:clusterrole:view", "ClusterRole/view"}
-	teamBinding = koshBinding{"rolebinding", teamNamespace, "kosh:role:edit", "Role", "edit", "kosh:role:" + teamNamespace + ":edit", "Role/" + teamNamespace + "/edit"}
-)
+func fullBinding(t *testing.T) koshBinding { return bindingOf(t, "cluster-admin", "") }
+func viewBinding(t *testing.T) koshBinding { return bindingOf(t, "view", "") }
+func teamBinding(t *testing.T) koshBinding { return bindingOf(t, "edit", teamNamespace) }
 
 // is reports what of b differs from what kosh makes for w, or "".
 func (w koshBinding) is(b *rbacBinding) string {
@@ -2598,7 +2647,7 @@ func (w koshBinding) is(b *rbacBinding) string {
 		return fmt.Sprintf("its roleRef is %s %s", b.RoleRef.Kind, b.RoleRef.Name)
 	case len(b.Subjects) != 1 || b.Subjects[0].Kind != "Group" || b.Subjects[0].Name != w.group:
 		return fmt.Sprintf("its subjects are %+v", b.Subjects)
-	case b.Metadata.Labels["app.kubernetes.io/managed-by"] != "kosh":
+	case b.Metadata.Labels["app.kubernetes.io/managed-by"] != "kosh" || b.Metadata.Labels["kosh.fables-for-robots.dev/instance"] != w.instance:
 		return fmt.Sprintf("its labels are %v", b.Metadata.Labels)
 	case b.Metadata.Annotations["kosh.fables-for-robots.dev/role"] != w.annotation:
 		return fmt.Sprintf("its annotations are %v", b.Metadata.Annotations)
@@ -2606,16 +2655,33 @@ func (w koshBinding) is(b *rbacBinding) string {
 	return ""
 }
 
-// kosh has made the binding of each role of its key list, with its label;
-// a role that leaves the list has its binding deleted, and the bindings
-// of the roles still named stay. It takes the team key out of the list,
-// and puts it back.
+// logTime is the time of a line of kosh's log.
+func logTime(t *testing.T, line string) time.Time {
+	t.Helper()
+	m := regexp.MustCompile(`^time=(\S+)`).FindStringSubmatch(line)
+	if m == nil {
+		t.Fatalf("no time in %q", line)
+	}
+	at, err := time.Parse(time.RFC3339Nano, m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+// kosh has made the binding of each role of its key list, named and
+// labelled with its instance; a role that leaves the list has its binding
+// deleted as soon as kosh reads the list, and the bindings of the roles
+// still named stay. It takes the team key out of the list, and puts it
+// back.
 func TestBindingsExistAndGo(t *testing.T) {
 	inCluster(t)
-	full, ro, team := fullKey(t), viewKey(t), teamKey(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
+	teamB := teamBinding(t)
+	t.Logf("kosh's instance: %s", teamB.instance)
 	// Made at kosh's start, or again after the list was put back by a
 	// test before this one.
-	for _, w := range []koshBinding{fullBinding, viewBinding, teamBinding} {
+	for _, w := range []koshBinding{fullBinding(t), viewBinding(t), teamB} {
 		var why string
 		eventually(t, wait, "the binding "+w.name, func() bool {
 			why = w.is(getBinding(t, w.kind, w.ns, w.name))
@@ -2623,24 +2689,38 @@ func TestBindingsExistAndGo(t *testing.T) {
 		}, func() string { return why + "\nkosh's log:\n" + koshLog(t) })
 	}
 
-	setKeys(t, full.line, ro.line)
+	readings := len(logLines(t, "key list changed"))
+	setKeys(t, full.line, view.line)
 	changed := time.Now()
 	t.Cleanup(func() {
 		// Back as it was, and waited for.
-		setKeys(t, full.line, ro.line, team.line)
+		setKeys(t, full.line, view.line, team.line)
 		waitAccepted(t, team, true, 150*time.Second)
 		eventually(t, wait, "the team key's RoleBinding is made again", func() bool {
-			return teamBinding.is(getBinding(t, teamBinding.kind, teamBinding.ns, teamBinding.name)) == ""
+			return teamB.is(getBinding(t, teamB.kind, teamB.ns, teamB.name)) == ""
 		}, func() string { return "kosh's log:\n" + koshLog(t) })
 	})
-	eventually(t, 90*time.Second, "the team key's RoleBinding is deleted", func() bool {
-		return getBinding(t, teamBinding.kind, teamBinding.ns, teamBinding.name) == nil
+	// The kubelet updates the mounted key list in its own time, up to a
+	// minute or two; what is kosh's is measured from its own reading.
+	eventually(t, 150*time.Second, "the team key's RoleBinding is deleted", func() bool {
+		return getBinding(t, teamB.kind, teamB.ns, teamB.name) == nil
 	}, func() string { return "kosh's log:\n" + koshLog(t) })
 	t.Logf("the team key's RoleBinding was deleted %v after the list changed", time.Since(changed).Round(100*time.Millisecond))
-	if lines := logLines(t, "a binding no key needs is deleted", "binding", teamNamespace+"/"+teamBinding.name); len(lines) == 0 {
-		t.Errorf("kosh's log does not say that it deleted the binding:\n%s", koshLog(t))
+	var deleted []string
+	eventually(t, wait, "kosh's log says that it deleted the binding", func() bool {
+		deleted = logLines(t, "a binding no key needs is deleted", "binding", teamNamespace+"/"+teamB.name)
+		return len(deleted) > 0
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	read := logLines(t, "key list changed")
+	if len(read) <= readings {
+		t.Fatalf("kosh's log has no reading of the changed list:\n%s", koshLog(t))
 	}
-	for _, w := range []koshBinding{fullBinding, viewBinding} {
+	took := logTime(t, deleted[len(deleted)-1]).Sub(logTime(t, read[readings]))
+	t.Logf("kosh deleted it %v after it read the list", took)
+	if took < 0 || took > 10*time.Second {
+		t.Errorf("kosh deleted the binding %v after it read the list, want within 10s", took)
+	}
+	for _, w := range []koshBinding{fullBinding(t), viewBinding(t)} {
 		if why := w.is(getBinding(t, w.kind, w.ns, w.name)); why != "" {
 			t.Errorf("the binding %s of a role still named: %s", w.name, why)
 		}
@@ -2655,12 +2735,12 @@ func TestBindingsExistAndGo(t *testing.T) {
 // ClusterRole, which gives no node.
 func TestOldAdminListWarns(t *testing.T) {
 	inCluster(t)
-	full, ro, team := fullKey(t), viewKey(t), teamKey(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
 	old := newKey(t, "dave@kosh-e2e/admin")
-	setKeys(t, full.line, ro.line, team.line, old.line)
+	setKeys(t, full.line, view.line, team.line, old.line)
 	t.Cleanup(func() {
 		// The list as it was, and waited for.
-		setKeys(t, full.line, ro.line, team.line)
+		setKeys(t, full.line, view.line, team.line)
 		waitAccepted(t, old, false, 150*time.Second)
 	})
 	const warning = "a key's role is the ClusterRole admin, which is not cluster-admin: before 0.5.0 /admin meant full access"
@@ -2673,7 +2753,7 @@ func TestOldAdminListWarns(t *testing.T) {
 		t.Errorf("the warning is not at warn level: %s", warned[0])
 	}
 	t.Logf("kosh's log: %s", warned[0])
-	adminBinding := koshBinding{"clusterrolebinding", "", "kosh:clusterrole:admin", "ClusterRole", "admin", "kosh:clusterrole:admin", "ClusterRole/admin"}
+	adminBinding := bindingOf(t, "admin", "")
 	var why string
 	eventually(t, wait, "the binding of the ClusterRole admin", func() bool {
 		why = adminBinding.is(getBinding(t, adminBinding.kind, adminBinding.ns, adminBinding.name))
@@ -2682,6 +2762,19 @@ func TestOldAdminListWarns(t *testing.T) {
 	out, _ := run("kubectl", "auth", "can-i", "list", "nodes", "--as", "kosh:"+old.name, "--as-group", adminBinding.group)
 	if strings.TrimSpace(out) != "no" {
 		t.Errorf("the ClusterRole admin may list the nodes: can-i says %q", strings.TrimSpace(out))
+	}
+
+	// admin may write ConfigMaps in kosh's namespace, so edit the key
+	// list: kosh warns of it, and of no other role of the list.
+	const editor = "a key's role may edit the key list, and so grant itself any role"
+	var editors []string
+	eventually(t, wait, "kosh's log warns that admin may edit the key list", func() bool {
+		editors = logLines(t, editor, "role", "ClusterRole/admin", "keys", old.name, "namespace", namespace)
+		return len(editors) > 0
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	t.Logf("kosh's log: %s", editors[0])
+	if all := logLines(t, editor); len(all) != len(logLines(t, editor, "role", "ClusterRole/admin")) {
+		t.Errorf("kosh warns of another role than admin: %q", all)
 	}
 }
 

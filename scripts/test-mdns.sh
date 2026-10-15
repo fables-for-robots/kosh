@@ -17,7 +17,9 @@
 # kosh needs an API server: the script makes a kind cluster of its own,
 # kosh-mdns-<random>, with a kubeconfig of its own, unless
 # KOSH_E2E_KUBECONFIG names one; the KUBECONFIG of the environment is not
-# used. Its key is of the ClusterRole view, whose binding kosh makes; in a
+# used. Its kosh is the instance mdns, so that its bindings are its own
+# and it never prunes a deployed kosh's. Its key is of the ClusterRole
+# view, whose binding, kosh:mdns:clusterrole:view, kosh makes; in a
 # cluster that is not the script's own, the binding is deleted at the end
 # unless it was there before. It removes what it built, started and made
 # when it ends.
@@ -53,7 +55,7 @@ CREATED_CLUSTER=
 KOSH=
 # The binding kosh makes for its key's role, and whether the script is to
 # delete it.
-BINDING=kosh:clusterrole:view
+BINDING=kosh:mdns:clusterrole:view
 DELETE_BINDING=
 BUILDING=      # a build of iroh-ssh is under way, in $CACHE/iroh-ssh-build
 
@@ -112,8 +114,10 @@ fi
 # kosh, as a process, found by nothing but mDNS.
 step "kosh serve, with the relays off"
 go build -o "$WORK/kosh" ./cmd/kosh
+# The test reads the key as the full key's (KOSH_E2E_FULL_KEY); all it
+# needs is to see the pods, which view may.
 ssh-keygen -q -t ed25519 -N '' -C alice@kosh-mdns/view -f "$WORK/full"
-if [ -z "$CREATED_CLUSTER" ] && kubectl get clusterrolebinding "$BINDING" 2>&1 | grep -q NotFound; then
+if [ -z "$CREATED_CLUSTER" ] && ! kubectl get clusterrolebinding "$BINDING" >/dev/null 2>&1; then
   DELETE_BINDING=1
 fi
 cp "$WORK/full.pub" "$WORK/authorized_keys"
@@ -121,7 +125,7 @@ cp "$WORK/full.pub" "$WORK/authorized_keys"
 ENDPOINT=$(sed -n 's/^endpoint ID *//p' "$WORK/id")
 sed -n 's/^host key *//p' "$WORK/id" >"$WORK/host_key.pub"
 [ -n "$ENDPOINT" ] && [ -s "$WORK/host_key.pub" ] || fail "kosh id printed no endpoint ID or host key"
-"$WORK/kosh" serve --ssh-listen "" --iroh-relay=false --iroh-mdns=true \
+"$WORK/kosh" serve --ssh-listen "" --iroh-relay=false --iroh-mdns=true --instance mdns \
   --state-dir "$WORK/state" --authorized-keys "$WORK/authorized_keys" --kubeconfig "$KUBECONFIG" \
   2>"$WORK/kosh.log" &
 KOSH=$!
