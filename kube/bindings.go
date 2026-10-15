@@ -29,14 +29,19 @@ const (
 const (
 	// retryEvery is how often a reconcile that failed is tried again.
 	retryEvery = 30 * time.Second
-	// reconcileTimeout bounds a Make or Prune that the key list's change
-	// calls: the sessions of a changed key end after it, so an API that
-	// does not answer is not waited for longer.
+	// reconcileTimeout bounds each Make or Prune of MakeNow, PruneNow and
+	// Run, from the moment it may run: the sessions of a changed key end
+	// after MakeNow, so an API that does not answer is not waited for
+	// longer.
 	reconcileTimeout = 10 * time.Second
 )
 
-// msgBindingsFailed is logged when a Make or Prune fails.
-const msgBindingsFailed = "the bindings of the key list could not be made"
+// What the log says of the reconciles: a failure when it begins or its
+// reason changes, and the end of a failure.
+const (
+	msgBindingsFailed = "the bindings of the key list could not be made"
+	msgBindingsMade   = "the bindings of the key list are made"
+)
 
 // Bindings makes the ClusterRoleBindings and RoleBindings the roles of the
 // key list need, and deletes those of kosh's that no role needs any more.
@@ -45,41 +50,42 @@ const msgBindingsFailed = "the bindings of the key list could not be made"
 // a time.
 type Bindings struct {
 	c     *Cluster
-	roles func() []keys.Role
+	roles func() []keys.RoleKeys
 	log   *slog.Logger
-	retry time.Duration // retryEvery; tests set less
+	// retry and timeout are retryEvery and reconcileTimeout; tests set
+	// less.
+	retry, timeout time.Duration
 
-	mu          sync.Mutex
-	makeFailed  bool // the last Make failed
-	pruneFailed bool // the last Prune failed
+	mu sync.Mutex
+	// What the last Make and the last Prune failed with, as the log says
+	// it; "" when it worked. Run retries while either is set.
+	makeFailure, pruneFailure string
+	// logged is the failure the log last said, "" when none or once it
+	// said that the failure ended.
+	logged string
+	// uncheckable is set once the log has said that kosh may not read
+	// the roles.
+	uncheckable bool
+	// foreign holds the bindings at kosh's names that another manager
+	// has, which the log has named: each is named once.
+	foreign map[string]bool
 }
 
 // NewBindings returns the reconciler of c's bindings, which reads the roles
-// to bind from roles at every Make and Prune: the key list's Roles.
-func NewBindings(c *Cluster, roles func() []keys.Role, log *slog.Logger) *Bindings {
-	return &Bindings{c: c, roles: roles, log: log, retry: retryEvery}
+// to bind, with their keys, from roles at every Make and Prune: the key
+// list's Roles.
+func NewBindings(c *Cluster, roles func() []keys.RoleKeys, log *slog.Logger) *Bindings {
+	return &Bindings{c: c, roles: roles, log: log, retry: retryEvery, timeout: reconcileTimeout, foreign: map[string]bool{}}
 }
 
 // Make makes the bindings every role of roles() needs: it creates a missing
 // one, replaces one whose roleRef is another (a roleRef cannot be changed),
-// and sets the subjects and kosh's marks of one that has others. It logs a
-// role that does not exist, and binds it all the same. It goes on past a
-// failure, and returns them all.
+// and sets the subjects and kosh's marks of one that has others. A binding
+// at kosh's name that another manager's label claims is left as it is. It
+// logs a role that does not exist, with its keys, and binds it all the
+// same. It goes on past a failure, and returns them all.
 func (b *Bindings) Make(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var errs []error
-	for _, r := range b.roles() {
-		if err := b.checkRole(ctx, r); err != nil {
-			errs = append(errs, err)
-		}
-		if err := b.bind(ctx, r); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	err := errors.Join(errs...)
-	b.makeFailed = err != nil
-	return err
+	return b.locked(ctx, 0, b.makeReading, &b.makeFailure)
 }
 
 // Prune deletes the bindings that carry kosh's label and that no role of
@@ -87,38 +93,28 @@ func (b *Bindings) Make(ctx context.Context) error {
 // namespace. A binding without the label is never deleted, whatever its
 // name.
 func (b *Bindings) Prune(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	err := b.prune(ctx)
-	b.pruneFailed = err != nil
-	return err
+	return b.locked(ctx, 0, b.prune, &b.pruneFailure)
 }
 
-// MakeNow is Make within reconcileTimeout, with a failure logged and left
-// to Run: what the key list's change calls first, before the sessions of
-// the keys that changed end.
+// MakeNow is Make within reconcileTimeout, with a failure left to Run:
+// what the key list's change calls first, before the sessions of the keys
+// that changed end.
 func (b *Bindings) MakeNow() {
-	ctx, cancel := context.WithTimeout(b.c.ctx, reconcileTimeout)
-	defer cancel()
-	if err := b.Make(ctx); err != nil {
-		b.logFailure(err)
-	}
+	_ = b.locked(b.c.ctx, b.timeout, b.makeReading, &b.makeFailure)
 }
 
-// PruneNow is Prune within reconcileTimeout, with a failure logged and
-// left to Run: what the key list's change calls last, after the sessions
-// of the keys that changed have been ended.
+// PruneNow is Prune within reconcileTimeout, with a failure left to Run:
+// what the key list's change calls last, after the sessions of the keys
+// that changed have been ended.
 func (b *Bindings) PruneNow() {
-	ctx, cancel := context.WithTimeout(b.c.ctx, reconcileTimeout)
-	defer cancel()
-	if err := b.Prune(ctx); err != nil {
-		b.logFailure(err)
-	}
+	_ = b.locked(b.c.ctx, b.timeout, b.prune, &b.pruneFailure)
 }
 
-// Run makes and prunes again every 30 seconds while the last Make or Prune
-// failed, until ctx is done. The reconciles of the key list's changes are
-// MakeNow and PruneNow; Run only retries.
+// Run makes and prunes again on every tick of the retry interval (30
+// seconds) while the last Make or Prune failed, until ctx is done. The
+// reconciles of the key list's changes are MakeNow and PruneNow; Run only
+// retries, and does not log a missing role again, since the list has not
+// been read again.
 func (b *Bindings) Run(ctx context.Context) {
 	tick := time.NewTicker(b.retry)
 	defer tick.Stop()
@@ -129,24 +125,72 @@ func (b *Bindings) Run(ctx context.Context) {
 		case <-tick.C:
 		}
 		b.mu.Lock()
-		failed := b.makeFailed || b.pruneFailed
+		failed := b.makeFailure != "" || b.pruneFailure != ""
 		b.mu.Unlock()
 		if !failed {
 			continue
 		}
-		rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
-		err := errors.Join(b.Make(rctx), b.Prune(rctx))
-		cancel()
-		if err != nil {
-			b.logFailure(err)
-		}
+		_ = b.locked(ctx, b.timeout, b.makeRetry, &b.makeFailure)
+		_ = b.locked(ctx, b.timeout, b.prune, &b.pruneFailure)
 	}
 }
 
-// checkRole logs r when it does not exist. That the ServiceAccount may not
-// read it is no failure: one with the least rights (§7) may bind a role
-// without reading it, and whether it exists is then not known.
-func (b *Bindings) checkRole(ctx context.Context, r keys.Role) error {
+// locked runs step under b.mu, within timeout of taking it when timeout is
+// not zero, keeps what it failed with in failure, and logs what the
+// failures of Make and Prune now are: an error when one begins or its
+// reason changes, and the end of one.
+func (b *Bindings) locked(ctx context.Context, timeout time.Duration, step func(context.Context) error, failure *string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	err := step(ctx)
+	*failure = ""
+	if err != nil {
+		*failure = loggableBindingsError(err)
+	}
+	now := strings.Join(slices.DeleteFunc([]string{b.makeFailure, b.pruneFailure}, func(f string) bool { return f == "" }), "; ")
+	switch {
+	case now == b.logged:
+		if err != nil {
+			b.log.Debug(msgBindingsFailed, "err", now, "again", true)
+		}
+	case now == "":
+		b.log.Info(msgBindingsMade)
+	default:
+		b.log.Error(msgBindingsFailed, "err", now)
+	}
+	b.logged = now
+	return err
+}
+
+// makeReading is Make at a reading of the key list, which logs the roles
+// that do not exist; makeRetry is Make on Run's retry, which does not.
+func (b *Bindings) makeReading(ctx context.Context) error { return b.make(ctx, true) }
+func (b *Bindings) makeRetry(ctx context.Context) error   { return b.make(ctx, false) }
+
+func (b *Bindings) make(ctx context.Context, reading bool) error {
+	var errs []error
+	for _, rk := range b.roles() {
+		if err := b.checkRole(ctx, rk, reading); err != nil {
+			errs = append(errs, err)
+		}
+		if err := b.makeBinding(ctx, rk.Role); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// checkRole logs, at a reading, a role that does not exist, with its keys.
+// That the ServiceAccount may not read the roles is no failure, since it
+// may bind them all the same, and is logged once: a missing role then
+// goes unsaid.
+func (b *Bindings) checkRole(ctx context.Context, rk keys.RoleKeys, reading bool) error {
+	r := rk.Role
 	rbac := b.c.typed.RbacV1()
 	var err error
 	if r.Kind == keys.KindRole {
@@ -155,18 +199,27 @@ func (b *Bindings) checkRole(ctx context.Context, r keys.Role) error {
 		_, err = rbac.ClusterRoles().Get(ctx, r.Name, metav1.GetOptions{})
 	}
 	switch {
-	case err == nil, apierrors.IsForbidden(err):
+	case err == nil:
+		return nil
+	case apierrors.IsForbidden(err):
+		if !b.uncheckable {
+			b.uncheckable = true
+			b.log.Warn("the role of a key cannot be checked", "role", r.String(), "keys", strings.Join(rk.Keys, ", "),
+				"reason", "kosh may not read the roles: a role that does not exist is not reported")
+		}
 		return nil
 	case apierrors.IsNotFound(err):
-		b.log.Warn("the role of a key does not exist", "role", r.String())
+		if reading {
+			b.log.Warn("the role of a key does not exist", "role", r.String(), "keys", strings.Join(rk.Keys, ", "))
+		}
 		return nil
 	default:
 		return &bindingError{what: "reading the " + r.String(), err: err}
 	}
 }
 
-// bind makes the binding of r right.
-func (b *Bindings) bind(ctx context.Context, r keys.Role) error {
+// makeBinding makes the binding of r right, unless another manager has it.
+func (b *Bindings) makeBinding(ctx context.Context, r keys.Role) error {
 	rbac := b.c.typed.RbacV1()
 	meta := metav1.ObjectMeta{
 		Name:        bindingName(r),
@@ -185,11 +238,22 @@ func (b *Bindings) bind(ctx context.Context, r keys.Role) error {
 		want := &rbacv1.ClusterRoleBinding{ObjectMeta: meta, RoleRef: ref, Subjects: subjects}
 		done, err = reconcile(ctx, rbac.ClusterRoleBindings(), want, clusterRoleBindingParts)
 	}
+	path := bindingPath(r.Namespace, meta.Name)
+	var other *otherManager
+	if errors.As(err, &other) {
+		if !b.foreign[path] {
+			b.foreign[path] = true
+			b.log.Warn("a binding at kosh's name has another manager: it is left as it is", "binding", path,
+				"manager", other.manager, "role", r.String())
+		}
+		return nil
+	}
+	delete(b.foreign, path)
 	if err != nil {
-		return &bindingError{what: "making the binding " + bindingPath(r.Namespace, meta.Name), err: err}
+		return &bindingError{what: "making the binding " + path, err: err}
 	}
 	if done != "" {
-		b.log.Info(done, "binding", bindingPath(r.Namespace, meta.Name), "role", r.String())
+		b.log.Info(done, "binding", path, "role", r.String())
 	}
 	return nil
 }
@@ -241,6 +305,9 @@ func reconcile[B metav1.Object](ctx context.Context, api bindingAPI[B], want B, 
 	if err != nil {
 		return "", err
 	}
+	if m, ok := got.GetLabels()[managedByLabel]; ok && m != managedByKosh {
+		return "", &otherManager{manager: m}
+	}
 	gotRef, gotSubjects := parts(got)
 	wantRef, wantSubjects := parts(want)
 	if *gotRef != *wantRef {
@@ -253,6 +320,7 @@ func reconcile[B metav1.Object](ctx context.Context, api bindingAPI[B], want B, 
 		_, err = api.Create(ctx, want, metav1.CreateOptions{})
 		return "a binding of the key list is replaced: its roleRef was another", err
 	}
+	// A binding without the label is kosh's to take: §4 gives it the name.
 	marked := got.GetLabels()[managedByLabel] == managedByKosh &&
 		got.GetAnnotations()[roleAnnotation] == want.GetAnnotations()[roleAnnotation]
 	if marked && slices.Equal(*gotSubjects, *wantSubjects) {
@@ -278,8 +346,8 @@ func reconcile[B metav1.Object](ctx context.Context, api bindingAPI[B], want B, 
 
 func (b *Bindings) prune(ctx context.Context) error {
 	needed := map[string]bool{} // by bindingPath
-	for _, r := range b.roles() {
-		needed[bindingPath(r.Namespace, bindingName(r))] = true
+	for _, rk := range b.roles() {
+		needed[bindingPath(rk.Role.Namespace, bindingName(rk.Role))] = true
 	}
 	rbac := b.c.typed.RbacV1()
 	byLabel := metav1.ListOptions{LabelSelector: managedByLabel + "=" + managedByKosh}
@@ -334,10 +402,17 @@ type bindingError struct {
 func (e *bindingError) Error() string { return e.what + ": " + e.err.Error() }
 func (e *bindingError) Unwrap() error { return e.err }
 
-// logFailure logs a failed Make or Prune: each failure with what was
-// asked, and of an error of the API only its reason and code, as kosh logs
-// every error of the API (loggableError).
-func (b *Bindings) logFailure(err error) {
+// otherManager is what reconcile answers for a binding at kosh's name
+// whose label names another manager, such as helm or argocd: kosh leaves
+// it as it is rather than fight that manager, and Prune never sees it.
+type otherManager struct{ manager string }
+
+func (e *otherManager) Error() string { return "the binding is managed by " + e.manager }
+
+// loggableBindingsError returns a failed Make or Prune as the log says it:
+// each failure with what was asked, and of an error of the API only its
+// reason and code, as kosh logs every error of the API (loggableError).
+func loggableBindingsError(err error) string {
 	var failures []string
 	for _, e := range unjoin(err) {
 		var be *bindingError
@@ -348,7 +423,7 @@ func (b *Bindings) logFailure(err error) {
 			failures = append(failures, e.Error())
 		}
 	}
-	b.log.Error(msgBindingsFailed, "err", strings.Join(failures, "; "))
+	return strings.Join(failures, "; ")
 }
 
 // unjoin returns the errors errors.Join joined in err, or err alone.

@@ -119,13 +119,14 @@ func bindRoles(t *testing.T, admin *rest.Config) {
 
 // koshMinimumRules are the least kosh's ServiceAccount needs (§7 of the
 // roles design): to impersonate the keys and the roles, to make the
-// bindings, and to bind the roles it names. Discovery and the version
-// every authenticated subject has.
+// bindings, to read the roles, so that one that does not exist is told,
+// and to bind the roles it names. Discovery and the version every
+// authenticated subject has.
 var koshMinimumRules = []rbacv1.PolicyRule{
 	{APIGroups: []string{""}, Resources: []string{"users", "groups"}, Verbs: []string{"impersonate"}},
 	{APIGroups: []string{rbacGroup}, Resources: []string{"clusterrolebindings", "rolebindings"},
 		Verbs: []string{"get", "list", "create", "update", "delete"}},
-	{APIGroups: []string{rbacGroup}, Resources: []string{"clusterroles", "roles"}, Verbs: []string{"bind"}},
+	{APIGroups: []string{rbacGroup}, Resources: []string{"clusterroles", "roles"}, Verbs: []string{"get", "bind"}},
 }
 
 // startRBACAPIServer is startAPIServer with a user kosh that has no

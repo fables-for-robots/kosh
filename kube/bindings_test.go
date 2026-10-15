@@ -59,10 +59,24 @@ func newBindingsFixture(t *testing.T, existing []keys.Role, roles ...keys.Role) 
 	return f
 }
 
-func (f *bindingsFixture) currentRoles() []keys.Role {
+// currentRoles is the fixture's key list: each role with one key, named
+// "alice/<role>".
+func (f *bindingsFixture) currentRoles() []keys.RoleKeys {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return slices.Clone(f.roles)
+	var out []keys.RoleKeys
+	for _, r := range f.roles {
+		out = append(out, keys.RoleKeys{Role: r, Keys: []string{keyOf(r)}})
+	}
+	return out
+}
+
+// keyOf is the name of the fixture's key of r.
+func keyOf(r keys.Role) string {
+	if r.Kind == keys.KindRole {
+		return "alice/" + r.Name + "@" + r.Namespace
+	}
+	return "alice/" + r.Name
 }
 
 func (f *bindingsFixture) setRoles(roles ...keys.Role) {
@@ -266,8 +280,8 @@ func TestMakeSetsSubjects(t *testing.T) {
 }
 
 // TestMakeMarksABindingAtItsName: a binding at the name kosh gives a role
-// that lacks kosh's label, as an operator may have made it by hand, is
-// given it, so that Prune deletes it when no key needs it any more.
+// that has no managed-by label, as an operator may have made it by hand,
+// is given kosh's, so that Prune deletes it when no key needs it any more.
 func TestMakeMarksABindingAtItsName(t *testing.T) {
 	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
 	ctx := context.Background()
@@ -285,6 +299,47 @@ func TestMakeMarksABindingAtItsName(t *testing.T) {
 	b, _ := f.crb(t, "kosh:clusterrole:view")
 	if b.Labels["app.kubernetes.io/managed-by"] != "kosh" || b.Annotations["kosh.fables-for-robots.dev/role"] != "ClusterRole/view" {
 		t.Errorf("labels %v, annotations %v", b.Labels, b.Annotations)
+	}
+}
+
+// TestMakeLeavesAnotherManagersBinding: a binding at kosh's name whose
+// managed-by label names another manager, as helm or argocd, is left as it
+// is, said once in the log, and not pruned: kosh does not fight a tool
+// that owns it.
+func TestMakeLeavesAnotherManagersBinding(t *testing.T) {
+	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
+	ctx := context.Background()
+	theirs := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh:clusterrole:view", Labels: map[string]string{"app.kubernetes.io/managed-by": "argocd"}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "edit"},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: "ops"}},
+	}
+	if _, err := f.e.typed.RbacV1().ClusterRoleBindings().Create(ctx, theirs, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.e.typed.ClearActions()
+	for range 2 {
+		if err := f.b.Make(ctx); err != nil {
+			t.Fatalf("Make: %v", err)
+		}
+	}
+	f.setRoles()
+	if err := f.b.Prune(ctx); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Errorf("writes %v to another manager's binding", w)
+	}
+	b, ok := f.crb(t, "kosh:clusterrole:view")
+	if !ok || b.Labels["app.kubernetes.io/managed-by"] != "argocd" || b.RoleRef.Name != "edit" {
+		t.Errorf("binding %+v, want argocd's as it was", b)
+	}
+	recs := f.log.with("a binding at kosh's name has another manager: it is left as it is")
+	if len(recs) != 1 {
+		t.Fatalf("records %+v, want one", f.log.all())
+	}
+	if m, _ := recs[0].attr("manager"); m != "argocd" {
+		t.Errorf("manager %q", m)
 	}
 }
 
@@ -364,9 +419,10 @@ func TestMissingRoleIsLoggedAndBound(t *testing.T) {
 			t.Errorf("level %v", r.Level)
 		}
 		role, _ := r.attr("role")
-		missing = append(missing, role)
+		keys, _ := r.attr("keys")
+		missing = append(missing, role+" "+keys)
 	}
-	if want := []string{"ClusterRole/cluster-admin", "Role/team-b/edit"}; !slices.Equal(missing, want) {
+	if want := []string{"ClusterRole/cluster-admin alice/cluster-admin", "Role/team-b/edit alice/edit@team-b"}; !slices.Equal(missing, want) {
 		t.Errorf("missing %v, want %v", missing, want)
 	}
 	// Bound all the same: the role works the moment it is made.
@@ -385,10 +441,10 @@ func TestMissingRoleIsLoggedAndBound(t *testing.T) {
 	}
 }
 
-// TestRoleThatCannotBeRead: a ServiceAccount with the least rights of §7
-// may bind a role and not read it, so whether it exists is not known; that
-// is no failure. Any other error reading it is one, and the binding is
-// made all the same.
+// TestRoleThatCannotBeRead: a ServiceAccount without get on the roles may
+// bind a role and not read it, so whether it exists is not known; that is
+// no failure, and is said once. Any other error reading it is a failure,
+// and the binding is made all the same.
 func TestRoleThatCannotBeRead(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -413,16 +469,39 @@ func TestRoleThatCannotBeRead(t *testing.T) {
 			if recs := f.log.with("the role of a key does not exist"); len(recs) != 0 {
 				t.Errorf("records %+v", recs)
 			}
+			// Said once, whatever the readings.
+			_ = f.b.Make(context.Background())
+			want := 0
+			if !tc.failure {
+				want = 1
+			}
+			recs := f.log.with("the role of a key cannot be checked")
+			if len(recs) != want {
+				t.Fatalf("records %+v, want %d", f.log.all(), want)
+			}
+			if want == 1 {
+				if k, _ := recs[0].attr("keys"); recs[0].Level != slog.LevelWarn || k != "alice/view" {
+					t.Errorf("record %+v", recs[0])
+				}
+			}
 		})
 	}
 }
 
+// TestRunRetriesAFailure: a failure that lasts is logged once, as an
+// error, when it begins, and once more, as info, when it ends; Run tries
+// again on every tick while it lasts, and not after. A missing role is
+// logged at the reading, not at every retry.
 func TestRunRetriesAFailure(t *testing.T) {
-	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole)
+	f := newBindingsFixture(t, []keys.Role{viewRole}, viewRole, adminRole)
 	f.b.retry = 5 * time.Millisecond
 	var creates atomic.Int32
-	f.e.typed.PrependReactor("create", "clusterrolebindings", func(k8stesting.Action) (bool, runtime.Object, error) {
-		if creates.Add(1) <= 2 {
+	f.e.typed.PrependReactor("create", "clusterrolebindings", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.(k8stesting.CreateAction).GetObject().(metav1.Object).GetName() != "kosh:clusterrole:view" {
+			return false, nil, nil
+		}
+		// The start's Make and three ticks fail; the fourth tick works.
+		if creates.Add(1) <= 4 {
 			// A webhook's text, which the log must not hold.
 			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: rbacGroup, Resource: "clusterrolebindings"}, "kosh:clusterrole:view", errors.New("the webhook says s3cr3t"))
 		}
@@ -446,8 +525,8 @@ func TestRunRetriesAFailure(t *testing.T) {
 	})
 	// Once it worked, nothing is retried.
 	time.Sleep(50 * time.Millisecond)
-	if n := creates.Load(); n != 3 {
-		t.Errorf("%d creates, want 3", n)
+	if n := creates.Load(); n != 5 {
+		t.Errorf("%d creates, want 5", n)
 	}
 	cancel()
 	select {
@@ -455,18 +534,47 @@ func TestRunRetriesAFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return when its context ended")
 	}
-	recs := f.log.with("the bindings of the key list could not be made")
-	if len(recs) != 2 {
-		t.Fatalf("records %+v, want the two failures", f.log.all())
-	}
-	for _, r := range recs {
-		if r.Level != slog.LevelError {
-			t.Errorf("level %v", r.Level)
-		}
+	var levels []string
+	for _, r := range f.log.with("the bindings of the key list could not be made") {
+		levels = append(levels, r.Level.String())
 		e, _ := r.attr("err")
 		if strings.Contains(e, "s3cr3t") || !strings.Contains(e, "the API answered Forbidden (403)") || !strings.Contains(e, "kosh:clusterrole:view") {
 			t.Errorf("err %q: the binding and the API's code, and nothing of its text", e)
 		}
+	}
+	// The error once; the three failed ticks at debug level.
+	if want := []string{"ERROR", "DEBUG", "DEBUG", "DEBUG"}; !slices.Equal(levels, want) {
+		t.Errorf("levels %v, want %v", levels, want)
+	}
+	if recs := f.log.with("the bindings of the key list are made"); len(recs) != 1 || recs[0].Level != slog.LevelInfo {
+		t.Errorf("records %+v, want one that says the failure ended", recs)
+	}
+	if recs := f.log.with("the role of a key does not exist"); len(recs) != 1 {
+		t.Errorf("%d records of the missing role, want the reading's alone", len(recs))
+	}
+}
+
+// TestTimeoutBeginsWithTheLock: the deadline of a reconcile begins when
+// it may run, not while it waits for one before it, which would leave it
+// no time and a new role without its binding until the next retry. (The
+// fakes do not heed a context, so the step's own deadline is looked at.)
+func TestTimeoutBeginsWithTheLock(t *testing.T) {
+	f := newBindingsFixture(t, nil)
+	f.b.timeout = 200 * time.Millisecond
+	f.b.mu.Lock() // a reconcile that takes longer than the timeout
+	left := make(chan time.Duration, 1)
+	var failure string
+	go func() {
+		_ = f.b.locked(context.Background(), f.b.timeout, func(ctx context.Context) error {
+			deadline, _ := ctx.Deadline()
+			left <- time.Until(deadline)
+			return nil
+		}, &failure)
+	}()
+	time.Sleep(2 * f.b.timeout)
+	f.b.mu.Unlock()
+	if d := <-left; d < f.b.timeout/2 {
+		t.Errorf("%v left of %v once the lock was taken", d, f.b.timeout)
 	}
 }
 

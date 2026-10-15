@@ -214,10 +214,9 @@ func TestImpersonatedUserInTheAPIsAnswer(t *testing.T) {
 
 // TestBindingsWorkForReal: the bindings kosh makes, as the user of §7's
 // least rights, are the ones a session's rights come from. The fixture's
-// binding of view is deleted first, for Bindings to make it; those of
-// cluster-admin and of edit in team-a, which have no label, stay for the
-// other tests and show here that a binding without kosh's label is not
-// pruned, and that one at kosh's name is marked when a role needs it.
+// bindings of view and of edit in team-a are deleted first, for Bindings
+// to make them; that of cluster-admin, which has no label and no role of
+// the test's, shows that Prune leaves a binding without kosh's label.
 func TestBindingsWorkForReal(t *testing.T) {
 	r := newRolesEnv(t)
 	ctx := context.Background()
@@ -225,18 +224,29 @@ func TestBindingsWorkForReal(t *testing.T) {
 	if err := rbac.ClusterRoleBindings().Delete(ctx, viewGrant.Role.Group(), metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	s := r.session(t, viewGrant)
-	listPods := func() error {
-		_, err := s.clients.typed.CoreV1().Pods("default").List(ctx, metav1.ListOptions{})
+	if err := rbac.RoleBindings(testTeamNamespace).Delete(ctx, "kosh:role:edit", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	listPods := func(s *session, namespace string) error {
+		_, err := s.clients.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 		return err
 	}
-	if err := listPods(); !apierrors.IsForbidden(err) {
-		t.Fatalf("list pods without a binding: %v, want the API's refusal", err)
+	view, team := r.session(t, viewGrant), r.session(t, teamGrant)
+	if err := listPods(view, "default"); !apierrors.IsForbidden(err) {
+		t.Fatalf("view: list pods without a binding: %v, want the API's refusal", err)
+	}
+	if err := listPods(team, testTeamNamespace); !apierrors.IsForbidden(err) {
+		t.Fatalf("edit@team-a: list pods without a binding: %v, want the API's refusal", err)
 	}
 
+	missing := keys.Role{Kind: keys.KindClusterRole, Name: "nobody-made-this"}
 	var mu sync.Mutex
-	roles := []keys.Role{viewGrant.Role, teamGrant.Role}
-	b := NewBindings(r.c, func() []keys.Role {
+	roles := []keys.RoleKeys{
+		{Role: viewGrant.Role, Keys: []string{viewGrant.Name}},
+		{Role: missing, Keys: []string{"dave/nobody-made-this"}},
+		{Role: teamGrant.Role, Keys: []string{teamGrant.Name}},
+	}
+	b := NewBindings(r.c, func() []keys.RoleKeys {
 		mu.Lock()
 		defer mu.Unlock()
 		return slices.Clone(roles)
@@ -244,7 +254,9 @@ func TestBindingsWorkForReal(t *testing.T) {
 	if err := b.Make(ctx); err != nil {
 		t.Fatalf("Make: %v", err)
 	}
-	eventually(t, "view may list pods", func() bool { return listPods() == nil })
+	eventually(t, "view may list pods", func() bool { return listPods(view, "default") == nil })
+	eventually(t, "edit@team-a may list the pods of team-a", func() bool { return listPods(team, testTeamNamespace) == nil })
+
 	crb, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:clusterrole:view", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -257,30 +269,73 @@ func TestBindingsWorkForReal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rb.Labels["app.kubernetes.io/managed-by"] != "kosh" {
-		t.Errorf("the fixture's binding of edit in team-a is not marked: %v", rb.Labels)
+	if rb.Labels["app.kubernetes.io/managed-by"] != "kosh" || rb.Annotations["kosh.fables-for-robots.dev/role"] != "Role/team-a/edit" ||
+		rb.RoleRef.Kind != "Role" || rb.RoleRef.Name != "edit" || len(rb.Subjects) != 1 || rb.Subjects[0].Name != "kosh:role:team-a:edit" {
+		t.Errorf("the binding of edit in team-a: %+v", rb)
 	}
-	// kosh may bind the roles and not read them: no role is said to be
-	// missing, and nothing failed.
-	if recs := r.log.with("the role of a key does not exist"); len(recs) != 0 {
+	// kosh may read the roles (§7): the one that does not exist is told,
+	// with its key, and bound all the same.
+	recs := r.log.with("the role of a key does not exist")
+	if len(recs) != 1 {
+		t.Fatalf("records %+v, want the missing role's", r.log.all())
+	}
+	if role, _ := recs[0].attr("role"); role != "ClusterRole/nobody-made-this" {
+		t.Errorf("role %q", role)
+	}
+	if k, _ := recs[0].attr("keys"); k != "dave/nobody-made-this" {
+		t.Errorf("keys %q", k)
+	}
+	if recs := r.log.with("the role of a key cannot be checked"); len(recs) != 0 {
 		t.Errorf("records %+v", recs)
+	}
+	if _, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:clusterrole:nobody-made-this", metav1.GetOptions{}); err != nil {
+		t.Errorf("the missing role's binding: %v", err)
+	}
+
+	// A second Make, against the API's own defaulting, changes nothing.
+	versions := func() []string {
+		var out []string
+		for _, name := range []string{"kosh:clusterrole:view", "kosh:clusterrole:nobody-made-this"} {
+			b, err := rbac.ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, b.ResourceVersion)
+		}
+		b, err := rbac.RoleBindings(testTeamNamespace).Get(ctx, "kosh:role:edit", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(out, b.ResourceVersion)
+	}
+	before := versions()
+	if err := b.Make(ctx); err != nil {
+		t.Fatalf("the second Make: %v", err)
+	}
+	if after := versions(); !slices.Equal(before, after) {
+		t.Errorf("resourceVersions %v after a second Make, were %v", after, before)
 	}
 
 	mu.Lock()
-	roles = []keys.Role{teamGrant.Role}
+	roles = []keys.RoleKeys{{Role: teamGrant.Role, Keys: []string{teamGrant.Name}}}
 	mu.Unlock()
 	if err := b.Prune(ctx); err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	eventually(t, "view is refused again", func() bool { return apierrors.IsForbidden(listPods()) })
-	if _, err := rbac.ClusterRoleBindings().Get(ctx, "kosh:clusterrole:view", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the binding of view after Prune: %v", err)
+	eventually(t, "view is refused again", func() bool { return apierrors.IsForbidden(listPods(view, "default")) })
+	for _, name := range []string{"kosh:clusterrole:view", "kosh:clusterrole:nobody-made-this"} {
+		if _, err := rbac.ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Errorf("%s after Prune: %v", name, err)
+		}
 	}
-	if _, err := rbac.RoleBindings(testTeamNamespace).Get(ctx, "kosh:role:edit", metav1.GetOptions{}); err != nil {
-		t.Errorf("the binding of edit in team-a, which a role needs: %v", err)
+	if err := listPods(team, testTeamNamespace); err != nil {
+		t.Errorf("edit@team-a, which a role needs, after Prune: %v", err)
 	}
 	if _, err := rbac.ClusterRoleBindings().Get(ctx, fullGrant.Role.Group(), metav1.GetOptions{}); err != nil {
 		t.Errorf("the fixture's binding of cluster-admin, without kosh's label: %v", err)
+	}
+	if recs := r.log.with("the bindings of the key list could not be made"); len(recs) != 0 {
+		t.Errorf("failures %+v", recs)
 	}
 }
 

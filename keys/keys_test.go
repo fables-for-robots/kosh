@@ -603,15 +603,25 @@ func TestOnChangeOrder(t *testing.T) {
 func TestListRoles(t *testing.T) {
 	_, a := newKey(t)
 	_, b := newKey(t)
-	set, rejected := parseString(a + " a/view\n" + b + " b/edit@team-a\n")
+	_, c := newKey(t)
+	set, rejected := parseString(a + " b/view\n" + b + " c/edit@team-a\n" + c + " a/view\n")
 	noRejected(t, rejected)
 	l := NewList(set)
-	if got, want := l.Roles(), []Role{clusterRole("view"), nsRole("team-a", "edit")}; !slices.Equal(got, want) {
+	want := []RoleKeys{
+		{Role: clusterRole("view"), Keys: []string{"a/view", "b/view"}},
+		{Role: nsRole("team-a", "edit"), Keys: []string{"c/edit@team-a"}},
+	}
+	if got := l.Roles(); !slices.EqualFunc(got, want, func(x, y RoleKeys) bool {
+		return x.Role == y.Role && slices.Equal(x.Keys, y.Keys)
+	}) {
 		t.Errorf("Roles = %+v, want %+v", got, want)
+	}
+	if got := set.KeysOf(clusterRole("edit")); len(got) != 0 {
+		t.Errorf("KeysOf a role no key names = %v", got)
 	}
 	// What Roles reads is the set Replace put in place, from within
 	// OnChange too.
-	var inChange []Role
+	var inChange []RoleKeys
 	l.OnChange(func() { inChange = l.Roles() })
 	l.Replace(nil)
 	if got := l.Roles(); len(got) != 0 || len(inChange) != 0 {
