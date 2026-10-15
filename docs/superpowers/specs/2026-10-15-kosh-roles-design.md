@@ -50,9 +50,15 @@ Roles both; a key the role cannot use is hidden, not refused.
    follow the role, the kind and the namespace: an `edit@team-a` key has
    `<ctrl-d> Delete` in `team-a` and not in `default`.
 
-4. **A key with a namespaced Role** starts in its namespace, not in
-   `default`; its tables of other namespaces, and `<0> all`, show the
-   API's refusal; its header's `CPU:`/`MEM:` lines need `nodes`, which a
+4. **A key with a namespaced Role starts in its namespace.** The
+   session opens on the pods of `<namespace>`, not of `default`; the
+   namespace shortcuts of the header are `<0> all`, `<1> <namespace>`,
+   then the recent ones, with `default` nowhere unless it is that
+   namespace or was visited; and `:ns` lists what the role may list
+   (the table of namespaces is refused to a Role, so `:ns` shows the
+   refusal, and the namespace is reached by `:pods <namespace>` or the
+   shortcut). Its tables of other namespaces, and `<0> all`, show the
+   API's refusal. Its header's `CPU:`/`MEM:` lines need `nodes`, which a
    Role cannot grant, so they are absent.
 
 5. **A role that does not exist** gives no access: every table says
@@ -312,6 +318,12 @@ first table of a kind, nothing after.
 
 The help lists what is bound. The `[read-only]` suffix of the header
 goes; the name is the role.
+
+**The starting namespace** is the grant's role's namespace when it has
+one (`root.ns.current` and the first table's query), else `default` as
+today; the shortcuts' second entry is that namespace (`namespaces.use`
+and `shortcuts()` take the starting namespace in place of the fixed
+`default`).
 
 `x` on a Secret, `d`, `y`, `l` are bound by the same rule (`get` on the
 resource or `pods/log`); a key that may not read Secrets has no `x`
