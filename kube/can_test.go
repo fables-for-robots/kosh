@@ -212,6 +212,17 @@ func TestCanErrorIsFalseAndLoggedOnce(t *testing.T) {
 	r.allow(attrs)
 	r.setErr(errors.New("the API is down"))
 
+	// A question its asker cancelled says nothing of the key's rights:
+	// it is false and not logged, and does not use up the session's line.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if s.Can(cancelled, "delete", pods, "", testTeamNamespace) {
+		t.Error("delete with a cancelled context and the API down: allowed")
+	}
+	if recs := log.with("the key's rights could not be checked"); len(recs) != 0 {
+		t.Fatalf("a cancelled question was logged: %+v", recs)
+	}
+
 	ctx := context.Background()
 	for _, verb := range []string{"delete", "delete", "get"} {
 		if s.Can(ctx, verb, pods, "", testTeamNamespace) {
@@ -238,15 +249,20 @@ func TestCanErrorIsFalseAndLoggedOnce(t *testing.T) {
 	if !s.Can(ctx, "delete", pods, "", testTeamNamespace) {
 		t.Error("delete pods in team-a after the API is back: not allowed")
 	}
-	if n := len(r.reviews()); n != 4 {
-		t.Errorf("%d reviews, want 4: an error is asked again", n)
+	if n := len(r.reviews()); n != 5 {
+		t.Errorf("%d reviews, want 5: an error is asked again", n)
 	}
-	// Another session logs its own line.
-	r.setErr(errors.New("the API is down"))
+	// Another session logs its own line. Its asker's deadline passed: an
+	// API that does not answer in time is logged.
+	r.setErr(context.DeadlineExceeded)
 	other := keys.Grant{Name: "dave/edit@team-a", Fingerprint: "SHA256:dave", Role: teamGrant.Role}
-	e.sessionOf(t, other).Can(ctx, "delete", pods, "", testTeamNamespace)
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	if e.sessionOf(t, other).Can(expired, "delete", pods, "", testTeamNamespace) {
+		t.Error("delete past the deadline: allowed")
+	}
 	if n := len(log.with("the key's rights could not be checked")); n != 2 {
-		t.Errorf("%d lines after a second session's error, want 2", n)
+		t.Errorf("%d lines after a second session's error past its deadline, want 2", n)
 	}
 }
 

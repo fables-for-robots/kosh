@@ -124,6 +124,8 @@ func TestCanAnswersWhatWasAllowed(t *testing.T) {
 	s.Allow("delete", "", "pods", "", "team-a")
 	s.Allow("get", "*", "*", "", "*")
 	s.Allow("*", "apps", "deployments", "scale", "default")
+	s.Allow("list", "", "pods", "", "")
+	s.Allow("watch", "", "pods", "", "team-a")
 	for _, tc := range []struct {
 		verb string
 		res  kube.Resource
@@ -142,6 +144,13 @@ func TestCanAnswersWhatWasAllowed(t *testing.T) {
 		{"update", deployments, "scale", "default", true},
 		{"update", deployments, "scale", "team-a", false},
 		{"update", deployments, "", "default", false},
+		// A right with no namespace is the cluster-wide one: it holds in
+		// every namespace. A right in one namespace holds there alone.
+		{"list", pods, "", "default", true},
+		{"list", pods, "", "", true},
+		{"watch", pods, "", "team-a", true},
+		{"watch", pods, "", "default", false},
+		{"watch", pods, "", "", false},
 	} {
 		if got := s.Can(ctx, tc.verb, tc.res, tc.sub, tc.ns); got != tc.want {
 			t.Errorf("Can(%s, %s, %q, %q) = %v, want %v", tc.verb, tc.res.GVR.Resource, tc.sub, tc.ns, got, tc.want)

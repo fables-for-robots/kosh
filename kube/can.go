@@ -96,9 +96,11 @@ func (s *session) Can(ctx context.Context, verb string, res Resource, subresourc
 	}
 	allowed, err := s.ask(ctx, q)
 	if err != nil {
-		// A question whose asker has gone, or whose session has ended,
-		// says nothing of the key's rights.
-		if ctx.Err() == nil && s.ctx.Err() == nil && s.can.warnOnce() {
+		// A question whose asker cancelled it, or whose session has
+		// ended, says nothing of the key's rights. One whose asker's
+		// deadline passed is an API that did not answer in time, which
+		// the operator is to see.
+		if !errors.Is(ctx.Err(), context.Canceled) && s.ctx.Err() == nil && s.can.warnOnce() {
 			s.c.log.LogAttrs(ctx, slog.LevelWarn, "the key's rights could not be checked",
 				slog.String("key", s.grant.Name),
 				slog.String("fingerprint", s.grant.Fingerprint),
@@ -136,8 +138,12 @@ func (s *session) ask(ctx context.Context, q canQuestion) (bool, error) {
 	return got.Status.Allowed, nil
 }
 
-// canError is what the log says of an error of Can: of an error of the
-// API, its reason and code alone, as of an action's.
+// canError is what the log says of an error of Can. An error of the API
+// is reduced to its reason and code, as an action's is: its text is the
+// API's, or an admission webhook's, which kosh does not log. Any other
+// error keeps its text: it is kosh's or client-go's own (the API could
+// not be reached, the session has no clients), holds nothing of an
+// object, and is what the operator needs to see why.
 func canError(err error) error {
 	var api apierrors.APIStatus
 	if errors.As(err, &api) {

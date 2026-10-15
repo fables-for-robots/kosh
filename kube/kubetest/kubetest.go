@@ -262,10 +262,12 @@ func (s *Session) Resolve(_ context.Context, name string) (kube.Resource, error)
 }
 
 // Allow gives the session the right of verb on group/resource, or on
-// its subresource ("" for none), in namespace ("" for the cluster scope
-// or every namespace), for Can to answer. Any field may be "*", which
-// matches every value, "" among them. A session is allowed nothing until
-// a test allows it something.
+// its subresource ("" for none), in namespace, for Can to answer. A
+// right with no namespace ("") is the cluster-wide one, which holds in
+// every namespace, as RBAC's does; a right in one namespace holds there
+// alone, not in another nor in every one (Can with ""). Any field may
+// be "*", which matches every value, "" among them. A session is
+// allowed nothing until a test allows it something.
 func (s *Session) Allow(verb, group, resource, subresource, namespace string) {
 	s.mu.Lock()
 	s.allowed = append(s.allowed, right{verb, group, resource, subresource, namespace})
@@ -281,7 +283,7 @@ func (s *Session) Can(_ context.Context, verb string, res kube.Resource, subreso
 	defer s.mu.Unlock()
 	for _, r := range s.allowed {
 		if match(r.verb, verb) && match(r.group, res.GVR.Group) && match(r.resource, res.GVR.Resource) &&
-			match(r.subresource, subresource) && match(r.namespace, namespace) {
+			match(r.subresource, subresource) && (r.namespace == "" || match(r.namespace, namespace)) {
 			return true
 		}
 	}
