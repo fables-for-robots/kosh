@@ -225,10 +225,14 @@ with no namespace), which is what `<0> all` needs.
 
 ### 3.6 Sessions end with the list, as before
 
-A key that leaves the list, or whose role changes, has its sessions
-ended (`MsgGrantChanged`, §6 of the stage 1 design, unchanged). The
-bindings are reconciled before the sessions are ended (§4), so that a
-key whose role was narrowed cannot act with the old role in between.
+A key that leaves the list, or whose line changes in its name or its
+role, has its sessions ended (`MsgGrantChanged`): the name is the user
+the session impersonates and the audit log records, so a renamed key is
+another user, and its old sessions do not go on under a name the list
+no longer holds. (Until 0.5.0 a rename alone ended nothing; the grant
+had nothing but its name and a flag.) The bindings are reconciled before
+the sessions are ended (§4), so that a key whose role was narrowed
+cannot act with the old role in between.
 
 ## 4. The bindings
 
