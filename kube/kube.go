@@ -355,6 +355,14 @@ type Reader interface {
 	// ErrUnknownResource is returned.
 	Resolve(ctx context.Context, name string) (Resource, error)
 
+	// Can reports whether the session's role allows verb on res, or on
+	// its subresource ("log", "scale"; "" for none), in namespace: ""
+	// for the cluster scope, or for a namespaced resource every
+	// namespace. It asks the API server, as the key, with a
+	// SelfSubjectAccessReview, and keeps the answer for two minutes. An
+	// error is answered as false and logged once per session.
+	Can(ctx context.Context, verb string, res Resource, subresource, namespace string) bool
+
 	// Watch opens the table of q. The table of a resource the session
 	// may not list is a Watch whose Table has Err, not an error here.
 	Watch(q Query) (Watch, error)

@@ -199,3 +199,43 @@ func TestImpersonatedUserInTheAPIsAnswer(t *testing.T) {
 		t.Errorf("the role's cache is %q to the API", got)
 	}
 }
+
+func TestCanAgainstRBAC(t *testing.T) {
+	r := newRolesEnv(t)
+	ctx := context.Background()
+	view := r.session(t, viewGrant)
+	pods := readEnvResolve(t, view, "pods")
+	secrets := readEnvResolve(t, view, "secrets")
+	team := r.session(t, teamGrant)
+	for _, tc := range []struct {
+		name      string
+		s         *session
+		verb      string
+		res       Resource
+		namespace string
+		want      bool
+	}{
+		{"view: list pods", view, "list", pods, "default", true},
+		{"view: list pods everywhere", view, "list", pods, "", true},
+		{"view: delete pods", view, "delete", pods, "default", false},
+		{"view: get secrets", view, "get", secrets, "default", false},
+		{"edit@team-a: delete pods in team-a", team, "delete", pods, testTeamNamespace, true},
+		{"edit@team-a: delete pods in default", team, "delete", pods, "default", false},
+		{"edit@team-a: delete pods everywhere", team, "delete", pods, "", false},
+	} {
+		if got := tc.s.Can(ctx, tc.verb, tc.res, "", tc.namespace); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// A subresource is asked as one: view may read a pod's log and not
+	// open a shell in it.
+	if !view.Can(ctx, "get", pods, "log", "default") {
+		t.Error("view: get pods/log: not allowed")
+	}
+	if view.Can(ctx, "create", pods, "exec", "default") {
+		t.Error("view: create pods/exec: allowed")
+	}
+	if recs := r.log.with("the key's rights could not be checked"); len(recs) != 0 {
+		t.Errorf("errors %+v", recs)
+	}
+}

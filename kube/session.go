@@ -20,6 +20,8 @@ type session struct {
 	role       identity // the role's, whose caches and pollers the session shares
 	clients    *clients // of self; nil when clientsErr says why
 	clientsErr error
+
+	can canCache // the answers of Can, the session's own
 }
 
 var _ Session = (*session)(nil)

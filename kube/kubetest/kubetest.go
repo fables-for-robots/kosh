@@ -66,6 +66,12 @@ type Session struct {
 	usage   kube.ClusterUsage
 	usageOK bool
 	usages  []*UsageWatch
+	allowed []right
+}
+
+// right is one right Allow gave: each field is a value or "*" for any.
+type right struct {
+	verb, group, resource, subresource, namespace string
 }
 
 var _ kube.Session = (*Session)(nil)
@@ -253,6 +259,33 @@ func (s *Session) Resolve(_ context.Context, name string) (kube.Resource, error)
 		}
 	}
 	return kube.Resource{}, fmt.Errorf("%q: %w", name, kube.ErrUnknownResource)
+}
+
+// Allow gives the session the right of verb on group/resource, or on
+// its subresource ("" for none), in namespace ("" for the cluster scope
+// or every namespace), for Can to answer. Any field may be "*", which
+// matches every value, "" among them. A session is allowed nothing until
+// a test allows it something.
+func (s *Session) Allow(verb, group, resource, subresource, namespace string) {
+	s.mu.Lock()
+	s.allowed = append(s.allowed, right{verb, group, resource, subresource, namespace})
+	s.mu.Unlock()
+}
+
+// Can reports whether Allow gave a right that matches the question. It is
+// not recorded: the tables ask it for every key they bind, and no test
+// of what a view asked wants it among the calls.
+func (s *Session) Can(_ context.Context, verb string, res kube.Resource, subresource, namespace string) bool {
+	match := func(want, got string) bool { return want == "*" || want == got }
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.allowed {
+		if match(r.verb, verb) && match(r.group, res.GVR.Group) && match(r.resource, res.GVR.Resource) &&
+			match(r.subresource, subresource) && match(r.namespace, namespace) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) Watch(q kube.Query) (kube.Watch, error) {

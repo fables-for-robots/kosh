@@ -113,3 +113,41 @@ func TestFakeUsage(t *testing.T) {
 		t.Errorf("%+v, %v; want served and not ok", got, ok)
 	}
 }
+
+func TestCanAnswersWhatWasAllowed(t *testing.T) {
+	s := New(keys.Grant{})
+	ctx := context.Background()
+	pods, deployments := Resource("pods"), Resource("deployments")
+	if s.Can(ctx, "get", pods, "", "default") {
+		t.Error("allowed before Allow")
+	}
+	s.Allow("delete", "", "pods", "", "team-a")
+	s.Allow("get", "*", "*", "", "*")
+	s.Allow("*", "apps", "deployments", "scale", "default")
+	for _, tc := range []struct {
+		verb string
+		res  kube.Resource
+		sub  string
+		ns   string
+		want bool
+	}{
+		{"delete", pods, "", "team-a", true},
+		{"delete", pods, "", "default", false},
+		{"delete", pods, "", "", false},
+		{"delete", pods, "eviction", "team-a", false},
+		{"delete", deployments, "", "team-a", false},
+		{"get", pods, "", "", true},
+		{"get", deployments, "", "kube-system", true},
+		{"get", pods, "log", "default", false},
+		{"update", deployments, "scale", "default", true},
+		{"update", deployments, "scale", "team-a", false},
+		{"update", deployments, "", "default", false},
+	} {
+		if got := s.Can(ctx, tc.verb, tc.res, tc.sub, tc.ns); got != tc.want {
+			t.Errorf("Can(%s, %s, %q, %q) = %v, want %v", tc.verb, tc.res.GVR.Resource, tc.sub, tc.ns, got, tc.want)
+		}
+	}
+	if n := len(s.Called("Can")); n != 0 {
+		t.Errorf("Can was recorded %d times among the calls", n)
+	}
+}
