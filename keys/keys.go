@@ -451,8 +451,20 @@ func (l *List) Lookup(key ssh.PublicKey) (Grant, bool) {
 	return set.Lookup(key)
 }
 
+// Roles returns the roles the keys of the current set name, as
+// Set.Roles does: what the bindings are made for.
+func (l *List) Roles() []Role {
+	l.mu.Lock()
+	set := l.set
+	l.mu.Unlock()
+	return set.Roles()
+}
+
 // Replace makes set the current one and calls every function OnChange
-// was given, in the goroutine of the caller, after the set is in place.
+// was given, in the order they were registered, in the goroutine of the
+// caller, after the set is in place. kosh serve relies on the order: the
+// bindings are made before the sessions of changed keys end, and
+// deleted after.
 func (l *List) Replace(set *Set) {
 	l.mu.Lock()
 	l.set = set

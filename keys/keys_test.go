@@ -582,6 +582,43 @@ func TestListReplaceCallsOnChangeAfterTheSetIsInPlace(t *testing.T) {
 	}
 }
 
+// TestOnChangeOrder pins what kosh serve relies on: the functions are
+// called in the order they were registered, at every Replace, so that the
+// bindings are made before the sessions end and deleted after.
+func TestOnChangeOrder(t *testing.T) {
+	_, line := newKey(t)
+	l := NewList(nil)
+	var calls []string
+	for _, name := range []string{"make", "end", "prune"} {
+		l.OnChange(func() { calls = append(calls, name) })
+	}
+	set, _ := parseString(line + " a/view\n")
+	l.Replace(set)
+	l.Replace(nil)
+	if got := strings.Join(calls, ","); got != "make,end,prune,make,end,prune" {
+		t.Errorf("calls = %s", got)
+	}
+}
+
+func TestListRoles(t *testing.T) {
+	_, a := newKey(t)
+	_, b := newKey(t)
+	set, rejected := parseString(a + " a/view\n" + b + " b/edit@team-a\n")
+	noRejected(t, rejected)
+	l := NewList(set)
+	if got, want := l.Roles(), []Role{clusterRole("view"), nsRole("team-a", "edit")}; !slices.Equal(got, want) {
+		t.Errorf("Roles = %+v, want %+v", got, want)
+	}
+	// What Roles reads is the set Replace put in place, from within
+	// OnChange too.
+	var inChange []Role
+	l.OnChange(func() { inChange = l.Roles() })
+	l.Replace(nil)
+	if got := l.Roles(); len(got) != 0 || len(inChange) != 0 {
+		t.Errorf("after Replace(nil): Roles = %+v, in OnChange %+v", got, inChange)
+	}
+}
+
 func TestListOnChangeMayUseTheList(t *testing.T) {
 	key, line := newKey(t)
 	l := NewList(nil)

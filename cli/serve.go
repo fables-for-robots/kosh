@@ -199,14 +199,14 @@ func loggableStartError(err error) string {
 type running struct {
 	log *slog.Logger
 
-	stopKeys context.CancelFunc // ends the key list's Watch
+	stopKeys context.CancelFunc // ends the key list's Watch and the bindings' retries
 	cluster  *kube.Cluster
 	server   *sshd.Server
 	tcp      net.Listener
 	iroh     *irohnet.Listener
 
-	// wg counts the goroutines start started: the key list's Watch and
-	// each listener's Serve.
+	// wg counts the goroutines start started: the key list's Watch, the
+	// bindings' Run, and each listener's Serve.
 	wg sync.WaitGroup
 	// stopping is set when stop begins: a Serve that returns after it
 	// was asked to.
@@ -250,6 +250,18 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	}
 	cluster := r.cluster
 
+	// The bindings the key list needs (§4 of the roles design) are made
+	// before the SSH server is, so that the first sessions have theirs. At
+	// every change of the list they are made before the sessions of the
+	// keys that changed end, and pruned after: the list calls its OnChange
+	// functions in the order they were registered, and sshd.New registers
+	// the end of the sessions between the two. A failure is logged and
+	// retried by Run, and does not stop kosh: a session whose binding is
+	// missing gets the API's refusals.
+	bindings := kube.NewBindings(cluster, list.Roles, log)
+	list.OnChange(bindings.MakeNow)
+	bindings.MakeNow()
+
 	r.server, err = sshd.New(sshd.Config{
 		HostKeyPEM: st.HostKeyPEM,
 		Keys:       list,
@@ -262,6 +274,13 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	if err != nil {
 		return fmt.Errorf("the SSH server could not be made: %w", err)
 	}
+	list.OnChange(bindings.PruneNow)
+	bindings.PruneNow()
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		bindings.Run(watchCtx)
+	}()
 
 	if o.sshListen != "" {
 		r.tcp, err = net.Listen("tcp", o.sshListen)
