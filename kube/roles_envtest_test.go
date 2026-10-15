@@ -81,6 +81,17 @@ func TestViewCannotReadASecret(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, got, v)
 		}
 	}
+	// Nor describe it: the describers ask as the key too, and the
+	// refusal is logged as the read's.
+	_, err = s.Describe(context.Background(), ref)
+	if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), `"kosh:alice/view"`) {
+		t.Errorf("Describe: %v, want the API's refusal of the key", err)
+	}
+	if recs := r.log.with("refused"); len(recs) != 2 {
+		t.Errorf("records %+v, want the describe's refusal", r.log.all())
+	} else if a, _ := recs[1].attr("action"); a != readDescribe {
+		t.Errorf("the second refusal is of %q, want %q", a, readDescribe)
+	}
 	// view may read what is not a Secret.
 	if _, err := s.YAML(context.Background(), ObjectRef{Resource: readEnvResolve(t, s, "pods"), Namespace: "default", Name: "web"}, false); err != nil {
 		t.Errorf("YAML of a pod: %v", err)

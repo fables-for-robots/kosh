@@ -117,8 +117,13 @@ func auditOneAction(t *testing.T, f *actionFixture) auditRecord {
 		t.Errorf("refusals %+v", r)
 	}
 	r := recs[0]
-	if r.Level != slog.LevelInfo {
-		t.Errorf("level %v, want info", r.Level)
+	// The API's refusal of the role is a warning; anything else is info.
+	want := slog.LevelInfo
+	if e, _ := r.attr("error"); strings.HasPrefix(e, "the API answered Forbidden") || strings.HasPrefix(e, "the API answered Unauthorized") {
+		want = slog.LevelWarn
+	}
+	if r.Level != want {
+		t.Errorf("level %v, want %v", r.Level, want)
 	}
 	for k, v := range map[string]string{"key": fullGrant.Name, "fingerprint": fullGrant.Fingerprint} {
 		if got, _ := r.attr(k); got != v {

@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -85,12 +86,14 @@ func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 	defer release()
 	defer func() {
 		logged := err
-		if ref.Resource.Is("", "secrets") {
+		var api apierrors.APIStatus
+		if ref.Resource.Is("", "secrets") && !errors.As(err, &api) {
 			// logAction already logs an error of the API as its reason
-			// and code. What this adds is the rest: an error that is no
-			// API status, which may still quote the Secret (a webhook's
-			// text passed on in some other form), is logged as "delete
-			// failed".
+			// and code, and at warn level when it is a refusal; it is
+			// given that error as it is. What this adds is the rest: an
+			// error that is no API status, which may still quote the
+			// Secret (a webhook's text passed on in some other form), is
+			// logged as "delete failed".
 			logged = loggableError(actDelete, err)
 		}
 		s.logAction(ctx, actDelete, ref, logged,

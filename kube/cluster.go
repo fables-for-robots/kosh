@@ -132,7 +132,8 @@ func (o Options) withDefaults() Options {
 // newCluster makes a Cluster from clients, without connecting: what New
 // is made of, and what unit tests use with client-go's fakes. typed and
 // dyn are the ServiceAccount's; with cfg, each identity's clients are
-// made from it, and without, they are typed and dyn. resources
+// made from it, and without, none are until a test sets newClients.
+// resources
 // is what discovery would have found; nil means it is read from disc,
 // which may be nil only when resources is not.
 func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interface, disc discovery.DiscoveryInterface, resources []Resource, opts Options) *Cluster {
@@ -154,10 +155,12 @@ func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interf
 		pollers:    map[cacheKey]*metricsPoller{},
 	}
 	if cfg == nil {
-		// Without a configuration there is nothing to impersonate with:
-		// every identity has the clients the Cluster was given.
-		given := &clients{typed: typed, dyn: dyn, openLog: logOpener(typed)}
-		c.newClients = func(*rest.Config) (*clients, error) { return given, nil }
+		// Without a configuration there is nothing to impersonate with,
+		// and no identity gets clients: handing a session the clients
+		// the Cluster was given would make it the ServiceAccount, with
+		// the ServiceAccount's rights, without a word. A test that makes
+		// a Cluster of fakes sets newClients itself.
+		c.newClients = func(*rest.Config) (*clients, error) { return nil, errNoIdentityConfig }
 	}
 	if resources == nil {
 		c.refresh(ctx)

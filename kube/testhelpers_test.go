@@ -25,6 +25,7 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	metadatafake "k8s.io/client-go/metadata/fake"
 	"k8s.io/client-go/rest"
@@ -345,6 +346,14 @@ func (e *env) newClients(cfg *rest.Config) (*clients, error) {
 			return open(ctx, namespace, pod, opts)
 		},
 	}, nil
+}
+
+// givenClients is a factory that gives every identity typed and dyn:
+// for a test that makes a Cluster without a configuration and wants its
+// sessions to reach the clients it made.
+func givenClients(typed kubernetes.Interface, dyn dynamic.Interface) func(*rest.Config) (*clients, error) {
+	given := &clients{typed: typed, dyn: dyn, openLog: logOpener(typed)}
+	return func(*rest.Config) (*clients, error) { return given, nil }
 }
 
 // madeWith returns what the clients of user were made with; ok is false

@@ -10,11 +10,10 @@ import (
 )
 
 // Owner reads the object's metadata alone, with the session's metadata
-// client,
-// and returns its owner: the owner reference that is the controller, or
-// else the first. ErrNoOwner when it has none; an error that names the
-// kind when the owner's kind is not a resource of the cluster. Nothing
-// but the metadata is read: of a Secret, not its data.
+// client, and returns its owner: the owner reference that is the
+// controller, or else the first. ErrNoOwner when it has none; an error
+// that names the kind when the owner's kind is not a resource of the
+// cluster. Nothing but the metadata is read: of a Secret, not its data.
 func (s *session) Owner(ctx context.Context, ref ObjectRef) (ObjectRef, error) {
 	ctx, release := s.bound(ctx)
 	defer release()

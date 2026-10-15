@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -90,10 +91,21 @@ func logOpener(typed kubernetes.Interface) func(ctx context.Context, namespace, 
 	}
 }
 
+// errNoIdentityConfig is what clientsFor returns for a Cluster made
+// without a configuration, unless a test gave it a factory of clients.
+var errNoIdentityConfig = errors.New("no configuration for an identity's clients")
+
 // clientsFor returns the clients of id, made on first use and kept for
 // the Cluster's life: a client is a configuration over the transport
 // client-go shares among configurations of the same TLS, and the key
 // list, so the identities, is bounded.
+//
+// Each identity's clients have their own rate limiter, of Options' QPS
+// and burst, not one shared by every session. The API server's priority
+// and fairness queue the requests by the impersonated user, so that the
+// total is bounded there and one user cannot starve the others; a
+// shared limiter in kosh would undo that, and let one busy session (a
+// drain, a cache that lists again) slow every other.
 func (c *Cluster) clientsFor(id identity) (*clients, error) {
 	c.idMu.Lock()
 	defer c.idMu.Unlock()

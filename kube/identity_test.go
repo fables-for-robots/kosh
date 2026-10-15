@@ -2,11 +2,13 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,9 +69,13 @@ func TestSessionClientsImpersonateTheKey(t *testing.T) {
 
 // With a configuration, the clients are client-go's, and every request
 // of a session carries the key's impersonation, and every request of its
-// role's cache the role's.
+// role's cache the role's. Each of the session's clients is asked once:
+// the dynamic (YAML), the typed (SecretData, the pod of Logs), the
+// metadata (Owner), the log opener (Logs) and the tables (a kind that is
+// not typed), so that a call site that slid back to the ServiceAccount's
+// clients would send a request without the key's name.
 func TestARequestCarriesTheImpersonation(t *testing.T) {
-	type seen struct{ path, user string }
+	type seen struct{ path, as, user string }
 	var (
 		mu       sync.Mutex
 		requests []seen
@@ -77,16 +83,35 @@ func TestARequestCarriesTheImpersonation(t *testing.T) {
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user := r.Header.Get("Impersonate-User")
+		accept := r.Header.Get("Accept")
+		as := ""
+		switch {
+		case strings.Contains(accept, "as=Table"):
+			as = "Table"
+		case strings.Contains(accept, "as=PartialObjectMetadata"):
+			as = "PartialObjectMetadata"
+		}
 		mu.Lock()
-		requests = append(requests, seen{r.URL.Path, user})
+		requests = append(requests, seen{r.URL.Path, as, user})
 		groups[user] = r.Header.Values("Impersonate-Group")
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Query().Get("watch") == "true":
 			<-r.Context().Done()
+		case as == "Table":
+			fmt.Fprint(w, `{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{},"columnDefinitions":[],"rows":[]}`)
+		case as == "PartialObjectMetadata":
+			fmt.Fprint(w, `{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"namespace":"default","name":"settings"}}`)
 		case r.URL.Path == "/api/v1/pods":
 			fmt.Fprint(w, `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[]}`)
+		case r.URL.Path == "/api/v1/namespaces/default/pods/web":
+			fmt.Fprint(w, `{"kind":"Pod","apiVersion":"v1","metadata":{"namespace":"default","name":"web"},"spec":{"containers":[{"name":"web","image":"nginx"}]}}`)
+		case r.URL.Path == "/api/v1/namespaces/default/pods/web/log":
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "2026-10-15T10:00:00Z hello\n")
+		case r.URL.Path == "/api/v1/namespaces/default/secrets/db":
+			fmt.Fprint(w, `{"kind":"Secret","apiVersion":"v1","metadata":{"namespace":"default","name":"db"},"data":{"password":"czNjcjN0"}}`)
 		default:
 			fmt.Fprint(w, `{"kind":"ConfigMap","apiVersion":"v1","metadata":{"namespace":"default","name":"settings"}}`)
 		}
@@ -99,27 +124,54 @@ func TestARequestCarriesTheImpersonation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s := c.Session(ctx, viewGrant).(*session)
+	bg := context.Background()
 
-	ref := ObjectRef{Resource: e.resource(t, "", "configmaps"), Namespace: "default", Name: "settings"}
-	if _, err := s.YAML(context.Background(), ref, false); err != nil {
-		t.Fatal(err)
+	configMaps := e.resource(t, "", "configmaps")
+	settings := ObjectRef{Resource: configMaps, Namespace: "default", Name: "settings"}
+	if _, err := s.YAML(bg, settings, false); err != nil {
+		t.Errorf("YAML: %v", err)
+	}
+	if _, err := s.Owner(bg, settings); !errors.Is(err, ErrNoOwner) {
+		t.Errorf("Owner: %v, want ErrNoOwner", err)
+	}
+	db := ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "db"}
+	if got, err := s.SecretData(bg, db); err != nil || len(got) != 1 || got[0].Value != "s3cr3t" {
+		t.Errorf("SecretData: %v, %v", got, err)
 	}
 	pods := e.resource(t, "", "pods")
+	ls, err := s.Logs(bg, ObjectRef{Resource: pods, Namespace: "default", Name: "web"}, LogOptions{})
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	if lines := readFlatten(readCollect(t, ls)); len(lines) != 1 || lines[0].Text != "hello" {
+		t.Errorf("Logs: %+v", lines)
+	}
+	table, err := s.Watch(Query{Resource: configMaps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
 	w, err := s.Watch(Query{Resource: pods})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	eventually(t, "the pods' list", func() bool {
-		tab := w.Table(time.Now())
-		return tab.Err == nil && !tab.Stale
+	eventually(t, "the pods' list and the table of configmaps", func() bool {
+		tab, cms := w.Table(time.Now()), table.Table(time.Now())
+		return tab.Err == nil && !tab.Stale && cms.Err == nil && !cms.Stale
 	})
 
 	mu.Lock()
 	defer mu.Unlock()
+	const key = "kosh:alice/view"
 	want := []seen{
-		{"/api/v1/namespaces/default/configmaps/settings", "kosh:alice/view"},
-		{"/api/v1/pods", "kosh:clusterrole:view"},
+		{"/api/v1/namespaces/default/configmaps/settings", "", key},                      // YAML: dynamic
+		{"/api/v1/namespaces/default/configmaps/settings", "PartialObjectMetadata", key}, // Owner: metadata
+		{"/api/v1/namespaces/default/secrets/db", "", key},                               // SecretData: typed
+		{"/api/v1/namespaces/default/pods/web", "", key},                                 // Logs: typed
+		{"/api/v1/namespaces/default/pods/web/log", "", key},                             // Logs: the opener
+		{"/api/v1/configmaps", "Table", key},                                             // the tables
+		{"/api/v1/pods", "", "kosh:clusterrole:view"},                                    // the role's cache
 	}
 	for _, r := range want {
 		if !slices.Contains(requests, r) {
@@ -135,6 +187,38 @@ func TestARequestCarriesTheImpersonation(t *testing.T) {
 		if !reflect.DeepEqual(g, []string{"kosh:clusterrole:view"}) {
 			t.Errorf("%s impersonates the groups %v", user, g)
 		}
+	}
+}
+
+// A Cluster without a configuration, and without a factory of a test,
+// gives no identity clients: a session of it is not the ServiceAccount
+// in disguise, and is refused what it asks.
+func TestNoConfigNoClients(t *testing.T) {
+	e := newEnv(t, envConfig{}, readConfigMap())
+	log := newAuditLog()
+	c := newCluster(nil, e.typed, e.dyn, nil, e.c.resourceList(), Options{Log: log.logger()})
+	t.Cleanup(c.Close)
+	e.typed.ClearActions() // the discovery of newEnv's own Cluster
+	e.dyn.ClearActions()
+	if _, err := c.clientsFor(identityOf(fullGrant)); !errors.Is(err, errNoIdentityConfig) {
+		t.Errorf("clientsFor: %v, want errNoIdentityConfig", err)
+	}
+	s := c.Session(context.Background(), fullGrant)
+	if recs := log.with("the clients of a session cannot be made"); len(recs) != 1 {
+		t.Errorf("records %+v, want the session's error", log.all())
+	}
+	ref := ObjectRef{Resource: e.resource(t, "", "configmaps"), Namespace: "default", Name: "settings"}
+	if _, err := s.YAML(context.Background(), ref, false); !errors.Is(err, errNoIdentityConfig) {
+		t.Errorf("YAML: %v, want errNoIdentityConfig", err)
+	}
+	if err := s.Delete(context.Background(), ref, DeleteOptions{}); !errors.Is(err, errNoIdentityConfig) {
+		t.Errorf("Delete: %v, want errNoIdentityConfig", err)
+	}
+	if _, err := s.Watch(Query{Resource: e.resource(t, "", "pods")}); !errors.Is(err, errNoIdentityConfig) {
+		t.Errorf("Watch: %v, want errNoIdentityConfig", err)
+	}
+	if a := append(e.typed.Actions(), e.dyn.Actions()...); len(a) != 0 {
+		t.Errorf("the ServiceAccount's clients were sent %v", a)
 	}
 }
 

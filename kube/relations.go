@@ -18,8 +18,8 @@ func everything(runtime.Object) bool { return true }
 
 // filterOf returns the filter of a query of a typed resource. Without
 // Of it is the namespace. With Of, the owner is read from the API now,
-// once, with api, the session's clients; a pair of resource and owner that has no relation is
-// ErrNoRelation.
+// once, with api, the session's clients; a pair of resource and owner
+// that has no relation is ErrNoRelation.
 func (api *clients) filterOf(ctx context.Context, q Query) (filter, error) {
 	if q.Of == nil {
 		if q.Namespace == "" || !q.Resource.Namespaced {

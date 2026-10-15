@@ -61,8 +61,8 @@ func TestAnActionTheAPIRefusesIsLogged(t *testing.T) {
 		t.Fatalf("records %+v, want one", recs)
 	}
 	r := recs[0]
-	if r.Level != slog.LevelInfo || r.Message != "action" {
-		t.Errorf("level %v, message %q", r.Level, r.Message)
+	if r.Level != slog.LevelWarn || r.Message != "action" {
+		t.Errorf("level %v, message %q; want a warning", r.Level, r.Message)
 	}
 	want := map[string]string{
 		"key":         viewGrant.Name,
@@ -197,6 +197,7 @@ func TestActionsEndWithTheSession(t *testing.T) {
 		e := newEnv(t, envConfig{})
 		log := newAuditLog()
 		c := newCluster(nil, e.typed, dyn, nil, e.c.resourceList(), Options{Log: log.logger()})
+		c.newClients = givenClients(e.typed, dyn)
 		t.Cleanup(c.Close)
 		ctx, end := context.WithCancel(context.Background())
 		t.Cleanup(end)

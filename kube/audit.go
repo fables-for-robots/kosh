@@ -92,7 +92,10 @@ func (s *session) logRefusal(ctx context.Context, what string, ref ObjectRef, at
 // logAction logs a call of an action that began, once the API has
 // answered: the key and its role, the action, the object, the action's
 // own options in attrs, and the error when there is one: a refusal of
-// the API's among them, as "the API answered Forbidden (403)".
+// the API's among them, as "the API answered Forbidden (403)". The line
+// is at info level, and at warn level when the API refused the role, as
+// a refused read is: a key that tries what its role forbids is what an
+// operator watching the warnings wants to see.
 func (s *session) logAction(ctx context.Context, action string, ref ObjectRef, err error, attrs ...slog.Attr) {
 	all := make([]slog.Attr, 0, 6+len(attrs))
 	all = append(all,
@@ -103,6 +106,10 @@ func (s *session) logAction(ctx context.Context, action string, ref ObjectRef, e
 		slog.String("object", ref.String()),
 	)
 	all = append(all, attrs...)
+	level := slog.LevelInfo
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		level = slog.LevelWarn
+	}
 	if err != nil {
 		// Of an error of the API, only its reason and code: the rest may
 		// be a webhook's text, which may quote the object. Of a refused
@@ -113,7 +120,7 @@ func (s *session) logAction(ctx context.Context, action string, ref ObjectRef, e
 		}
 		all = append(all, slog.String("error", err.Error()))
 	}
-	s.c.log.LogAttrs(ctx, slog.LevelInfo, "action", all...)
+	s.c.log.LogAttrs(ctx, level, "action", all...)
 }
 
 // loggableError returns what kind of error err is, in words that hold
