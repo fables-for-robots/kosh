@@ -30,7 +30,9 @@ Roles both; a key the role cannot use is hidden, not refused.
    access, like a line with an option, and is logged with its number and
    the reason (`the name does not end in /<role> or /<role>@<namespace>`).
    A role or namespace that is not a valid Kubernetes name rejects the
-   line the same way.
+   line the same way, and so does a comment with a character that does
+   not show (a control, format or bidi character anywhere in it): what
+   the operator reads must be what kosh reads.
 
 2. **The session has the role's rights, as the API server grants them.**
    Everything kosh does for the session — tables, describe, YAML, the
@@ -73,9 +75,9 @@ Roles both; a key the role cannot use is hidden, not refused.
    `kosh:<key name>` (`kosh:bob@laptop/view`): an audit event's `user`
    is the ServiceAccount and its `impersonatedUser` is the key, with the
    role's group. Today every event says only the ServiceAccount. The
-   reads that fill a shared cache are made as the role's own user
-   `kosh:role:<role>` (§3.3), so that they are not put down to the key
-   that happened to open the cache.
+   reads that fill a shared cache are made as the role's own user, named
+   as its group (§3.3), so that they are not put down to the key that
+   happened to open the cache.
 
 7. **kosh's own log** is as today: every session and every action with
    the key's name and fingerprint, plus the role at session start
@@ -180,10 +182,12 @@ An informer's cache is shared by the sessions that may see the same
 things: **one cache per `(role, gvr)`**, and for a namespaced Role **per
 `(role, gvr, namespace)`**, listing that namespace alone (a cluster-wide
 list by a Role-bound identity is refused, and would show the refusal for
-every namespace). The cache's own requests impersonate the role's user
-`kosh:role:<role>` (`kosh:role:view`, `kosh:role:team-a:edit`) with the
-role's group: the audit log then says that the list was made for the
-role's cache, not for whichever key opened it first. `kindCache` gains the
+every namespace). The cache's own requests impersonate the role's user,
+named as its group is (`kosh:clusterrole:view`,
+`kosh:role:team-a:edit`; the two prefixes keep a ClusterRole `team-a:edit`
+and a Role `edit` in `team-a` apart) with the role's group: the audit
+log then says that the list was made for the role's cache, not for
+whichever key opened it first. `kindCache` gains the
 identity and the namespace; `acquire`/`release`, the idle stop and
 `stopCaches` are as they are, over a map keyed by the triple. A `view`
 session and a `cluster-admin` session of the same kind hold two caches;
