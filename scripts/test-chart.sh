@@ -159,7 +159,7 @@ want=$(yq '.authorizedKeys' "$CI/keys-values.yaml")
 got=$(yq 'select(.kind == "ConfigMap") | .data.authorized_keys' "$OUT/keys.yaml")
 [ "$got" = "$want" ] || fail "keys: authorized_keys differs from authorizedKeys"
 echo "ok   authorized_keys is exactly the text"
-eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("/admin$"))) | length' 1 "one admin line"
+eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("/cluster-admin$"))) | length' 1 "one /cluster-admin line"
 
 # --- narrow-rbac
 render narrow-rbac

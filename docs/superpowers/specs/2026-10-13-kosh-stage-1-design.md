@@ -170,6 +170,11 @@ program listening for the process's signals.
 
 ## 6. The key list
 
+> Replaced, from v0.5.0, by §2 of `2026-10-15-kosh-roles-design.md`: a
+> key's name ends in the Kubernetes role whose rights it has, and kosh
+> makes that role's binding. What follows is the key list of v0.1 to
+> v0.4.
+
 `--authorized-keys` (default `/etc/kosh/authorized_keys`) names a file
 in OpenSSH's `authorized_keys` format: one key to a line, a comment after
 the key, which is the key's name and says what it may do. Empty lines and
@@ -509,6 +514,12 @@ is part of kosh (the text area of `charm.land/bubbles/v2`).
 
 ## 12. Read-only keys
 
+> Replaced, from v0.5.0, by `2026-10-15-kosh-roles-design.md`: there
+> are no read-only keys; a session has its key's role's rights, as the
+> API server grants them, and the keys a role cannot use are hidden
+> (§5 there). A read-only key of v0.4 is a `/view` key. What follows is
+> the read-only key of v0.1 to v0.4.
+
 A read-only session differs in two things.
 
 **It has no actions.** The keys of §11 are not bound for it: they are in
@@ -824,6 +835,16 @@ where it differs from them, this section is what is built. The plan's
   SemVer version.
 - **§18.** A stop tells the sessions before it closes what carries them,
   on both transports; the whole stop takes 10 seconds at most.
+- **§6, §8.1, §12, §15** (v0.5.0, `2026-10-15-kosh-roles-design.md`).
+  A key's name ends in its role, `name/<role>` for a ClusterRole and
+  `name/<role>@<namespace>` for a Role, and the list is §2 of that
+  design; `/admin` is the ClusterRole `admin`. A session is its key:
+  kosh's ServiceAccount impersonates `kosh:<key name>` in the role's
+  group, caches are per role, and kosh makes and prunes the bindings of
+  the roles the list names. Read-only keys are gone with §12, and a
+  key's actions are the ones its role allows, asked of the API server.
+  The chart's `rbac.clusterRole` stays; what the ServiceAccount needs at
+  the least is §7 of that design.
 
 ## Appendix A: the columns
 

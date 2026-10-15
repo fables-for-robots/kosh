@@ -30,6 +30,10 @@ Connect:
 iroh.hostNetwork puts the pod on the node's network: SSH listens on port {{ .Values.ssh.port }} of every address of the node, whatever service.type is.
 {{- end }}
 
-authorizedKeys is the list of who may connect; a key with the option
-read-only is read-only. A full key is as powerful as the ClusterRole
-{{ .Values.rbac.clusterRole }}.
+authorizedKeys is the list of who may connect. A key's name ends in its
+role: name/<role> for a ClusterRole (alice@laptop/cluster-admin,
+bob@laptop/view), name/<role>@<namespace> for a Role in that namespace
+(carol/edit@team-a). A session has the rights of its key's role; kosh
+makes the role's binding. /admin is the ClusterRole admin, not
+cluster-admin. kosh can grant no more than the ClusterRole
+{{ .Values.rbac.clusterRole }} lets it.
