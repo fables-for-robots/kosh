@@ -88,7 +88,7 @@ func firstRead(t *testing.T, w Watch) {
 func TestWatchRefusesWhatIsNoNamespace(t *testing.T) {
 	e := newEnv(t, envConfig{})
 	api := newAPIServer(t)
-	e.c.tables = api.tables(t)
+	e.setTables(api.tables(t))
 	s := e.session(t)
 	widgets := e.resource(t, "example.com", "widgets") // a table of the API server's
 	pods := e.resource(t, "", "pods")                  // a typed kind

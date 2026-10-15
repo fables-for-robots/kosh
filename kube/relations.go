@@ -18,9 +18,9 @@ func everything(runtime.Object) bool { return true }
 
 // filterOf returns the filter of a query of a typed resource. Without
 // Of it is the namespace. With Of, the owner is read from the API now,
-// once; a pair of resource and owner that has no relation is
+// once, with api, the session's clients; a pair of resource and owner that has no relation is
 // ErrNoRelation.
-func (c *Cluster) filterOf(ctx context.Context, q Query) (filter, error) {
+func (api *clients) filterOf(ctx context.Context, q Query) (filter, error) {
 	if q.Of == nil {
 		if q.Namespace == "" || !q.Resource.Namespaced {
 			return everything, nil
@@ -30,7 +30,7 @@ func (c *Cluster) filterOf(ctx context.Context, q Query) (filter, error) {
 	of := *q.Of
 	switch {
 	case q.Resource.Is("", "pods") && of.Resource.Is("", "nodes"):
-		node, err := c.typed.CoreV1().Nodes().Get(ctx, of.Name, metav1.GetOptions{})
+		node, err := api.typed.CoreV1().Nodes().Get(ctx, of.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -40,7 +40,7 @@ func (c *Cluster) filterOf(ctx context.Context, q Query) (filter, error) {
 			return ok && p.Spec.NodeName == name
 		}, nil
 	case q.Resource.Is("", "pods"):
-		namespace, sel, err := c.podSelector(ctx, of)
+		namespace, sel, err := api.podSelector(ctx, of)
 		if err != nil {
 			return nil, err
 		}
@@ -49,7 +49,7 @@ func (c *Cluster) filterOf(ctx context.Context, q Query) (filter, error) {
 			return err == nil && m.GetNamespace() == namespace && sel.Matches(labels.Set(m.GetLabels()))
 		}, nil
 	case q.Resource.Is("batch", "jobs") && of.Resource.Is("batch", "cronjobs"):
-		cj, err := c.typed.BatchV1().CronJobs(of.Namespace).Get(ctx, of.Name, metav1.GetOptions{})
+		cj, err := api.typed.BatchV1().CronJobs(of.Namespace).Get(ctx, of.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -84,7 +84,7 @@ func ownedBy(namespace string, uid types.UID) filter {
 // belong to a deployment, replicaset, statefulset, daemonset, job or
 // service, read from the API now. ErrNoRelation for anything else. A
 // service without a selector gives labels.Nothing().
-func (c *Cluster) podSelector(ctx context.Context, ref ObjectRef) (string, labels.Selector, error) {
+func (api *clients) podSelector(ctx context.Context, ref ObjectRef) (string, labels.Selector, error) {
 	get := metav1.GetOptions{}
 	var (
 		namespace string
@@ -92,37 +92,37 @@ func (c *Cluster) podSelector(ctx context.Context, ref ObjectRef) (string, label
 	)
 	switch {
 	case ref.Resource.Is("apps", "deployments"):
-		o, err := c.typed.AppsV1().Deployments(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().Deployments(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return "", nil, err
 		}
 		namespace, sel = o.Namespace, o.Spec.Selector
 	case ref.Resource.Is("apps", "replicasets"):
-		o, err := c.typed.AppsV1().ReplicaSets(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().ReplicaSets(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return "", nil, err
 		}
 		namespace, sel = o.Namespace, o.Spec.Selector
 	case ref.Resource.Is("apps", "statefulsets"):
-		o, err := c.typed.AppsV1().StatefulSets(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().StatefulSets(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return "", nil, err
 		}
 		namespace, sel = o.Namespace, o.Spec.Selector
 	case ref.Resource.Is("apps", "daemonsets"):
-		o, err := c.typed.AppsV1().DaemonSets(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().DaemonSets(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return "", nil, err
 		}
 		namespace, sel = o.Namespace, o.Spec.Selector
 	case ref.Resource.Is("batch", "jobs"):
-		o, err := c.typed.BatchV1().Jobs(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.BatchV1().Jobs(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return "", nil, err
 		}
 		namespace, sel = o.Namespace, o.Spec.Selector
 	case ref.Resource.Is("", "services"):
-		o, err := c.typed.CoreV1().Services(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.CoreV1().Services(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return "", nil, err
 		}

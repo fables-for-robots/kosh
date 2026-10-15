@@ -242,7 +242,7 @@ func (s *session) checkExec(pod ObjectRef, opts ExecOptions) error {
 	if len(opts.Command) == 0 {
 		return errors.New("there is no command to run")
 	}
-	if s.c.cfg == nil {
+	if s.clients.cfg == nil {
 		return errors.New("the cluster has no API to run a command through")
 	}
 	return nil
@@ -296,7 +296,7 @@ func (t *execTerm) letGo() {
 // container and the command, as kubectl exec builds the request, and
 // runs the stream over WebSocket until it ends.
 func (s *session) stream(ctx context.Context, pod ObjectRef, container string, command []string, opts remotecommand.StreamOptions) error {
-	req := s.c.typed.CoreV1().RESTClient().Post().
+	req := s.clients.typed.CoreV1().RESTClient().Post().
 		Namespace(pod.Namespace).Resource("pods").Name(pod.Name).SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
 			Container: container,
@@ -305,7 +305,7 @@ func (s *session) stream(ctx context.Context, pod ObjectRef, container string, c
 			Stdout:    true,
 			TTY:       true,
 		}, scheme.ParameterCodec)
-	ex, err := remotecommand.NewWebSocketExecutor(s.c.cfg, "GET", req.URL().String())
+	ex, err := remotecommand.NewWebSocketExecutor(s.clients.cfg, "GET", req.URL().String())
 	if err != nil {
 		return err
 	}

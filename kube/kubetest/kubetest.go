@@ -29,9 +29,9 @@ type Call struct {
 // set before the session is used; the Set methods may be called at any
 // time, from any goroutine.
 type Session struct {
-	// GrantValue is what Grant returns. Every method of kube.Actions,
-	// and YAML, Describe and SecretData of a Secret, return
-	// kube.ErrReadOnly when it is read-only, as the real Session does.
+	// GrantValue is what Grant returns. The fake refuses nothing by
+	// it: the API server is what refuses a role, and a test that wants
+	// a refusal puts it into Errs.
 	GrantValue keys.Grant
 	// Version is what ClusterVersion returns.
 	Version string
@@ -231,20 +231,6 @@ func (s *Session) err(method string) error {
 	return s.Errs[method]
 }
 
-func (s *Session) mayChange() error {
-	if s.GrantValue.ReadOnly {
-		return kube.ErrReadOnly
-	}
-	return nil
-}
-
-func (s *Session) maySee(ref kube.ObjectRef) error {
-	if s.GrantValue.ReadOnly && ref.Resource.Is("", "secrets") {
-		return kube.ErrReadOnly
-	}
-	return nil
-}
-
 func (s *Session) Grant() keys.Grant      { return s.GrantValue }
 func (s *Session) ClusterVersion() string { return s.Version }
 
@@ -294,9 +280,6 @@ func (s *Session) ClusterUsage() kube.UsageWatch {
 
 func (s *Session) YAML(_ context.Context, ref kube.ObjectRef, managedFields bool) (string, error) {
 	s.record("YAML", ref, managedFields)
-	if err := s.maySee(ref); err != nil {
-		return "", err
-	}
 	if err := s.err("YAML"); err != nil {
 		return "", err
 	}
@@ -305,9 +288,6 @@ func (s *Session) YAML(_ context.Context, ref kube.ObjectRef, managedFields bool
 
 func (s *Session) Describe(_ context.Context, ref kube.ObjectRef) (string, error) {
 	s.record("Describe", ref)
-	if err := s.maySee(ref); err != nil {
-		return "", err
-	}
 	if err := s.err("Describe"); err != nil {
 		return "", err
 	}
@@ -316,9 +296,6 @@ func (s *Session) Describe(_ context.Context, ref kube.ObjectRef) (string, error
 
 func (s *Session) SecretData(_ context.Context, ref kube.ObjectRef) ([]kube.SecretEntry, error) {
 	s.record("SecretData", ref)
-	if s.GrantValue.ReadOnly {
-		return nil, kube.ErrReadOnly
-	}
 	if err := s.err("SecretData"); err != nil {
 		return nil, err
 	}
@@ -374,9 +351,6 @@ func (s *Session) Replicas(_ context.Context, ref kube.ObjectRef) (int32, error)
 }
 
 func (s *Session) action(method string, args ...any) error {
-	if err := s.mayChange(); err != nil {
-		return err
-	}
 	s.record(method, args...)
 	return s.err(method)
 }

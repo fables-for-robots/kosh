@@ -87,7 +87,7 @@ func genericEnv(t *testing.T, opts Options) (*env, *fakeTables) {
 	t.Helper()
 	e := newEnv(t, envConfig{opts: opts})
 	f := &fakeTables{table: &metav1.Table{ColumnDefinitions: widgetColumns()}}
-	e.c.tables = f
+	e.setTables(f)
 	return e, f
 }
 

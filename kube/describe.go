@@ -30,26 +30,28 @@ var errNoConfig = errors.New("describe needs a connection to the API server, and
 
 // Describe returns what kubectl describe prints of the object, events
 // included: kubectl's describer of its kind, or for a kind that has
-// none, the generic describer. A Secret is refused to a read-only grant
-// before anything is read, and the refusal is logged. The describers take no context: each of
-// their requests, not the describe as a whole, is bounded as
-// describeConfig says.
+// none, the generic describer, made with the session's configuration,
+// so that every request of it is the key's. The API refuses a role that
+// may not get the object, and the refusal is logged. The describers
+// take no context: each of their requests, not the describe as a whole,
+// is bounded as describeConfig says.
 func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
 	ctx, release := s.bound(ctx)
 	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}
-	if err := s.mayRead(ctx, readDescribe, ref); err != nil {
+	api, err := s.api()
+	if err != nil {
 		return "", err
 	}
-	if s.c.cfg == nil {
+	if api.cfg == nil {
 		return "", errNoConfig
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	cfg := describeConfig(ctx, s.c.cfg)
+	cfg := describeConfig(ctx, api.cfg)
 	gvr := ref.Resource.GVR
 	d, ok := describe.DescriberFor(schema.GroupKind{Group: gvr.Group, Kind: ref.Resource.Kind}, cfg)
 	if !ok {
@@ -66,7 +68,11 @@ func (s *session) Describe(ctx context.Context, ref ObjectRef) (string, error) {
 			return "", fmt.Errorf("kosh cannot describe %s", ref)
 		}
 	}
-	return d.Describe(ref.Namespace, ref.Name, describe.DescriberSettings{ShowEvents: true, ChunkSize: describeChunkSize})
+	out, err := d.Describe(ref.Namespace, ref.Name, describe.DescriberSettings{ShowEvents: true, ChunkSize: describeChunkSize})
+	if err != nil {
+		s.logReadRefusal(ctx, readDescribe, ref, err)
+	}
+	return out, err
 }
 
 // describeConfig is the config the describers of one Describe are made

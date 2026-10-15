@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,17 +22,30 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
+	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/render"
 )
 
-// startAPIServer starts kube-apiserver and etcd for one test, and stops
-// them when it ends. It skips the test without KUBEBUILDER_ASSETS.
+// startAPIServer starts kube-apiserver and etcd for one test, with RBAC
+// on, binds the roles of the tests' grants (bindRoles), and stops them
+// when it ends. It returns the configuration of the administrator, which
+// may impersonate anyone. It skips the test without KUBEBUILDER_ASSETS.
 func startAPIServer(t *testing.T) *rest.Config {
+	t.Helper()
+	_, cfg := startEnvtest(t)
+	return cfg
+}
+
+// startEnvtest is startAPIServer, with the environment, whose AddUser
+// makes users.
+func startEnvtest(t *testing.T) (*envtest.Environment, *rest.Config) {
 	t.Helper()
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS is not set: run scripts/envtest-assets.sh")
 	}
 	env := &envtest.Environment{}
+	// envtest's default, said here because the tests of roles rely on it.
+	env.ControlPlane.GetAPIServer().Configure().Set("authorization-mode", "RBAC")
 	cfg, err := env.Start()
 	if err != nil {
 		t.Fatalf("starting the API server: %v", err)
@@ -41,7 +55,105 @@ func startAPIServer(t *testing.T) *rest.Config {
 			t.Errorf("stopping the API server: %v", err)
 		}
 	})
-	return cfg
+	bindRoles(t, cfg)
+	return env, cfg
+}
+
+// testTeamNamespace is the namespace of teamGrant's Role.
+const testTeamNamespace = "team-a"
+
+// bindRoles makes, as admin, the bindings the key list of the tests'
+// grants needs, as kosh's reconciler will: the ClusterRoles cluster-admin
+// and view bound to their groups, and a Role edit in team-a, which may do
+// anything there, bound to its group.
+func bindRoles(t *testing.T, admin *rest.Config) {
+	t.Helper()
+	ctx := context.Background()
+	typed := kubernetes.NewForConfigOrDie(admin)
+	rbac := typed.RbacV1()
+	for _, r := range []keys.Role{fullGrant.Role, viewGrant.Role} {
+		b := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: r.Group()},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: r.Name},
+			Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: r.Group()}},
+		}
+		if _, err := rbac.ClusterRoleBindings().Create(ctx, b, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// envtest runs no controller-manager, whose controller fills the
+	// aggregated ClusterRoles: view is given the rules it aggregates, as
+	// a cluster has them.
+	aggregated, err := rbac.ClusterRoles().Get(ctx, "system:aggregate-to-view", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := rbac.ClusterRoles().Get(ctx, "view", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Rules = aggregated.Rules
+	if _, err := rbac.ClusterRoles().Update(ctx, view, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testTeamNamespace}}
+	if _, err := typed.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testTeamNamespace, Name: teamGrant.Role.Name},
+		Rules:      []rbacv1.PolicyRule{{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}}},
+	}
+	if _, err := rbac.Roles(testTeamNamespace).Create(ctx, role, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testTeamNamespace, Name: "kosh:role:" + teamGrant.Role.Name},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "Role", Name: teamGrant.Role.Name},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "Group", Name: teamGrant.Role.Group()}},
+	}
+	if _, err := rbac.RoleBindings(testTeamNamespace).Create(ctx, rb, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// koshMinimumRules are the least kosh's ServiceAccount needs (§7 of the
+// roles design): to impersonate the keys and the roles, to make the
+// bindings, and to bind the roles it names. Discovery and the version
+// every authenticated subject has.
+var koshMinimumRules = []rbacv1.PolicyRule{
+	{APIGroups: []string{""}, Resources: []string{"users", "groups"}, Verbs: []string{"impersonate"}},
+	{APIGroups: []string{rbacGroup}, Resources: []string{"clusterrolebindings", "rolebindings"},
+		Verbs: []string{"get", "list", "create", "update", "delete"}},
+	{APIGroups: []string{rbacGroup}, Resources: []string{"clusterroles", "roles"}, Verbs: []string{"bind"}},
+}
+
+// startRBACAPIServer is startAPIServer with a user kosh that has no
+// right but koshMinimumRules, as the ServiceAccount of a cluster that
+// gives it the least: it returns the administrator's configuration and
+// kosh's.
+func startRBACAPIServer(t *testing.T) (admin, kosh *rest.Config) {
+	t.Helper()
+	env, admin := startEnvtest(t)
+	ctx := context.Background()
+	rbac := kubernetes.NewForConfigOrDie(admin).RbacV1()
+	role := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "kosh"}, Rules: koshMinimumRules}
+	if _, err := rbac.ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	b := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kosh"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacGroup, Kind: "ClusterRole", Name: "kosh"},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacGroup, Kind: "User", Name: "kosh"}},
+	}
+	if _, err := rbac.ClusterRoleBindings().Create(ctx, b, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := env.AddUser(envtest.User{Name: "kosh"}, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return admin, user.Config()
 }
 
 // newEnvCluster makes a Cluster with New against cfg and the test
@@ -54,7 +166,9 @@ func newEnvCluster(t *testing.T, cfg *rest.Config, opts Options) *Cluster {
 		renderers.extra[gvr] = &testRenderer{gvr: gvr}
 	}
 	opts.Renderers = renderers.For
-	opts.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if opts.Log == nil {
+		opts.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, err := New(ctx, cfg, opts)
@@ -305,10 +419,11 @@ func TestEnvGenericTableOfACustomResource(t *testing.T) {
 
 func TestEnvForbiddenList(t *testing.T) {
 	cfg := startAPIServer(t)
-	nobody := rest.CopyConfig(cfg)
-	nobody.Impersonate = rest.ImpersonationConfig{UserName: "nobody", Groups: []string{"system:authenticated"}}
-	c := newEnvCluster(t, nobody, Options{})
-	s := c.Session(context.Background(), fullGrant)
+	c := newEnvCluster(t, cfg, Options{})
+	// A key whose role nothing binds, as one whose role does not exist:
+	// every table says forbidden.
+	nobody := keys.Grant{Name: "nobody/none", Fingerprint: "SHA256:nobody", Role: keys.Role{Kind: keys.KindClusterRole, Name: "none"}}
+	s := c.Session(context.Background(), nobody)
 	pods, err := s.Resolve(context.Background(), "pods")
 	if err != nil {
 		t.Fatal(err)

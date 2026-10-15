@@ -25,7 +25,7 @@ import (
 func (c *Cluster) idle(gvr schema.GroupVersionResource) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	k := c.caches[gvr]
+	k := c.findCache(gvr)
 	return k != nil && k.users == 0 && k.idle != nil
 }
 
@@ -244,7 +244,7 @@ func TestCloseWithWatchesOpen(t *testing.T) {
 func (c *Cluster) held(gvr schema.GroupVersionResource) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	k := c.caches[gvr]
+	k := c.findCache(gvr)
 	return k != nil && k.users > 0
 }
 
@@ -365,7 +365,7 @@ func TestUsageWatchSignalsOnPollsNotOnNodes(t *testing.T) {
 		}
 		eventually(t, "the node's change in the cache", func() bool {
 			e.c.mu.Lock()
-			k := e.c.caches[render.Nodes]
+			k := e.c.findCache(render.Nodes)
 			e.c.mu.Unlock()
 			o, ok := k.get("", "n1")
 			return ok && o.(*corev1.Node).Labels["test"] == label

@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 
 	"github.com/fables-for-robots/kosh/render"
 )
@@ -41,14 +42,16 @@ func (c *Cluster) metricsServed(gvr schema.GroupVersionResource) bool {
 	return false
 }
 
-// metricsPoller reads the metrics of one kind every opts.MetricsPoll
-// while it has a user, and keeps the last reading. The metrics API can
-// be listed and not watched, so this is what an informer is to a kind
-// that can.
+// metricsPoller reads the metrics of one kind for one role every
+// opts.MetricsPoll while it has a user, and keeps the last reading. The
+// metrics API can be listed and not watched, so this is what an informer
+// is to a kind that can; and it is keyed as the caches are: by the
+// role's identity, the kind, and for a Role the namespace.
 type metricsPoller struct {
-	c      *Cluster
-	gvr    schema.GroupVersionResource
-	cancel context.CancelFunc
+	c       *Cluster
+	key     cacheKey
+	objects dynamic.ResourceInterface // the kind, as key's identity, in its namespace
+	cancel  context.CancelFunc
 
 	users int // guarded by c.mu, as kindCache.users is
 
@@ -60,23 +63,31 @@ type metricsPoller struct {
 	parseLogged bool    // an item that does not parse is in the log
 }
 
-// acquireMetrics returns the poller of gvr, PodMetrics or NodeMetrics,
-// started when it was not running, and counts one more user of it;
-// releaseMetrics counts one less.
-func (c *Cluster) acquireMetrics(gvr schema.GroupVersionResource) (*metricsPoller, error) {
-	if gvr != PodMetrics && gvr != NodeMetrics {
-		return nil, fmt.Errorf("kosh reads no metrics of %s", gvr)
+// acquireMetrics returns the poller of key, whose kind is PodMetrics or
+// NodeMetrics, started when it was not running, and counts one more user
+// of it; releaseMetrics counts one less.
+func (c *Cluster) acquireMetrics(key cacheKey) (*metricsPoller, error) {
+	if key.gvr != PodMetrics && key.gvr != NodeMetrics {
+		return nil, fmt.Errorf("kosh reads no metrics of %s", key.gvr)
+	}
+	api, err := c.clientsFor(key.id)
+	if err != nil {
+		return nil, err
+	}
+	var objects dynamic.ResourceInterface = api.dyn.Resource(key.gvr)
+	if key.namespace != "" {
+		objects = api.dyn.Resource(key.gvr).Namespace(key.namespace)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil, errClosed
 	}
-	p := c.pollers[gvr]
+	p := c.pollers[key]
 	if p == nil {
 		ctx, cancel := context.WithCancel(c.ctx)
-		p = &metricsPoller{c: c, gvr: gvr, cancel: cancel, subs: map[chan struct{}]struct{}{}}
-		c.pollers[gvr] = p
+		p = &metricsPoller{c: c, key: key, objects: objects, cancel: cancel, subs: map[chan struct{}]struct{}{}}
+		c.pollers[key] = p
 		c.wg.Add(1)
 		go p.run(ctx)
 	}
@@ -91,18 +102,18 @@ func (c *Cluster) releaseMetrics(p *metricsPoller) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p.users--
-	if p.users > 0 || c.pollers[p.gvr] != p {
+	if p.users > 0 || c.pollers[p.key] != p {
 		return
 	}
-	delete(c.pollers, p.gvr)
+	delete(c.pollers, p.key)
 	p.cancel()
 }
 
 // stopPollers stops every poller, for Close. c.mu is held.
 func (c *Cluster) stopPollers() {
-	for gvr, p := range c.pollers {
+	for key, p := range c.pollers {
 		p.cancel()
-		delete(c.pollers, gvr)
+		delete(c.pollers, key)
 	}
 }
 
@@ -122,7 +133,8 @@ func (p *metricsPoller) run(ctx context.Context) {
 	}
 }
 
-// list reads the metrics of the whole cluster in one request, keeps the
+// list reads the metrics of the whole cluster, or of the poller's
+// namespace, in one request, keeps the
 // reading or the error, logs a change between the two, and tells the
 // subscribers.
 func (p *metricsPoller) list(ctx context.Context) {
@@ -130,16 +142,16 @@ func (p *metricsPoller) list(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	l, err := p.c.dyn.Resource(p.gvr).List(ctx, metav1.ListOptions{})
+	l, err := p.objects.List(ctx, metav1.ListOptions{})
 	if ctx.Err() != nil {
 		// Released or closed while it listed: nobody wants the answer.
 		return
 	}
 	var r reading
 	if err == nil {
-		r = parseReading(p.gvr, l, p.logParse)
+		r = parseReading(p.key.gvr, l, p.logParse)
 	}
-	kind := p.gvr.GroupResource().String()
+	kind := p.key.gvr.GroupResource().String()
 
 	p.mu.Lock()
 	warn, again := false, false
@@ -154,9 +166,9 @@ func (p *metricsPoller) list(ctx context.Context) {
 
 	switch {
 	case warn:
-		p.c.log.Warn("metrics could not be read", "kind", kind, "err", err)
+		p.c.log.Warn("metrics could not be read", "kind", kind, "as", p.key.id.user, "err", err)
 	case again:
-		p.c.log.Info("metrics can be read again", "kind", kind)
+		p.c.log.Info("metrics can be read again", "kind", kind, "as", p.key.id.user)
 	}
 	p.signal()
 }
@@ -169,7 +181,7 @@ func (p *metricsPoller) logParse(msg string, args ...any) {
 	p.parseLogged = true
 	p.mu.Unlock()
 	if !logged {
-		p.c.log.Warn(msg, append([]any{"kind", p.gvr.GroupResource().String()}, args...)...)
+		p.c.log.Warn(msg, append([]any{"kind", p.key.gvr.GroupResource().String()}, args...)...)
 	}
 }
 

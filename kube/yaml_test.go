@@ -113,49 +113,31 @@ func TestYAML(t *testing.T) {
 	}
 }
 
-func TestYAMLOfASecretIsRefusedReadOnly(t *testing.T) {
+func TestYAMLOfASecret(t *testing.T) {
 	e := newEnv(t, envConfig{}, readSecret())
 	ref := ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "token"}
-
-	ro := readSessionOf(t, e, readOnlyGrant)
-	if _, err := ro.YAML(context.Background(), ref, false); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("read-only: got %v, want ErrReadOnly", err)
-	}
-	if aa := readActionsOn(e, "secrets"); len(aa) != 0 {
-		t.Errorf("read-only: the Secret was read: %v", aa)
-	}
-
 	text, err := e.session(t).YAML(context.Background(), ref, false)
 	if err != nil {
-		t.Fatalf("full: %v", err)
+		t.Fatal(err)
 	}
 	var got corev1.Secret
 	if err := yaml.Unmarshal([]byte(text), &got); err != nil {
 		t.Fatal(err)
 	}
 	if string(got.Data["token"]) != "s3cr3t" {
-		t.Errorf("full: the YAML holds %q, want the Secret's data", got.Data)
+		t.Errorf("the YAML holds %q, want the Secret's data", got.Data)
 	}
 }
 
-func TestDescribeOfASecretIsRefusedReadOnly(t *testing.T) {
+func TestDescribeWithoutAConfig(t *testing.T) {
 	e := newEnv(t, envConfig{}, readSecret())
 	ref := ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "token"}
-
-	ro := readSessionOf(t, e, readOnlyGrant)
-	if _, err := ro.Describe(context.Background(), ref); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("read-only: got %v, want ErrReadOnly", err)
-	}
-	if aa := readActionsOn(e, "secrets"); len(aa) != 0 {
-		t.Errorf("read-only: the Secret was read: %v", aa)
-	}
-
-	// Without a config, a full grant gets as far as the describer, which
-	// says that it needs one; TestEnvDescribeSecretShowsNoValue describes
-	// a Secret for real.
+	// Without a config, Describe gets as far as the describer, which says
+	// that it needs one; TestEnvDescribeOfAnOpaqueSecretShowsNoValue
+	// describes a Secret for real.
 	_, err := e.session(t).Describe(context.Background(), ref)
-	if err == nil || errors.Is(err, ErrReadOnly) || !strings.Contains(err.Error(), "connection") {
-		t.Errorf("full, without a config: got %v, want the error that describe needs a connection", err)
+	if err == nil || !strings.Contains(err.Error(), "connection") {
+		t.Errorf("got %v, want the error that describe needs a connection", err)
 	}
 }
 
@@ -171,32 +153,24 @@ func TestASecretByItsKindIsRefused(t *testing.T) {
 	cm := e.resource(t, "", "configmaps")
 	cm.Kind = "Secret"
 	ref := ObjectRef{Resource: cm, Namespace: "default", Name: "settings"}
-	ro := readSessionOf(t, e, readOnlyGrant)
 	dyn, typed := readActionCounts(e)
-	for _, s := range []*session{ro, e.session(t)} {
+	for _, s := range []*session{readSessionOf(t, e, viewGrant), e.session(t)} {
 		if _, err := s.YAML(context.Background(), ref, false); !errors.Is(err, ErrUnknownResource) {
-			t.Errorf("YAML, read-only %v: got %v, want ErrUnknownResource", s.grant.ReadOnly, err)
+			t.Errorf("YAML, %s: got %v, want ErrUnknownResource", s.grant.Name, err)
 		}
 		if _, err := s.Describe(context.Background(), ref); !errors.Is(err, ErrUnknownResource) {
-			t.Errorf("Describe, read-only %v: got %v, want ErrUnknownResource", s.grant.ReadOnly, err)
+			t.Errorf("Describe, %s: got %v, want ErrUnknownResource", s.grant.Name, err)
 		}
 	}
 	if d, ty := readActionCounts(e); d != dyn || ty != typed {
 		t.Errorf("something was read: %v %v", e.dyn.Actions()[dyn:], e.typed.Actions()[typed:])
-	}
-	// maySee, the last line, refuses it by its kind too.
-	if err := ro.maySee(ref); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("maySee, read-only: got %v, want ErrReadOnly", err)
-	}
-	if err := e.session(t).maySee(ref); err != nil {
-		t.Errorf("maySee, full: got %v", err)
 	}
 }
 
 func TestAReferenceTheClusterDoesNotKnowIsRefused(t *testing.T) {
 	e := newEnv(t, envConfig{}, readSecret(), readConfigMap(), readPodWith("default", "web", nil, "app"))
 	f := &readFakeLogs{}
-	e.c.openLog = f.open
+	e.setOpenLog(f.open)
 	ctx := context.Background()
 	with := func(change func(*Resource)) Resource {
 		r := e.resource(t, "", "configmaps")
@@ -233,7 +207,7 @@ func TestAReferenceTheClusterDoesNotKnowIsRefused(t *testing.T) {
 		// Of the "." resource, the name "secrets" would be the path of
 		// every Secret of the namespace.
 		ref := ObjectRef{Resource: tc.res, Namespace: "default", Name: "secrets"}
-		for _, s := range []*session{readSessionOf(t, e, readOnlyGrant), e.session(t)} {
+		for _, s := range []*session{readSessionOf(t, e, viewGrant), e.session(t)} {
 			dyn, typed := readActionCounts(e)
 			calls := map[string]error{}
 			_, calls["YAML"] = s.YAML(ctx, ref, false)
@@ -244,16 +218,14 @@ func TestAReferenceTheClusterDoesNotKnowIsRefused(t *testing.T) {
 			_, calls["Logs"] = s.Logs(ctx, ref, LogOptions{})
 			_, calls["Watch Containers"] = s.Watch(Query{Resource: Containers, Of: &ref})
 			_, calls["Watch Rules"] = s.Watch(Query{Resource: Rules, Of: &ref})
-			if !s.grant.ReadOnly {
-				_, calls["SecretData"] = s.SecretData(ctx, ref)
-			}
+			_, calls["SecretData"] = s.SecretData(ctx, ref)
 			for m, err := range calls {
 				if !errors.Is(err, ErrUnknownResource) {
-					t.Errorf("%s, read-only %v, %s: got %v, want ErrUnknownResource", tc.name, s.grant.ReadOnly, m, err)
+					t.Errorf("%s, %s, %s: got %v, want ErrUnknownResource", tc.name, s.grant.Name, m, err)
 				}
 			}
 			if d, ty := readActionCounts(e); d != dyn || ty != typed {
-				t.Errorf("%s, read-only %v: something was read: %v %v", tc.name, s.grant.ReadOnly, e.dyn.Actions()[dyn:], e.typed.Actions()[typed:])
+				t.Errorf("%s, %s: something was read: %v %v", tc.name, s.grant.Name, e.dyn.Actions()[dyn:], e.typed.Actions()[typed:])
 			}
 		}
 	}

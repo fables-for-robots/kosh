@@ -14,18 +14,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
 )
 
 // errClosed is what acquire returns once the Cluster is closed.
 var errClosed = errors.New("the connection to the cluster is closed")
 
-// kindCache is the informer of one kind: one for the whole Cluster, of
-// all namespaces, over the dynamic client, whose objects are converted
-// into their typed structs before they are stored.
+// cacheKey names one cache: the identity it lists and watches as (a
+// role's), its kind, and its namespace, "" for every namespace.
+type cacheKey struct {
+	id        identity
+	gvr       schema.GroupVersionResource
+	namespace string
+}
+
+// kindCache is the informer of one kind for one role: shared by the
+// sessions of the role, of every namespace for a ClusterRole and of one
+// for a Role, over the dynamic client of the role's identity, whose
+// objects are converted into their typed structs before they are
+// stored.
 type kindCache struct {
 	c        *Cluster
-	gvr      schema.GroupVersionResource
+	key      cacheKey
 	zero     func() runtime.Object
 	typ      reflect.Type // of what zero returns
 	informer cache.SharedIndexInformer
@@ -43,21 +54,22 @@ type kindCache struct {
 	convertLogged bool
 }
 
-// acquire returns the cache of a typed kind, started when it was not
-// running, and counts one more user of it; release counts one less.
-func (c *Cluster) acquire(gvr schema.GroupVersionResource) (*kindCache, error) {
+// acquire returns the cache of key, of a typed kind, started when it
+// was not running, and counts one more user of it; release counts one
+// less.
+func (c *Cluster) acquire(key cacheKey) (*kindCache, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil, errClosed
 	}
-	k := c.caches[gvr]
+	k := c.caches[key]
 	if k == nil {
 		var err error
-		if k, err = c.startCache(gvr); err != nil {
+		if k, err = c.startCache(key); err != nil {
 			return nil, err
 		}
-		c.caches[gvr] = k
+		c.caches[key] = k
 	}
 	k.users++
 	k.stopTimer()
@@ -70,7 +82,7 @@ func (c *Cluster) release(k *kindCache) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k.users--
-	if k.users > 0 || c.closed || c.caches[k.gvr] != k {
+	if k.users > 0 || c.closed || c.caches[k.key] != k {
 		return
 	}
 	k.gen++
@@ -99,10 +111,10 @@ func (c *Cluster) stopIdle(k *kindCache, gen int) {
 	defer c.wg.Done()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed || k.users > 0 || k.gen != gen || c.caches[k.gvr] != k {
+	if c.closed || k.users > 0 || k.gen != gen || c.caches[k.key] != k {
 		return
 	}
-	delete(c.caches, k.gvr)
+	delete(c.caches, k.key)
 	k.idle = nil
 	k.cancel()
 }
@@ -112,10 +124,10 @@ func (c *Cluster) stopCaches() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
-	for gvr, k := range c.caches {
+	for key, k := range c.caches {
 		k.stopTimer()
 		k.cancel()
-		delete(c.caches, gvr)
+		delete(c.caches, key)
 	}
 	c.stopPollers()
 }
@@ -129,16 +141,26 @@ type listWatch struct {
 
 func (listWatch) IsWatchListSemanticsUnSupported() bool { return true }
 
-// startCache makes the cache of gvr and starts its informer. c.mu is
-// held.
-func (c *Cluster) startCache(gvr schema.GroupVersionResource) (*kindCache, error) {
+// startCache makes the cache of key and starts its informer, which
+// lists and watches as key's identity, in key's namespace when it has
+// one. c.mu is held.
+func (c *Cluster) startCache(key cacheKey) (*kindCache, error) {
+	gvr := key.gvr
 	if _, ok := c.zeroOf(gvr); !ok {
 		return nil, fmt.Errorf("kosh has no type for %s", gvr)
+	}
+	api, err := c.clientsFor(key.id)
+	if err != nil {
+		return nil, err
+	}
+	var objects dynamic.ResourceInterface = api.dyn.Resource(gvr)
+	if key.namespace != "" {
+		objects = api.dyn.Resource(gvr).Namespace(key.namespace)
 	}
 	ctx, cancel := context.WithCancel(c.ctx)
 	k := &kindCache{
 		c:      c,
-		gvr:    gvr,
+		key:    key,
 		cancel: cancel,
 		subs:   map[chan struct{}]struct{}{},
 	}
@@ -150,7 +172,7 @@ func (c *Cluster) startCache(gvr schema.GroupVersionResource) (*kindCache, error
 
 	lw := listWatch{&cache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
-			list, err := c.dyn.Resource(gvr).List(ctx, opts)
+			list, err := objects.List(ctx, opts)
 			if ctx.Err() == nil {
 				k.listed(err)
 			}
@@ -160,7 +182,7 @@ func (c *Cluster) startCache(gvr schema.GroupVersionResource) (*kindCache, error
 			return list, nil
 		},
 		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			w, err := c.dyn.Resource(gvr).Watch(ctx, opts)
+			w, err := objects.Watch(ctx, opts)
 			if err != nil {
 				if ctx.Err() == nil {
 					k.setStale(true)
@@ -220,7 +242,7 @@ func (k *kindCache) transform(obj any) (any, error) {
 		k.convertLogged = true
 		k.mu.Unlock()
 		if !logged {
-			k.c.log.Warn("an object does not convert to its type and is left out", "resource", k.gvr.String(),
+			k.c.log.Warn("an object does not convert to its type and is left out", "resource", k.key.gvr.String(),
 				"namespace", u.GetNamespace(), "name", u.GetName(), "err", err)
 		}
 		return &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Namespace: u.GetNamespace(), Name: u.GetName()}}, nil

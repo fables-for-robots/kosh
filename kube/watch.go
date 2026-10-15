@@ -90,11 +90,19 @@ func (s *session) watchTyped(q Query) (Watch, error) {
 	if !ok {
 		return nil, fmt.Errorf("kosh has no renderer for %s", q.Resource.GVR)
 	}
-	f, err := s.c.filterOf(s.ctx, q)
+	api, err := s.api()
 	if err != nil {
 		return nil, err
 	}
-	k, err := s.c.acquire(q.Resource.GVR)
+	f, err := api.filterOf(s.ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	namespace := q.Namespace
+	if q.Of != nil {
+		namespace = q.Of.Namespace
+	}
+	k, err := s.c.acquire(s.cacheKey(q.Resource, namespace))
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +121,7 @@ func (s *session) watchTyped(q Query) (Watch, error) {
 			// The cache's signals and the poller's are one Changed.
 			ch := newChanges()
 			w.metered = m
-			w.metrics = &metricsHold{c: s.c, gvr: gvr, changed: ch}
+			w.metrics = &metricsHold{c: s.c, key: metricsKeyOf(k, gvr), changed: ch}
 			w.changed = ch
 			w.stopCache = ch.forward(s.c, changed)
 		}
@@ -122,6 +130,12 @@ func (s *session) watchTyped(q Query) (Watch, error) {
 	w.stopAfter = context.AfterFunc(s.ctx, w.Close)
 	w.mu.Unlock()
 	return w, nil
+}
+
+// metricsKeyOf returns the key of the metrics poller of kind gvr that
+// meters the rows of k: of k's role, and of its namespace.
+func metricsKeyOf(k *kindCache, gvr schema.GroupVersionResource) cacheKey {
+	return cacheKey{id: k.key.id, gvr: gvr, namespace: k.key.namespace}
 }
 
 // metricsOf returns the kind of the metrics API that meters r: PodMetrics
@@ -217,7 +231,7 @@ func (w *typedWatch) Close() {
 // signals are forwarded into the watch's Changed.
 type metricsHold struct {
 	c       *Cluster
-	gvr     schema.GroupVersionResource
+	key     cacheKey // of the poller
 	changed changes
 
 	mu     sync.Mutex
@@ -233,19 +247,19 @@ type metricsHold struct {
 // opened before metrics-server was installed picks it up, and one opened
 // before it was removed lets it go.
 func (h *metricsHold) follow() *metricsPoller {
-	served := h.c.metricsServed(h.gvr)
+	served := h.c.metricsServed(h.key.gvr)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	switch {
 	case h.closed:
 		return nil
 	case served && h.poller == nil:
-		p, err := h.c.acquireMetrics(h.gvr)
+		p, err := h.c.acquireMetrics(h.key)
 		if err != nil {
 			// After Close of the Cluster there is nothing to say.
 			if !errors.Is(err, errClosed) && !h.logged {
 				h.logged = true
-				h.c.log.Warn("metrics cannot be read for a table", "kind", h.gvr.GroupResource().String(), "err", err)
+				h.c.log.Warn("metrics cannot be read for a table", "kind", h.key.gvr.GroupResource().String(), "err", err)
 			}
 			return nil
 		}

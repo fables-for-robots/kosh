@@ -31,12 +31,12 @@ func (s *session) Cordon(ctx context.Context, node ObjectRef, on bool) (err erro
 	if err := kindIs(action, node, nodeKinds...); err != nil {
 		return err
 	}
-	return s.cordon(ctx, &kubedrain.Helper{Ctx: ctx, Client: s.c.typed, Out: io.Discard, ErrOut: io.Discard}, node.Name, on)
+	return s.cordon(ctx, &kubedrain.Helper{Ctx: ctx, Client: s.clients.typed, Out: io.Discard, ErrOut: io.Discard}, node.Name, on)
 }
 
 // cordon sets or clears the unschedulable flag of the node with h.
 func (s *session) cordon(ctx context.Context, h *kubedrain.Helper, name string, on bool) error {
-	n, err := s.c.typed.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	n, err := s.clients.typed.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -67,7 +67,7 @@ func (s *session) Drain(ctx context.Context, node ObjectRef, opts DrainOptions) 
 	if err := kindIs(actDrain, node, nodeKinds...); err != nil {
 		return err
 	}
-	h := newDrainHelper(ctx, s.c.typed, opts, out)
+	h := newDrainHelper(ctx, s.clients.typed, opts, out)
 	if err := s.cordon(ctx, h, node.Name, true); err != nil {
 		return err
 	}

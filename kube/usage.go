@@ -7,6 +7,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/fables-for-robots/kosh/keys"
 )
 
 // usageWatch is the cluster's use of its nodes, for the header. While
@@ -25,10 +27,17 @@ import (
 // next, not from a node's status update between two polls. A node's
 // allocatable rarely changes, and the next poll's Current reads it from
 // the cache. Close closes Changed.
+//
+// The poller and the cache are the session's role's, shared with every
+// session of the role. A Role cannot grant nodes, which are of no
+// namespace, so the watch of a Role-bound session never takes the hold
+// and is never Served: its header has no lines.
 type usageWatch struct {
-	c        *Cluster
-	changed  chan struct{}
-	stopTick func()
+	c           *Cluster
+	role        identity // whose poller and cache the hold is
+	clusterRole bool     // the role is a ClusterRole, which may grant nodes
+	changed     chan struct{}
+	stopTick    func()
 
 	closeOnce sync.Once
 
@@ -49,7 +58,7 @@ type usageWatch struct {
 }
 
 func (s *session) ClusterUsage() UsageWatch {
-	w := &usageWatch{c: s.c, changed: make(chan struct{}, 1)}
+	w := &usageWatch{c: s.c, role: s.role, clusterRole: s.grant.Role.Kind != keys.KindRole, changed: make(chan struct{}, 1)}
 	// The poller and the cache may be another session's, synced and with
 	// a reading, and signal nothing until they change: the consumer is
 	// not to wait for that to see what Current says. The signal is sent
@@ -88,7 +97,7 @@ func (w *usageWatch) notify() {
 // listed, which leaves Current without a percentage.
 func (w *usageWatch) follow() (*metricsPoller, *kindCache) {
 	nodes, ok := w.c.resourceFor("", "Node")
-	served := ok && nodes.Typed && w.c.metricsServed(NodeMetrics)
+	served := w.clusterRole && ok && nodes.Typed && w.c.metricsServed(NodeMetrics)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	switch {
@@ -112,12 +121,12 @@ func (w *usageWatch) follow() (*metricsPoller, *kindCache) {
 // held.
 func (w *usageWatch) take(nodes Resource) {
 	c := w.c
-	k, err := c.acquire(nodes.GVR)
+	k, err := c.acquire(cacheKey{id: w.role, gvr: nodes.GVR})
 	if err != nil {
 		w.logTake(err)
 		return
 	}
-	p, err := c.acquireMetrics(NodeMetrics)
+	p, err := c.acquireMetrics(cacheKey{id: w.role, gvr: NodeMetrics})
 	if err != nil {
 		c.release(k)
 		w.logTake(err)

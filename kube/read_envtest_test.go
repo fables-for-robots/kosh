@@ -242,7 +242,7 @@ func TestEnvOrdinaryReferencesAreRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	readEnvWidget(t, cfg, c, "sprocket")
-	s := c.Session(ctx, readOnlyGrant)
+	s := c.Session(ctx, fullGrant)
 	pod := ObjectRef{Resource: readEnvResolve(t, s, "pods"), Namespace: "default", Name: "web"}
 	deploy := ObjectRef{Resource: readEnvResolve(t, s, "deployments"), Namespace: "default", Name: "web"}
 	widget := ObjectRef{Resource: readEnvResolve(t, s, "widgets"), Namespace: "default", Name: "sprocket"}

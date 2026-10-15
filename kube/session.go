@@ -7,32 +7,41 @@ import (
 )
 
 // session is the Session of one SSH session: the Cluster, the session's
-// context, which ends every watch it opened, and its grant.
+// context, which ends every watch it opened, its grant, and what it acts
+// as. Every request it makes is made with clients, its key's own; the
+// tables of the typed kinds come from the caches of its role, which
+// act as the role.
 type session struct {
 	c     *Cluster
 	ctx   context.Context
 	grant keys.Grant
+
+	self       identity // the key's: "kosh:<key name>" and the role's group
+	role       identity // the role's, whose caches and pollers the session shares
+	clients    *clients // of self; nil when clientsErr says why
+	clientsErr error
 }
 
 var _ Session = (*session)(nil)
 
-// mayChange returns ErrReadOnly for a read-only grant.
-func (s *session) mayChange() error {
-	if s.grant.ReadOnly {
-		return ErrReadOnly
-	}
-	return nil
+// api returns the session's clients, or why there are none.
+func (s *session) api() (*clients, error) {
+	return s.clients, s.clientsErr
 }
 
-// maySee returns ErrReadOnly for a read-only grant and a Secret: a
-// reference that is one by its group and resource, or by its group and
-// kind. A read asks mayRead, which logs the refusal, not maySee.
-func (s *session) maySee(ref ObjectRef) error {
-	secret := ref.Resource.Is("", "secrets") || ref.Resource.GVR.Group == "" && ref.Resource.Kind == "Secret"
-	if s.grant.ReadOnly && secret {
-		return ErrReadOnly
+// cacheKey returns the key of the cache a session reads the objects of
+// r from, for rows of namespace ("" for every namespace). The cache is
+// its role's. A ClusterRole's caches are of every namespace, as the
+// role may list them; a Role's are of namespace alone, since the API
+// refuses a Role's list of every namespace. A Role-bound session that
+// asks for another namespace gets that namespace's cache, which the API
+// refuses too: its table shows the refusal.
+func (s *session) cacheKey(r Resource, namespace string) cacheKey {
+	k := cacheKey{id: s.role, gvr: r.GVR}
+	if s.grant.Role.Kind == keys.KindRole && r.Namespaced {
+		k.namespace = namespace
 	}
-	return nil
+	return k
 }
 
 // bound returns a context that ends when ctx ends or when the session

@@ -14,21 +14,23 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// YAML reads the object with the dynamic client now and returns it as
-// YAML, with its resourceVersion, which Update needs, and without
-// managedFields unless they are asked for. A Secret is refused to a
-// read-only grant before anything is read, and the refusal is logged.
+// YAML reads the object with the session's dynamic client now and
+// returns it as YAML, with its resourceVersion, which Update needs, and
+// without managedFields unless they are asked for. The API refuses a
+// role that may not get the object, and the refusal is logged.
 func (s *session) YAML(ctx context.Context, ref ObjectRef, managedFields bool) (string, error) {
 	ctx, release := s.bound(ctx)
 	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return "", err
 	}
-	if err := s.mayRead(ctx, readYAML, ref); err != nil {
+	api, err := s.api()
+	if err != nil {
 		return "", err
 	}
-	o, err := s.c.dyn.Resource(ref.Resource.GVR).Namespace(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	o, err := api.dyn.Resource(ref.Resource.GVR).Namespace(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
+		s.logReadRefusal(ctx, readYAML, ref, err)
 		return "", err
 	}
 	if !managedFields {

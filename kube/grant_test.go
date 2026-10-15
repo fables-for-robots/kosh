@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
@@ -38,53 +39,38 @@ func TestEveryMethodOfActionsTakesAContextAndReturnsAnError(t *testing.T) {
 	}
 }
 
-func TestReadOnlyGrantIsRefusedEveryAction(t *testing.T) {
-	f := actionEnv(t, readOnlyGrant, nil, pod("default", "web", nil))
-	v := reflect.ValueOf(f.s)
-	for i := 0; i < actionsType.NumMethod(); i++ {
-		m := actionsType.Method(i)
-		args := make([]reflect.Value, m.Type.NumIn())
-		args[0] = reflect.ValueOf(context.Background())
-		for j := 1; j < len(args); j++ {
-			args[j] = reflect.Zero(m.Type.In(j))
-		}
-		f.log.reset()
-		out := v.MethodByName(m.Name).Call(args)
-		err, _ := out[len(out)-1].Interface().(error)
-		if !errors.Is(err, ErrReadOnly) {
-			t.Errorf("%s: %v, want ErrReadOnly", m.Name, err)
-		}
-		if recs, all := f.log.with("refused"), f.log.all(); len(recs) != 1 || len(all) != 1 || recs[0].Level != slog.LevelWarn {
-			t.Errorf("%s: records %+v, want one refusal", m.Name, all)
-		}
+// kosh refuses no action of a key by its role: the action is sent, the
+// API refuses it, and the action's line logs the API's answer with the
+// key and its role.
+func TestAnActionTheAPIRefusesIsLogged(t *testing.T) {
+	forbid := func(e *env) {
+		e.dyn.PrependReactor("delete", "configmaps", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, "settings", errors.New("view may not delete"))
+		})
 	}
-	if a := f.typed.Actions(); len(a) != 0 {
-		t.Errorf("the clientset was sent %v", a)
+	f := actionEnv(t, viewGrant, forbid)
+	ref := f.ref(t, "", "configmaps", "default", "settings")
+	if err := f.s.Delete(context.Background(), ref, DeleteOptions{}); !apierrors.IsForbidden(err) {
+		t.Fatalf("Delete: %v, want the API's refusal", err)
 	}
-	if a := f.dyn.Actions(); len(a) != 0 {
-		t.Errorf("the dynamic client was sent %v", a)
-	}
-}
-
-func TestRefusalIsLogged(t *testing.T) {
-	f := actionEnv(t, readOnlyGrant, nil)
-	ref := f.ref(t, "apps", "deployments", "default", "web")
-	if err := f.s.Scale(context.Background(), ref, 3); !errors.Is(err, ErrReadOnly) {
-		t.Fatalf("Scale: %v", err)
+	if a := f.dyn.Actions(); len(a) != 1 || a[0].GetVerb() != "delete" {
+		t.Errorf("the dynamic client was sent %v, want the delete", a)
 	}
 	recs := f.log.all()
 	if len(recs) != 1 {
 		t.Fatalf("records %+v, want one", recs)
 	}
 	r := recs[0]
-	if r.Level != slog.LevelWarn || r.Message != "refused" {
+	if r.Level != slog.LevelInfo || r.Message != "action" {
 		t.Errorf("level %v, message %q", r.Level, r.Message)
 	}
 	want := map[string]string{
-		"key":         readOnlyGrant.Name,
-		"fingerprint": readOnlyGrant.Fingerprint,
-		"action":      "scale",
-		"object":      "deployments/default/web",
+		"key":         viewGrant.Name,
+		"fingerprint": viewGrant.Fingerprint,
+		"role":        "ClusterRole/view",
+		"action":      "delete",
+		"object":      "configmaps/default/settings",
+		"error":       "the API answered Forbidden (403)",
 	}
 	for k, v := range want {
 		if got, ok := r.attr(k); !ok || got != v {
@@ -93,7 +79,7 @@ func TestRefusalIsLogged(t *testing.T) {
 	}
 }
 
-// endedSession returns a session of f's Cluster with a full grant, and
+// endedSession returns a session of f's Cluster with fullGrant, and
 // the function that ends it, as sshd does when the key is removed.
 func endedSession(t *testing.T, f *actionFixture) (*session, context.CancelFunc) {
 	t.Helper()

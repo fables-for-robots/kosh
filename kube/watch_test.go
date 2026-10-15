@@ -316,31 +316,11 @@ func TestWatchChangedDoesNotBlock(t *testing.T) {
 	}
 }
 
-func TestGrantChecks(t *testing.T) {
+func TestGrantIsTheSessions(t *testing.T) {
 	e := newEnv(t, envConfig{})
-	secret := ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "s"}
-	configMap := ObjectRef{Resource: e.resource(t, "", "configmaps"), Namespace: "default", Name: "c"}
-
 	full := e.c.Session(context.Background(), fullGrant).(*session)
-	ro := e.c.Session(context.Background(), readOnlyGrant).(*session)
-	if full.Grant() != fullGrant || ro.Grant() != readOnlyGrant {
+	view := e.c.Session(context.Background(), viewGrant).(*session)
+	if full.Grant() != fullGrant || view.Grant() != viewGrant {
 		t.Error("Grant is not the session's")
-	}
-	if err := full.mayChange(); err != nil {
-		t.Errorf("full mayChange: %v", err)
-	}
-	if err := ro.mayChange(); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("read-only mayChange: %v", err)
-	}
-	for _, ref := range []ObjectRef{secret, configMap} {
-		if err := full.maySee(ref); err != nil {
-			t.Errorf("full maySee %s: %v", ref, err)
-		}
-	}
-	if err := ro.maySee(secret); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("read-only maySee of a Secret: %v", err)
-	}
-	if err := ro.maySee(configMap); err != nil {
-		t.Errorf("read-only maySee of a ConfigMap: %v", err)
 	}
 }

@@ -11,10 +11,11 @@ import (
 	"github.com/fables-for-robots/kosh/kube"
 )
 
-// The fake keeps the rule of the real Session: every method of
-// kube.Actions refuses a read-only grant, and records nothing.
-func TestReadOnlyGrantIsRefusedEveryAction(t *testing.T) {
-	s := New(keys.Grant{Name: "guest", ReadOnly: true})
+// The fake refuses nothing by the grant, as the real Session does not:
+// the API server refuses a role, and a test that wants that puts the
+// refusal into Errs.
+func TestAViewGrantIsRefusedNothing(t *testing.T) {
+	s := New(keys.Grant{Name: "guest/view", Role: keys.Role{Kind: keys.KindClusterRole, Name: "view"}})
 	actions := reflect.TypeOf((*kube.Actions)(nil)).Elem()
 	v := reflect.ValueOf(s)
 	for i := 0; i < actions.NumMethod(); i++ {
@@ -24,31 +25,24 @@ func TestReadOnlyGrantIsRefusedEveryAction(t *testing.T) {
 			args = append(args, reflect.Zero(m.Type.In(a)))
 		}
 		out := v.MethodByName(m.Name).Call(args)
-		err, _ := out[len(out)-1].Interface().(error)
-		if !errors.Is(err, kube.ErrReadOnly) {
-			t.Errorf("%s: %v, want ErrReadOnly", m.Name, err)
+		if err, _ := out[len(out)-1].Interface().(error); err != nil {
+			t.Errorf("%s: %v", m.Name, err)
 		}
 	}
-	if calls := s.Calls(); len(calls) != 0 {
-		t.Errorf("recorded %v", calls)
+	if calls := s.Calls(); len(calls) != actions.NumMethod() {
+		t.Errorf("recorded %d calls, want %d", len(calls), actions.NumMethod())
 	}
-}
 
-func TestReadOnlyGrantSeesNoSecret(t *testing.T) {
-	s := New(keys.Grant{Name: "guest", ReadOnly: true})
 	ref := Ref("secrets", "default", "db")
-	ctx := context.Background()
-	if _, err := s.YAML(ctx, ref, false); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("YAML: %v", err)
+	s.Secrets[ref.String()] = []kube.SecretEntry{{Key: "password", Value: "hunter2"}}
+	got, err := s.SecretData(context.Background(), ref)
+	if err != nil || len(got) != 1 || got[0].Value != "hunter2" {
+		t.Errorf("SecretData: %v, %v", got, err)
 	}
-	if _, err := s.Describe(ctx, ref); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("Describe: %v", err)
-	}
-	if _, err := s.SecretData(ctx, ref); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("SecretData: %v", err)
-	}
-	if _, err := s.YAML(ctx, Ref("configmaps", "default", "cfg"), false); err != nil {
-		t.Errorf("YAML of a configmap: %v", err)
+	forbidden := errors.New("secrets \"db\" is forbidden")
+	s.Errs["SecretData"] = forbidden
+	if _, err := s.SecretData(context.Background(), ref); !errors.Is(err, forbidden) {
+		t.Errorf("SecretData with a refusal in Errs: %v", err)
 	}
 }
 

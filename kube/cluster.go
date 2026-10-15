@@ -3,19 +3,16 @@ package kube
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -54,7 +51,12 @@ type Options struct {
 type Cluster struct {
 	_ noCopy
 
-	cfg     *rest.Config // nil in unit tests
+	// cfg is the ServiceAccount's configuration, from which every
+	// identity's is made; nil in unit tests.
+	cfg *rest.Config
+	// typed and dyn are the ServiceAccount's own clients, for what kosh
+	// asks for itself (§3.2 of the roles design). Nothing of a session
+	// is read or done with them: a session has its identity's clients.
 	typed   kubernetes.Interface
 	dyn     dynamic.Interface
 	log     *slog.Logger
@@ -65,13 +67,13 @@ type Cluster struct {
 	// zeroOf returns a new, empty object of a typed kind, which the
 	// informers convert what the API sends into: render.Zero.
 	zeroOf func(schema.GroupVersionResource) (runtime.Object, bool)
-	tables tableLister // nil without cfg, until a test sets its fake
-	// meta reads objects' metadata alone; nil without cfg, until a test
-	// sets its fake.
-	meta metadata.Interface
-	// openLog opens the log of one container of a pod: the typed
-	// client's GetLogs(…).Stream. Tests give streams of their own.
-	openLog func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
+
+	// newClients makes the clients of one identity from its
+	// configuration: newClients with a cfg, the clients the Cluster was
+	// given without one. Tests give a factory of fakes.
+	newClients func(*rest.Config) (*clients, error)
+	idMu       sync.Mutex
+	identities map[identity]*clients
 
 	// ctx is done when Close is called; everything the Cluster runs
 	// ends with it, and wg waits for it to have ended.
@@ -86,8 +88,8 @@ type Cluster struct {
 	lastMiss time.Time // of the last discovery that Resolve asked for
 
 	mu      sync.Mutex
-	caches  map[schema.GroupVersionResource]*kindCache
-	pollers map[schema.GroupVersionResource]*metricsPoller
+	caches  map[cacheKey]*kindCache
+	pollers map[cacheKey]*metricsPoller
 	closed  bool
 }
 
@@ -128,38 +130,34 @@ func (o Options) withDefaults() Options {
 }
 
 // newCluster makes a Cluster from clients, without connecting: what New
-// is made of, and what unit tests use with client-go's fakes. resources
+// is made of, and what unit tests use with client-go's fakes. typed and
+// dyn are the ServiceAccount's; with cfg, each identity's clients are
+// made from it, and without, they are typed and dyn. resources
 // is what discovery would have found; nil means it is read from disc,
 // which may be nil only when resources is not.
 func newCluster(cfg *rest.Config, typed kubernetes.Interface, dyn dynamic.Interface, disc discovery.DiscoveryInterface, resources []Resource, opts Options) *Cluster {
 	opts = opts.withDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Cluster{
-		cfg:    cfg,
-		typed:  typed,
-		dyn:    dyn,
-		log:    opts.Log,
-		opts:   opts,
-		disc:   disc,
-		zeroOf: render.Zero,
-		openLog: func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
-			return typed.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
-		},
-		ctx:     ctx,
-		cancel:  cancel,
-		caches:  map[schema.GroupVersionResource]*kindCache{},
-		pollers: map[schema.GroupVersionResource]*metricsPoller{},
+		cfg:        cfg,
+		typed:      typed,
+		dyn:        dyn,
+		log:        opts.Log,
+		opts:       opts,
+		disc:       disc,
+		zeroOf:     render.Zero,
+		newClients: newClients,
+		identities: map[identity]*clients{},
+		ctx:        ctx,
+		cancel:     cancel,
+		caches:     map[cacheKey]*kindCache{},
+		pollers:    map[cacheKey]*metricsPoller{},
 	}
-	if cfg != nil {
-		tables, err := newRESTTables(cfg)
-		if err != nil {
-			c.log.Error("the API server's tables cannot be read", "err", err)
-		} else {
-			c.tables = tables
-		}
-		if c.meta, err = metadata.NewForConfig(cfg); err != nil {
-			c.log.Error("the API server's metadata cannot be read", "err", err)
-		}
+	if cfg == nil {
+		// Without a configuration there is nothing to impersonate with:
+		// every identity has the clients the Cluster was given.
+		given := &clients{typed: typed, dyn: dyn, openLog: logOpener(typed)}
+		c.newClients = func(*rest.Config) (*clients, error) { return given, nil }
 	}
 	if resources == nil {
 		c.refresh(ctx)
@@ -242,10 +240,18 @@ func New(ctx context.Context, cfg *rest.Config, opts Options) (*Cluster, error) 
 	return c, nil
 }
 
-// Session returns the handle of one SSH session. Everything it opens
-// ends when ctx is done.
+// Session returns the handle of one SSH session, which acts as the
+// grant's key: every request it makes impersonates the key's user and
+// its role's group, and its tables are read from the caches of its role.
+// Everything it opens ends when ctx is done.
 func (c *Cluster) Session(ctx context.Context, grant keys.Grant) Session {
-	return &session{c: c, ctx: ctx, grant: grant}
+	s := &session{c: c, ctx: ctx, grant: grant, self: identityOf(grant), role: roleIdentity(grant.Role)}
+	s.clients, s.clientsErr = c.clientsFor(s.self)
+	if s.clientsErr != nil {
+		c.log.Error("the clients of a session cannot be made", "key", grant.Name, "fingerprint", grant.Fingerprint,
+			"role", grant.Role.String(), "err", s.clientsErr)
+	}
+	return s
 }
 
 // Version returns the version of the API server, as New read it: "v1.33.1".

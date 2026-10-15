@@ -21,10 +21,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/duration"
+	"k8s.io/apimachinery/pkg/watch"
 	fakediscovery "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	metadatafake "k8s.io/client-go/metadata/fake"
+	"k8s.io/client-go/rest"
 
 	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/render"
@@ -294,13 +297,161 @@ func newDynamicFake(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	}, us...)
 }
 
-// env is a Cluster on client-go's fakes, and the fakes.
+// env is a Cluster on client-go's fakes, and the fakes. Every identity
+// gets the same fakes, through a factory that records what each
+// identity's clients were made with and, for the dynamic client, as whom
+// each list and watch was sent.
 type env struct {
 	c         *Cluster
 	dyn       *dynamicfake.FakeDynamicClient
 	typed     *fake.Clientset
+	meta      *metadatafake.FakeMetadataClient
 	disc      *testDiscovery
 	renderers *testRenderers
+
+	mu       sync.Mutex
+	made     map[string]rest.ImpersonationConfig // by user: what the identity's clients were made with
+	requests []sentRequest                       // the gets, lists and watches of the dynamic client
+	tables   tableLister                         // nil: the API's tables cannot be read
+	openLog  func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
+}
+
+// sentRequest is one get, list or watch of the dynamic client: as whom,
+// of what, and in which namespace ("" for every one).
+type sentRequest struct {
+	user, verb string
+	gvr        schema.GroupVersionResource
+	namespace  string
+}
+
+// newClients is the env's factory of clients: the fakes, recorded.
+func (e *env) newClients(cfg *rest.Config) (*clients, error) {
+	user := cfg.Impersonate.UserName
+	e.mu.Lock()
+	e.made[user] = cfg.Impersonate
+	e.mu.Unlock()
+	return &clients{
+		typed:  e.typed,
+		dyn:    recordingDynamic{Interface: e.dyn, user: user, e: e},
+		meta:   e.meta,
+		tables: envTables{e},
+		openLog: func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
+			e.mu.Lock()
+			open := e.openLog
+			e.mu.Unlock()
+			if open == nil {
+				open = logOpener(e.typed)
+			}
+			return open(ctx, namespace, pod, opts)
+		},
+	}, nil
+}
+
+// madeWith returns what the clients of user were made with; ok is false
+// when none were.
+func (e *env) madeWith(user string) (imp rest.ImpersonationConfig, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	imp, ok = e.made[user]
+	return imp, ok
+}
+
+// sent returns the gets, lists and watches of the dynamic client so far.
+func (e *env) sent() []sentRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]sentRequest(nil), e.requests...)
+}
+
+func (e *env) record(r sentRequest) {
+	e.mu.Lock()
+	e.requests = append(e.requests, r)
+	e.mu.Unlock()
+}
+
+// setTables sets what the API's tables are read with.
+func (e *env) setTables(t tableLister) {
+	e.mu.Lock()
+	e.tables = t
+	e.mu.Unlock()
+}
+
+// setOpenLog sets what opens the log of a container.
+func (e *env) setOpenLog(open func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)) {
+	e.mu.Lock()
+	e.openLog = open
+	e.mu.Unlock()
+}
+
+// envTables reads the tables with what the env has when it is asked.
+type envTables struct{ e *env }
+
+func (t envTables) listTable(ctx context.Context, r Resource, namespace string) (*metav1.Table, error) {
+	t.e.mu.Lock()
+	tables := t.e.tables
+	t.e.mu.Unlock()
+	if tables == nil {
+		return nil, errors.New("the test gave no tables")
+	}
+	return tables.listTable(ctx, r, namespace)
+}
+
+// recordingDynamic is a dynamic client that records each get, list and
+// watch with the user it was made for.
+type recordingDynamic struct {
+	dynamic.Interface
+	user string
+	e    *env
+}
+
+func (d recordingDynamic) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return recordingResource{NamespaceableResourceInterface: d.Interface.Resource(gvr), d: d, gvr: gvr}
+}
+
+type recordingResource struct {
+	dynamic.NamespaceableResourceInterface
+	d   recordingDynamic
+	gvr schema.GroupVersionResource
+}
+
+func (r recordingResource) Namespace(ns string) dynamic.ResourceInterface {
+	return recordingNamespaced{ResourceInterface: r.NamespaceableResourceInterface.Namespace(ns), r: r, namespace: ns}
+}
+
+func (r recordingResource) Get(ctx context.Context, name string, opts metav1.GetOptions, sub ...string) (*unstructured.Unstructured, error) {
+	r.d.e.record(sentRequest{user: r.d.user, verb: "get", gvr: r.gvr})
+	return r.NamespaceableResourceInterface.Get(ctx, name, opts, sub...)
+}
+
+func (r recordingResource) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	r.d.e.record(sentRequest{user: r.d.user, verb: "list", gvr: r.gvr})
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+func (r recordingResource) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	r.d.e.record(sentRequest{user: r.d.user, verb: "watch", gvr: r.gvr})
+	return r.NamespaceableResourceInterface.Watch(ctx, opts)
+}
+
+type recordingNamespaced struct {
+	dynamic.ResourceInterface
+	r         recordingResource
+	namespace string
+}
+
+func (n recordingNamespaced) Get(ctx context.Context, name string, opts metav1.GetOptions, sub ...string) (*unstructured.Unstructured, error) {
+	n.r.d.e.record(sentRequest{user: n.r.d.user, verb: "get", gvr: n.r.gvr, namespace: n.namespace})
+	return n.ResourceInterface.Get(ctx, name, opts, sub...)
+}
+
+func (n recordingNamespaced) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	n.r.d.e.record(sentRequest{user: n.r.d.user, verb: "list", gvr: n.r.gvr, namespace: n.namespace})
+	return n.ResourceInterface.List(ctx, opts)
+}
+
+func (n recordingNamespaced) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	n.r.d.e.record(sentRequest{user: n.r.d.user, verb: "watch", gvr: n.r.gvr, namespace: n.namespace})
+	return n.ResourceInterface.Watch(ctx, opts)
 }
 
 // envConfig says how newEnv makes the Cluster.
@@ -322,7 +473,9 @@ func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 	e := &env{
 		dyn:       newDynamicFake(objs...),
 		typed:     fake.NewSimpleClientset(objs...),
+		meta:      metadataFake(objs),
 		renderers: newTestRenderers(),
+		made:      map[string]rest.ImpersonationConfig{},
 	}
 	e.disc = &testDiscovery{FakeDiscovery: e.typed.Discovery().(*fakediscovery.FakeDiscovery), fail: map[string]bool{}}
 	rr := cfg.resources
@@ -348,7 +501,7 @@ func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 		opts.Renderers = render.For
 	}
 	e.c = newCluster(nil, e.typed, e.dyn, e.disc, nil, opts)
-	e.c.meta = metadataFake(objs)
+	e.c.newClients = e.newClients
 	if !cfg.real {
 		e.c.zeroOf = testZero
 	}
@@ -356,18 +509,37 @@ func newEnv(t *testing.T, cfg envConfig, objs ...runtime.Object) *env {
 	return e
 }
 
+// The grants of the tests: a key of cluster-admin, which most tests
+// use, one of view, and one of the Role edit in team-a.
 var (
-	fullGrant     = keys.Grant{Name: "full", Fingerprint: "SHA256:full"}
-	readOnlyGrant = keys.Grant{Name: "ro", Fingerprint: "SHA256:ro", ReadOnly: true}
+	fullGrant = keys.Grant{Name: "full/cluster-admin", Fingerprint: "SHA256:full",
+		Role: keys.Role{Kind: keys.KindClusterRole, Name: "cluster-admin"}}
+	viewGrant = keys.Grant{Name: "alice/view", Fingerprint: "SHA256:alice",
+		Role: keys.Role{Kind: keys.KindClusterRole, Name: "view"}}
+	teamGrant = keys.Grant{Name: "carol/edit@team-a", Fingerprint: "SHA256:carol",
+		Role: keys.Role{Kind: keys.KindRole, Namespace: "team-a", Name: "edit"}}
 )
 
-// session returns a session of the Cluster with a full grant, which ends
+// fullKey is the key of the cache of gvr that the sessions of fullGrant
+// share.
+func fullKey(gvr schema.GroupVersionResource) cacheKey {
+	return cacheKey{id: roleIdentity(fullGrant.Role), gvr: gvr}
+}
+
+// session returns a session of the Cluster with fullGrant, which ends
 // with the test.
 func (e *env) session(t *testing.T) *session {
 	t.Helper()
+	return e.sessionOf(t, fullGrant)
+}
+
+// sessionOf returns a session of the Cluster with grant, which ends with
+// the test.
+func (e *env) sessionOf(t *testing.T, grant keys.Grant) *session {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return e.c.Session(ctx, fullGrant).(*session)
+	return e.c.Session(ctx, grant).(*session)
 }
 
 // resource returns the resource of the Cluster with the plural name and
@@ -431,11 +603,38 @@ func toUnstructured(t *testing.T, obj runtime.Object) *unstructured.Unstructured
 	return &unstructured.Unstructured{Object: m}
 }
 
-// running reports whether the informer of gvr runs.
+// running reports whether an informer of gvr runs, of any role.
 func (c *Cluster) running(gvr schema.GroupVersionResource) bool {
+	return c.cacheOf(gvr) != nil
+}
+
+// cacheOf returns a running cache of gvr, of any role; nil when none
+// runs.
+func (c *Cluster) cacheOf(gvr schema.GroupVersionResource) *kindCache {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.caches[gvr] != nil
+	return c.findCache(gvr)
+}
+
+// findCache is cacheOf with c.mu held.
+func (c *Cluster) findCache(gvr schema.GroupVersionResource) *kindCache {
+	for key, k := range c.caches {
+		if key.gvr == gvr {
+			return k
+		}
+	}
+	return nil
+}
+
+// cacheKeys returns the keys of the running caches.
+func (c *Cluster) cacheKeys() []cacheKey {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := make([]cacheKey, 0, len(c.caches))
+	for key := range c.caches {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // metadataFake returns a fake metadata client that holds the metadata
