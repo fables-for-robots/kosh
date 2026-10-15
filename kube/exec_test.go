@@ -31,7 +31,7 @@ import (
 )
 
 // execFixture is a Cluster whose clients reach a server of the test's
-// own, which stands for the API, and a session of it with a full grant.
+// own, which stands for the API, and a session of it with fullGrant.
 type execFixture struct {
 	c        *Cluster
 	s        *session

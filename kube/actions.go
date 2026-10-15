@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,7 +31,7 @@ import (
 // objectClient returns the dynamic client of ref's resource, in
 // ref.Namespace when the resource is namespaced.
 func (s *session) objectClient(ref ObjectRef) dynamic.ResourceInterface {
-	r := s.c.dyn.Resource(ref.Resource.GVR)
+	r := s.clients.dyn.Resource(ref.Resource.GVR)
 	if ref.Resource.Namespaced {
 		return r.Namespace(ref.Namespace)
 	}
@@ -85,12 +86,14 @@ func (s *session) Delete(ctx context.Context, ref ObjectRef, opts DeleteOptions)
 	defer release()
 	defer func() {
 		logged := err
-		if ref.Resource.Is("", "secrets") {
+		var api apierrors.APIStatus
+		if ref.Resource.Is("", "secrets") && !errors.As(err, &api) {
 			// logAction already logs an error of the API as its reason
-			// and code. What this adds is the rest: an error that is no
-			// API status, which may still quote the Secret (a webhook's
-			// text passed on in some other form), is logged as "delete
-			// failed".
+			// and code, and at warn level when it is a refusal; it is
+			// given that error as it is. What this adds is the rest: an
+			// error that is no API status, which may still quote the
+			// Secret (a webhook's text passed on in some other form), is
+			// logged as "delete failed".
 			logged = loggableError(actDelete, err)
 		}
 		s.logAction(ctx, actDelete, ref, logged,
@@ -248,7 +251,7 @@ func (s *session) Scale(ctx context.Context, ref ObjectRef, replicas int32) (err
 		return fmt.Errorf("cannot scale %s to %d replicas", ref, replicas)
 	}
 	var sc scaleClient
-	apps := s.c.typed.AppsV1()
+	apps := s.clients.typed.AppsV1()
 	switch {
 	case ref.Resource.Is("apps", "deployments"):
 		sc = apps.Deployments(ref.Namespace)
@@ -381,7 +384,7 @@ func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error
 	if err := kindIs("roll back to", replicaSet, rsKinds...); err != nil {
 		return err
 	}
-	rs, err := s.c.typed.AppsV1().ReplicaSets(replicaSet.Namespace).Get(ctx, replicaSet.Name, metav1.GetOptions{})
+	rs, err := s.clients.typed.AppsV1().ReplicaSets(replicaSet.Namespace).Get(ctx, replicaSet.Name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -400,14 +403,14 @@ func (s *session) Rollback(ctx context.Context, replicaSet ObjectRef) (err error
 	}
 	// The deployment of that name must be the one the reference is to,
 	// not another made since under the same name.
-	deployment, err := s.c.typed.AppsV1().Deployments(rs.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+	deployment, err := s.clients.typed.AppsV1().Deployments(rs.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) || err == nil && deployment.UID != owner.UID {
 		return fmt.Errorf("replicaset %s belongs to a deployment that no longer exists", name)
 	}
 	if err != nil {
 		return err
 	}
-	rb, err := polymorphichelpers.RollbackerFor(schema.GroupKind{Group: "apps", Kind: "Deployment"}, s.c.typed)
+	rb, err := polymorphichelpers.RollbackerFor(schema.GroupKind{Group: "apps", Kind: "Deployment"}, s.clients.typed)
 	if err != nil {
 		return err
 	}
@@ -442,11 +445,11 @@ func (s *session) Trigger(ctx context.Context, cronJob ObjectRef) (job string, e
 	if err := kindIs("trigger", cronJob, cronJobKinds...); err != nil {
 		return "", err
 	}
-	cj, err := s.c.typed.BatchV1().CronJobs(cronJob.Namespace).Get(ctx, cronJob.Name, metav1.GetOptions{})
+	cj, err := s.clients.typed.BatchV1().CronJobs(cronJob.Namespace).Get(ctx, cronJob.Name, metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
-	created, err := s.c.typed.BatchV1().Jobs(cj.Namespace).Create(ctx, jobFromCronJob(cj, manualJobName(cj.Name)), metav1.CreateOptions{})
+	created, err := s.clients.typed.BatchV1().Jobs(cj.Namespace).Create(ctx, jobFromCronJob(cj, manualJobName(cj.Name)), metav1.CreateOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -511,7 +514,7 @@ func (s *session) SetSuspended(ctx context.Context, cronJob ObjectRef, suspended
 	if err != nil {
 		return err
 	}
-	_, err = s.c.typed.BatchV1().CronJobs(cronJob.Namespace).Patch(ctx, cronJob.Name, types.MergePatchType, body, metav1.PatchOptions{})
+	_, err = s.clients.typed.BatchV1().CronJobs(cronJob.Namespace).Patch(ctx, cronJob.Name, types.MergePatchType, body, metav1.PatchOptions{})
 	return err
 }
 

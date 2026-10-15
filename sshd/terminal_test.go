@@ -472,7 +472,7 @@ func TestInputEndsWhenItIsClosed(t *testing.T) {
 func TestInputIsBounded(t *testing.T) {
 	hv := newHandover(nil)
 	h := handoverHarness(t, hv)
-	tm := openTerm(t, h.dial(h.key("ann", false), "u"))
+	tm := openTerm(t, h.dial(h.key(admin("ann")), "u"))
 	tm.waitFor("LASTLINE")
 	sess := h.onlySession()
 
@@ -629,7 +629,7 @@ func next(t *testing.T, turns chan held) held {
 func startHandover(t *testing.T, hv *handover, opts ...option) (*harness, *term) {
 	t.Helper()
 	h := handoverHarness(t, hv, opts...)
-	tm := openTerm(t, h.dial(h.key("ann", false), "u"))
+	tm := openTerm(t, h.dial(h.key(admin("ann")), "u"))
 	if !hv.atStart {
 		tm.waitFor("LASTLINE")
 	}
@@ -1255,7 +1255,7 @@ func TestSessionEndsDuringACommand(t *testing.T) {
 				return ctx.Err()
 			})
 			h := handoverHarness(t, hv)
-			cl := h.dial(h.key("ann", false), "u")
+			cl := h.dial(h.key(admin("ann")), "u")
 			tm := openTerm(t, cl)
 			tm.waitFor("LASTLINE")
 			tm.press("!")
@@ -1347,7 +1347,7 @@ func TestCommandThatDoesNotReturn(t *testing.T) {
 				return nil
 			})
 			h := handoverHarness(t, hv, withServer(func(s *Server) { s.endTimeout = 200 * time.Millisecond }))
-			cl := h.dial(h.key("ann", false), "u")
+			cl := h.dial(h.key(admin("ann")), "u")
 			tm := openTerm(t, cl)
 			tm.waitFor("LASTLINE")
 			tm.press("!")
@@ -1486,7 +1486,7 @@ func TestCommandPanics(t *testing.T) {
 
 	// The terminal of another session is handed over as ever.
 	hv.note(func() { hv.run = hv.echo })
-	tm = openTerm(t, h.dial(h.key("bob", false), "u"))
+	tm = openTerm(t, h.dial(h.key(admin("bob")), "u"))
 	tm.waitFor("LASTLINE")
 	tm.press("!")
 	hv.wait(t, "the command has begun", func() bool { return hv.began == 2 })
@@ -1803,7 +1803,7 @@ func TestSessionEndsWhileTheClientDoesNotRead(t *testing.T) {
 				return ctx.Err()
 			})
 			h := handoverHarness(t, hv, withServer(func(s *Server) { s.endTimeout = endTimeout }))
-			u := openUnread(t, h, h.key("ann", false))
+			u := openUnread(t, h, h.key(admin("ann")))
 			if _, err := u.stdin.Write([]byte("!")); err != nil {
 				t.Fatal(err)
 			}
@@ -1888,7 +1888,7 @@ func TestKeyTypedWhileATurnEnds(t *testing.T) {
 		return nil
 	})
 	h := handoverHarness(t, hv)
-	u := openUnread(t, h, h.key("ann", false))
+	u := openUnread(t, h, h.key(admin("ann")))
 	if _, err := u.stdin.Write([]byte("!")); err != nil {
 		t.Fatal(err)
 	}
@@ -2584,7 +2584,7 @@ func TestInputWithoutAnEventEndsTheSession(t *testing.T) {
 func TestTwentyFloodedSessions(t *testing.T) {
 	hv := newHandover(nil)
 	h := handoverHarness(t, hv)
-	cl := h.dial(h.key("ann", false), "u")
+	cl := h.dial(h.key(admin("ann")), "u")
 	before := heapNow()
 	var ending []int
 	for i, f := range floods {
@@ -2891,7 +2891,7 @@ func TestEndsAreStillFast(t *testing.T) {
 	h := handoverHarness(t, hv)
 	var quitTotal, endTotal time.Duration
 	for i := range n {
-		cl := h.dial(h.key(fmt.Sprintf("q%d", i), false), "u")
+		cl := h.dial(h.key(admin(fmt.Sprintf("q%d", i))), "u")
 		tm := openTerm(t, cl)
 		tm.waitFor("LASTLINE")
 		began := time.Now()
@@ -2907,7 +2907,7 @@ func TestEndsAreStillFast(t *testing.T) {
 	lines := append([]string(nil), h.lines...)
 	for i := range n {
 		e := newSigner(t)
-		setKeys(t, h.list, append(lines, keyLine(e, fmt.Sprintf("e%d", i), false))...)
+		setKeys(t, h.list, append(lines, keyLine(e, admin(fmt.Sprintf("e%d", i))))...)
 		tm := openTerm(t, h.dial(e, "u"))
 		tm.waitFor("LASTLINE")
 		began := time.Now()

@@ -1,17 +1,21 @@
 // Package keys is the list of accepted keys: the file in OpenSSH's
-// authorized_keys format that says whose SSH key kosh accepts, and
-// whether as an admin or read-only.
+// authorized_keys format that says whose SSH key kosh accepts, and as
+// which Kubernetes role.
 //
 // A line is a key and, after it, a comment that is the key's name. The
-// name decides what the key may do: one that ends in /admin is an admin,
-// who may do everything kosh does; any other is read-only. A line with
-// an option, and a line that does not parse, is rejected: it gives no
-// access. Empty lines and lines that begin with # are skipped.
+// name ends in the role whose rights a session of the key has: after its
+// last /, "view" is the ClusterRole view and "edit@team-a" the Role edit
+// in the namespace team-a. A line without a name or a role, with a name
+// that holds a character that does not show, with a role or namespace
+// that Kubernetes would not take, with an option, or that does not parse,
+// is rejected: it gives no access. Empty lines and lines that begin with
+// # are skipped.
 package keys
 
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -19,29 +23,147 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/ssh"
+	apipath "k8s.io/apimachinery/pkg/api/validation/path"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
-
-// AdminSuffix ends the name of a key that is an admin. It is this, in
-// this case, at the very end of the name.
-const AdminSuffix = "/admin"
 
 // Grant is what the key list says about one key.
 type Grant struct {
-	// Name is the key's comment, or its fingerprint when it has none. An
-	// admin's ends in AdminSuffix.
+	// Name is the key's comment, the whole of it: "bob@laptop/view".
 	Name string
 	// Fingerprint is the SHA256 fingerprint of the key, as ssh-keygen -l
 	// prints it: "SHA256:…".
 	Fingerprint string
-	// ReadOnly is true for a key that may change nothing and read no
-	// Secret's contents: every key whose name does not end in AdminSuffix.
-	ReadOnly bool
+	// Role is the role the name ends in, whose rights a session has.
+	Role Role
+}
+
+// User returns the user a session of the grant impersonates:
+// "kosh:" + Name.
+func (g Grant) User() string { return "kosh:" + g.Name }
+
+// The kinds of Role.
+const (
+	KindClusterRole = "ClusterRole"
+	KindRole        = "Role"
+)
+
+// Role is the Kubernetes role a key's name ends in.
+type Role struct {
+	// Kind is KindClusterRole or KindRole.
+	Kind string
+	// Namespace is set for a Role, empty for a ClusterRole.
+	Namespace string
+	Name      string
+}
+
+// Group returns the group that carries the role's binding for the kosh
+// instance named instance: "kosh:<instance>:clusterrole:<role>" or
+// "kosh:<instance>:role:<namespace>:<role>". Two instances of kosh that
+// serve one cluster never share a group, nor so a binding.
+func (r Role) Group(instance string) string {
+	if r.Kind == KindRole {
+		return "kosh:" + instance + ":role:" + r.Namespace + ":" + r.Name
+	}
+	return "kosh:" + instance + ":clusterrole:" + r.Name
+}
+
+// DefaultInstance is the name of a kosh instance that is given none.
+const DefaultInstance = "kosh"
+
+// instanceName is what an instance's name may be made of.
+var instanceName = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$`)
+
+// CheckInstance returns why name cannot name a kosh instance, or nil: it
+// is a path segment without ":", of lower-case letters, digits, "." and
+// "-", 63 at most, and neither "." nor "..", since it is in the names of
+// groups and bindings.
+func CheckInstance(name string) error {
+	if !instanceName.MatchString(name) || name == "." || name == ".." {
+		return fmt.Errorf("the instance %q is not a name: lower-case letters, digits, . and -, 63 at most, beginning and ending with a letter or a digit", name)
+	}
+	return nil
+}
+
+// String returns the role as kosh's log shows it: "ClusterRole/view" or
+// "Role/team-a/edit".
+func (r Role) String() string {
+	if r.Kind == KindRole {
+		return r.Kind + "/" + r.Namespace + "/" + r.Name
+	}
+	return r.Kind + "/" + r.Name
+}
+
+// Why a comment names no key: it is empty, it holds what cannot be
+// seen, it has no role after a /, or nothing before it; or the role or
+// namespace is not one Kubernetes takes.
+const (
+	reasonNoComment    = "no name, no role"
+	reasonHidden       = "the name holds a character that does not show"
+	reasonNoRole       = "the name does not end in /<role> or /<role>@<namespace>"
+	reasonNoName       = "a key needs a name before its role"
+	reasonBadRole      = "the role is not a name: no /, not . or .., no %"
+	reasonBadNamespace = "the namespace is not a DNS label: lower-case letters, digits and dashes, 63 at most"
+)
+
+// ParseRole splits a key's comment, without the space around it, into the
+// name before its last / and the role after it. A comment that names no
+// role, or one Kubernetes would not take, returns why: reason is "" when
+// name and role are good.
+func ParseRole(comment string) (name string, role Role, reason string) {
+	comment = strings.TrimSpace(comment)
+	if comment == "" {
+		return "", Role{}, reasonNoComment
+	}
+	// A control, format or other unseen character could make the line
+	// show one role and grant another: an escape that hides the role, a
+	// carriage return that draws it over the name, a bidi mark that
+	// reorders them. The name also goes into the audit log and the header.
+	if strings.ContainsFunc(comment, func(r rune) bool { return !unicode.IsPrint(r) || unicode.Is(unicode.Cf, r) }) {
+		return "", Role{}, reasonHidden
+	}
+	slash := strings.LastIndexByte(comment, '/')
+	if slash < 0 {
+		return "", Role{}, reasonNoRole
+	}
+	name, last := comment[:slash], comment[slash+1:]
+	roleName, namespace, namespaced := strings.Cut(last, "@")
+	switch {
+	case roleName == "":
+		return "", Role{}, reasonNoRole
+	case name == "":
+		return "", Role{}, reasonNoName
+	case strings.Contains(namespace, "@"):
+		return "", Role{}, fmt.Sprintf("the role %q has more than one @", last)
+	}
+	// Kubernetes takes a role whose name holds a space; in a key's name it
+	// is a mistake, such as a comment that goes on after the role.
+	if strings.ContainsRune(roleName, ' ') {
+		return "", Role{}, fmt.Sprintf("the role %q holds a space", roleName)
+	}
+	if len(apipath.IsValidPathSegmentName(roleName)) > 0 {
+		return "", Role{}, reasonBadRole
+	}
+	if !namespaced {
+		return name, Role{Kind: KindClusterRole, Name: roleName}, ""
+	}
+	if namespace == "" {
+		return "", Role{}, fmt.Sprintf("the role %q has no namespace after its @", roleName)
+	}
+	if len(validation.IsDNS1123Label(namespace)) > 0 {
+		return "", Role{}, reasonBadNamespace
+	}
+	return name, Role{Kind: KindRole, Namespace: namespace, Name: roleName}, ""
 }
 
 // Rejected is a line of the key list that gives no access, and why.
@@ -52,15 +174,21 @@ type Rejected struct {
 
 // Set is one reading of the key list. The zero value and nil hold no key.
 type Set struct {
-	grants map[string]Grant // by the key's wire format
+	grants map[string]listed // by the key's wire format
+}
+
+// listed is a key's grant and the line it is on.
+type listed struct {
+	Grant
+	line int
 }
 
 // Parse reads a key list. It does not fail: a line it cannot accept is in
 // the rejected ones, and the others are in the set. A key that is on more
-// than one line is read-only unless every line names it an admin, and has
-// the name of its first line.
+// than one line has the name and role of its first; a later line that
+// names another role is rejected.
 func Parse(r io.Reader) (*Set, []Rejected) {
-	set := &Set{grants: map[string]Grant{}}
+	set := &Set{grants: map[string]listed{}}
 	var rejected []Rejected
 	br := bufio.NewReader(r)
 	for n := 1; ; n++ {
@@ -79,7 +207,7 @@ func Parse(r io.Reader) (*Set, []Rejected) {
 		}
 		if long {
 			rejected = append(rejected, Rejected{Line: n, Reason: "the line is too long"})
-		} else if reason := set.add(line); reason != "" {
+		} else if reason := set.add(line, n); reason != "" {
 			rejected = append(rejected, Rejected{Line: n, Reason: reason})
 		}
 		if err != nil {
@@ -124,9 +252,9 @@ func readLine(br *bufio.Reader) (line []byte, long bool, err error) {
 	}
 }
 
-// add puts the key of line into s. It returns why the line gives no
-// access, or "" when it does or is a line to skip.
-func (s *Set) add(line []byte) (reason string) {
+// add puts the key of line, the n-th of the list, into s. It returns
+// why the line gives no access, or "" when it does or is a line to skip.
+func (s *Set) add(line []byte, n int) (reason string) {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) == 0 || trimmed[0] == '#' {
 		return ""
@@ -150,34 +278,28 @@ func (s *Set) add(line []byte) (reason string) {
 		}
 		return "unknown option " + strings.Join(options, ", ")
 	}
-	admin := strings.HasSuffix(comment, AdminSuffix)
-	// "dragan/Admin" is an admin written wrongly, not a read-only key that
-	// nobody notices.
-	if !admin && strings.HasSuffix(strings.ToLower(comment), AdminSuffix) {
-		return reasonAdminCase
+	_, role, reason := ParseRole(comment)
+	if reason != "" {
+		return reason
 	}
 	wire := string(key.Marshal())
-	if g, ok := s.grants[wire]; ok {
-		g.ReadOnly = g.ReadOnly || !admin
-		s.grants[wire] = g
+	if first, ok := s.grants[wire]; ok {
+		// One key is one user, of one role.
+		if first.Role != role {
+			return "the key is on line " + strconv.Itoa(first.line) + " with another role"
+		}
 		return ""
 	}
-	fp := ssh.FingerprintSHA256(key)
-	name := comment
-	if name == "" {
-		name = fp
+	s.grants[wire] = listed{
+		Grant: Grant{Name: comment, Fingerprint: ssh.FingerprintSHA256(key), Role: role},
+		line:  n,
 	}
-	s.grants[wire] = Grant{Name: name, Fingerprint: fp, ReadOnly: !admin}
 	return ""
 }
 
 // reasonReadOnlyOption is why a line with the option read-only of kosh
 // before 0.3.0 is rejected.
-const reasonReadOnlyOption = "the option read-only is gone: a key is read-only unless its name ends in " + AdminSuffix
-
-// reasonAdminCase is why a line whose name ends in /admin in another
-// case is rejected.
-const reasonAdminCase = "the admin suffix is " + AdminSuffix + ", in lower case, at the end of the name"
+const reasonReadOnlyOption = "the option read-only is gone: a key has the rights of the role its name ends in, such as /view"
 
 // Lookup returns the grant of key.
 func (s *Set) Lookup(key ssh.PublicKey) (Grant, bool) {
@@ -185,22 +307,57 @@ func (s *Set) Lookup(key ssh.PublicKey) (Grant, bool) {
 		return Grant{}, false
 	}
 	g, ok := s.grants[string(key.Marshal())]
-	return g, ok
+	return g.Grant, ok
 }
 
-// counts returns how many keys are admins and how many read-only.
-func (s *Set) counts() (admin, readOnly int) {
+// Roles returns the roles the keys name, each once, by kind, namespace and
+// name.
+func (s *Set) Roles() []Role {
 	if s == nil {
-		return 0, 0
+		return nil
 	}
+	var roles []Role
 	for _, g := range s.grants {
-		if g.ReadOnly {
-			readOnly++
+		roles = append(roles, g.Role)
+	}
+	slices.SortFunc(roles, func(a, b Role) int {
+		return cmp.Or(cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
+	})
+	return slices.Compact(roles)
+}
+
+// counts returns how many distinct ClusterRoles and Roles the keys name.
+func (s *Set) counts() (clusterRoles, roles int) {
+	for _, r := range s.Roles() {
+		if r.Kind == KindClusterRole {
+			clusterRoles++
 		} else {
-			admin++
+			roles++
 		}
 	}
-	return admin, readOnly
+	return clusterRoles, roles
+}
+
+// adminKeys returns the names of the keys of the ClusterRole admin, in
+// order.
+func (s *Set) adminKeys() []string {
+	return s.KeysOf(Role{Kind: KindClusterRole, Name: "admin"})
+}
+
+// KeysOf returns the names of the keys whose role is r, in order: what a
+// line of the log about r names.
+func (s *Set) KeysOf(r Role) []string {
+	if s == nil {
+		return nil
+	}
+	var names []string
+	for _, g := range s.grants {
+		if g.Role == r {
+			names = append(names, g.Name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 // Len returns the number of keys.
@@ -252,26 +409,27 @@ func Open(path string, log *slog.Logger) (*List, error) {
 	return l, nil
 }
 
-// msgNoAdmin is logged for a list of keys none of which is an admin.
-const msgNoAdmin = "key list has no admin: every session is read-only"
+// msgAdminRole is logged for a list with a key of the ClusterRole admin:
+// a list of 0.3 or 0.4 names its admins …/admin, which meant full access.
+const msgAdminRole = "a key's role is the ClusterRole admin, which is not cluster-admin: before 0.5.0 /admin meant full access"
 
 // parseLogged parses data, the content of the file at path, and logs
-// what Open and Watch log of it: each rejected line, a list of no key, a
-// list of no admin, and msg with the counts: of keys, admins and
-// read-only, and of lines rejected.
+// what Open and Watch log of it: each rejected line, a list of no key, the
+// keys of the ClusterRole admin, and msg with the counts: of keys, of the
+// ClusterRoles and Roles they name, and of lines rejected.
 func parseLogged(path string, data []byte, log *slog.Logger, msg string) *Set {
 	set, rejected := Parse(bytes.NewReader(data))
 	for _, r := range rejected {
 		log.Warn("key list: a line is rejected and gives no access", "path", path, "line", r.Line, "reason", r.Reason)
 	}
-	admin, readOnly := set.counts()
-	switch {
-	case set.Len() == 0:
+	if set.Len() == 0 {
 		log.Warn("key list holds no key: nobody is accepted", "path", path)
-	case admin == 0:
-		log.Warn(msgNoAdmin, "path", path, "hint", "an admin's name ends in "+AdminSuffix)
 	}
-	log.Info(msg, "path", path, "keys", set.Len(), "admin", admin, "read_only", readOnly, "rejected", len(rejected))
+	if admins := set.adminKeys(); len(admins) > 0 {
+		log.Warn(msgAdminRole, "path", path, "keys", strings.Join(admins, ", "))
+	}
+	clusterRoles, roles := set.counts()
+	log.Info(msg, "path", path, "keys", set.Len(), "clusterroles", clusterRoles, "roles", roles, "rejected", len(rejected))
 	return set
 }
 
@@ -319,8 +477,31 @@ func (l *List) Lookup(key ssh.PublicKey) (Grant, bool) {
 	return set.Lookup(key)
 }
 
+// RoleKeys is a role the key list names, and the names of its keys.
+type RoleKeys struct {
+	Role Role
+	Keys []string
+}
+
+// Roles returns the roles the keys of the current set name, in the order
+// of Set.Roles, each with the names of its keys, read from one set: what
+// the bindings are made for, and what the log of a missing role names.
+func (l *List) Roles() []RoleKeys {
+	l.mu.Lock()
+	set := l.set
+	l.mu.Unlock()
+	var out []RoleKeys
+	for _, r := range set.Roles() {
+		out = append(out, RoleKeys{Role: r, Keys: set.KeysOf(r)})
+	}
+	return out
+}
+
 // Replace makes set the current one and calls every function OnChange
-// was given, in the goroutine of the caller, after the set is in place.
+// was given, in the order they were registered, in the goroutine of the
+// caller, after the set is in place. kosh serve relies on the order: the
+// bindings are made before the sessions of changed keys end, and
+// deleted after.
 func (l *List) Replace(set *Set) {
 	l.mu.Lock()
 	l.set = set

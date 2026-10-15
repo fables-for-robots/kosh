@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -87,7 +88,7 @@ func genericEnv(t *testing.T, opts Options) (*env, *fakeTables) {
 	t.Helper()
 	e := newEnv(t, envConfig{opts: opts})
 	f := &fakeTables{table: &metav1.Table{ColumnDefinitions: widgetColumns()}}
-	e.c.tables = f
+	e.setTables(f)
 	return e, f
 }
 
@@ -491,6 +492,33 @@ func TestHumanDuration(t *testing.T) {
 			if again := human(got); again != text {
 				t.Errorf("%v printed as %q parses to %v, printed as %q", d, text, got, again)
 			}
+		}
+	}
+}
+
+// apiStatusOf gives the API's own Status when the body is one, and the
+// client's error otherwise.
+func TestAPIStatusOf(t *testing.T) {
+	plain := errors.New("the client's own error")
+	forbidden := `{"kind":"Status","apiVersion":"v1","status":"Failure","message":"nodes is forbidden: User \"kosh:carol/edit@team-a\" cannot list resource \"nodes\"","reason":"Forbidden","code":403}`
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+		api  bool // the result is the API's StatusError
+	}{
+		{"a refusal", forbidden, `nodes is forbidden: User "kosh:carol/edit@team-a" cannot list resource "nodes"`, true},
+		{"a Status that is no failure", `{"kind":"Status","apiVersion":"v1","status":"Success"}`, plain.Error(), false},
+		{"another kind", `{"kind":"Table","apiVersion":"meta.k8s.io/v1"}`, plain.Error(), false},
+		{"no JSON", "<html>bad gateway</html>", plain.Error(), false},
+		{"no body", "", plain.Error(), false},
+	} {
+		err := apiStatusOf(plain, []byte(tc.raw))
+		if err.Error() != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, err, tc.want)
+		}
+		if got := apierrors.IsForbidden(err); got != tc.api {
+			t.Errorf("%s: forbidden %v, want %v", tc.name, got, tc.api)
 		}
 	}
 }

@@ -123,7 +123,7 @@ func (f *readFakeLogs) allClosed() bool {
 func readLogEnv(t *testing.T, f *readFakeLogs, objs ...k8sruntime.Object) *env {
 	t.Helper()
 	e := newEnv(t, envConfig{}, objs...)
-	e.c.openLog = f.open
+	e.setOpenLog(f.open)
 	return e
 }
 

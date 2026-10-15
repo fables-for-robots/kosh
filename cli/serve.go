@@ -41,6 +41,8 @@ type serveOptions struct {
 	stateDir       string // the two keys
 	authorizedKeys string // the key list
 	kubeconfig     string // empty for the pod's ServiceAccount
+	instance       string // the instance's name, in kosh's groups and bindings; empty for keys.DefaultInstance
+	namespace      string // kosh's namespace, when the pod does not say it
 
 	// What tests set; the command line sets none of it.
 
@@ -59,6 +61,28 @@ type serveOptions struct {
 	// started, when it is set, is called once kosh serves, with what it
 	// serves on.
 	started func(serving)
+	// namespaceFile is the file of the pod's own namespace. Empty means
+	// the ServiceAccount's, saNamespaceFile.
+	namespaceFile string
+}
+
+// saNamespaceFile is where a pod finds its namespace, beside its
+// ServiceAccount's token.
+const saNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// koshNamespace returns kosh's own namespace: the pod's, when the
+// ServiceAccount's file says it, else --namespace, else "" for unknown.
+func (o serveOptions) koshNamespace() string {
+	file := o.namespaceFile
+	if file == "" {
+		file = saNamespaceFile
+	}
+	if b, err := os.ReadFile(file); err == nil {
+		if ns := strings.TrimSpace(string(b)); ns != "" {
+			return ns
+		}
+	}
+	return o.namespace
 }
 
 // serving is what serve tells a test once it serves.
@@ -91,6 +115,10 @@ func serveCommand(runServe func(context.Context, serveOptions) error) *ucli.Comm
 				Usage: "the key list"},
 			&ucli.StringFlag{Name: "kubeconfig", EnvVars: []string{"KUBECONFIG"},
 				Usage: "a kubeconfig instead of the pod's ServiceAccount, for running kosh outside a cluster"},
+			&ucli.StringFlag{Name: "instance", EnvVars: []string{"KOSH_INSTANCE"}, Value: keys.DefaultInstance,
+				Usage: "the name of this kosh among those that serve the cluster, in its groups and bindings: lower-case letters, digits, . and -"},
+			&ucli.StringFlag{Name: "namespace", EnvVars: []string{"KOSH_NAMESPACE"},
+				Usage: "kosh's own namespace, where its key list is, when it does not run in a pod (default: the pod's)"},
 		},
 		Action: func(c *ucli.Context) error {
 			return runServe(c.Context, serveOptions{
@@ -102,6 +130,8 @@ func serveCommand(runServe func(context.Context, serveOptions) error) *ucli.Comm
 				stateDir:       c.String("state-dir"),
 				authorizedKeys: c.String("authorized-keys"),
 				kubeconfig:     c.String("kubeconfig"),
+				instance:       c.String("instance"),
+				namespace:      c.String("namespace"),
 			})
 		},
 	}
@@ -115,6 +145,12 @@ func (o serveOptions) check() (bind netip.AddrPort, err error) {
 	}
 	if o.iroh && !o.irohRelay && !o.irohMDNS {
 		return bind, errors.New("iroh is on and nobody could find it: set --iroh-relay or --iroh-mdns")
+	}
+	// Empty is the default instance, as kube.Options has it.
+	if o.instance != "" {
+		if err := keys.CheckInstance(o.instance); err != nil {
+			return bind, fmt.Errorf("--instance: %w", err)
+		}
 	}
 	if o.irohBind != "" {
 		if bind, err = netip.ParseAddrPort(o.irohBind); err != nil {
@@ -199,14 +235,14 @@ func loggableStartError(err error) string {
 type running struct {
 	log *slog.Logger
 
-	stopKeys context.CancelFunc // ends the key list's Watch
+	stopKeys context.CancelFunc // ends the key list's Watch and the bindings' retries
 	cluster  *kube.Cluster
 	server   *sshd.Server
 	tcp      net.Listener
 	iroh     *irohnet.Listener
 
-	// wg counts the goroutines start started: the key list's Watch and
-	// each listener's Serve.
+	// wg counts the goroutines start started: the key list's Watch, the
+	// bindings' Run, and each listener's Serve.
 	wg sync.WaitGroup
 	// stopping is set when stop begins: a Serve that returns after it
 	// was asked to.
@@ -243,12 +279,25 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 		return fmt.Errorf("the cluster's configuration could not be read: %w", err)
 	}
 	kctx, cancel := context.WithTimeout(ctx, clusterTimeout)
-	r.cluster, err = kube.New(kctx, cfg, kube.Options{Log: log, UserAgent: "kosh/" + Version, IdleStop: o.idleStop})
+	r.cluster, err = kube.New(kctx, cfg, kube.Options{Log: log, UserAgent: "kosh/" + Version, IdleStop: o.idleStop,
+		Instance: o.instance, Namespace: o.koshNamespace()})
 	cancel()
 	if err != nil {
 		return fmt.Errorf("the cluster could not be reached: %w", err)
 	}
 	cluster := r.cluster
+
+	// The bindings the key list needs (§4 of the roles design) are made
+	// before the SSH server is, so that the first sessions have theirs. At
+	// every change of the list they are made before the sessions of the
+	// keys that changed end, and pruned after: the list calls its OnChange
+	// functions in the order they were registered, and sshd.New registers
+	// the end of the sessions between the two. A failure is logged and
+	// retried by Run, and does not stop kosh: a session whose binding is
+	// missing gets the API's refusals.
+	bindings := kube.NewBindings(cluster, list.Roles, log)
+	list.OnChange(bindings.MakeNow)
+	bindings.MakeNow()
 
 	r.server, err = sshd.New(sshd.Config{
 		HostKeyPEM: st.HostKeyPEM,
@@ -262,6 +311,17 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	if err != nil {
 		return fmt.Errorf("the SSH server could not be made: %w", err)
 	}
+	list.OnChange(bindings.PruneNow)
+	bindings.PruneNow()
+	// The roles that may edit the key list, and so name any role, are
+	// warned of at every reading (§4.1 of the roles design).
+	list.OnChange(bindings.WarnEditorsNow)
+	bindings.WarnEditorsNow()
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		bindings.Run(watchCtx)
+	}()
 
 	if o.sshListen != "" {
 		r.tcp, err = net.Listen("tcp", o.sshListen)
@@ -313,21 +373,20 @@ func (r *running) start(ctx context.Context, o serveOptions, bind netip.AddrPort
 	return nil
 }
 
-// uiOptions are the options of a session's program. A full key's session
-// is given the session's terminal, for a shell in a pod; a read-only
-// key's is not, so that no shell is reachable from it whatever the UI
-// binds. tui does not know sshd: its Terminal is sshd's, field for
-// field.
+// uiOptions are the options of a session's program. Every session is
+// given the session's terminal, for a shell in a pod: whether the key may
+// open one is its role's to say, and the API server's, which refuses the
+// exec of a role without create on pods/exec. tui does not know sshd: its
+// Terminal is sshd's, field for field.
 func uiOptions(s sshd.Session) tui.Options {
-	opts := tui.Options{Version: Version}
-	if !s.Grant.ReadOnly {
-		opts.Handover = func(run func(context.Context, tui.Terminal) error, done func(error) tea.Msg) tea.Cmd {
+	return tui.Options{
+		Version: Version,
+		Handover: func(run func(context.Context, tui.Terminal) error, done func(error) tea.Msg) tea.Cmd {
 			return s.Exec(func(ctx context.Context, t sshd.Terminal) error {
 				return run(ctx, tui.Terminal(t))
 			}, done)
-		}
+		},
 	}
-	return opts
 }
 
 // serve runs the server's Serve for l, the transport transport, in a

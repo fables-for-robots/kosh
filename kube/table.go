@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/duration"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -56,7 +57,7 @@ func (t *restTables) listTable(ctx context.Context, r Resource, namespace string
 		SetHeader("Accept", tableAccept).
 		Do(ctx).Raw()
 	if err != nil {
-		return nil, err
+		return nil, apiStatusOf(err, raw)
 	}
 	var tab metav1.Table
 	if err := json.Unmarshal(raw, &tab); err != nil {
@@ -66,6 +67,19 @@ func (t *restTables) listTable(ctx context.Context, r Resource, namespace string
 		return nil, fmt.Errorf("the API server sent no table for %s, but %q", r.GVR.Resource, tab.Kind)
 	}
 	return &tab, nil
+}
+
+// apiStatusOf returns the error of a request whose body is raw: the
+// API's own Status when raw is one, else err. The client of the tables
+// negotiates no group version, so it cannot read the Status the API
+// answers with, and its error says only "unknown": a table that the API
+// refuses a role is to say why, as the API words it.
+func apiStatusOf(err error, raw []byte) error {
+	var status metav1.Status
+	if json.Unmarshal(raw, &status) != nil || status.Kind != "Status" || status.Status != metav1.StatusFailure {
+		return err
+	}
+	return &apierrors.StatusError{ErrStatus: status}
 }
 
 // listPath returns the path of the list of r, in namespace when r is
@@ -99,6 +113,7 @@ func listPath(r Resource, namespace string) (string, error) {
 // server's, read again every opts.TablePoll by a goroutine of its own.
 type tableWatch struct {
 	c         *Cluster
+	tables    tableLister // the session's
 	res       Resource
 	namespace string
 	changed   chan struct{}
@@ -115,12 +130,17 @@ type tableWatch struct {
 
 func (s *session) watchTable(q Query) (Watch, error) {
 	c := s.c
-	if c.tables == nil {
+	api, err := s.api()
+	if err != nil {
+		return nil, err
+	}
+	if api.tables == nil {
 		return nil, errors.New("kosh cannot read the API server's tables")
 	}
 	ctx, cancel := context.WithCancel(c.ctx)
 	w := &tableWatch{
 		c:         c,
+		tables:    api.tables,
 		res:       q.Resource,
 		namespace: q.Namespace,
 		changed:   make(chan struct{}, 1),
@@ -162,7 +182,7 @@ func (w *tableWatch) poll(ctx context.Context) {
 // read reads the table once and signals when what the watch shows
 // changed.
 func (w *tableWatch) read(ctx context.Context) {
-	tab, err := w.c.tables.listTable(ctx, w.res, w.namespace)
+	tab, err := w.tables.listTable(ctx, w.res, w.namespace)
 	if ctx.Err() != nil {
 		return
 	}

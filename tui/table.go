@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/kube"
@@ -194,6 +197,14 @@ type tableView struct {
 	lastMark  *rowKey
 
 	ns namespacesMsg
+
+	// rights are the session's answers to the needs of the bindings
+	// that apply to the table, for its namespace: nil until they are in,
+	// and no binding with a need is bound until then. rightsGen numbers
+	// the asking, so that the answers of a namespace the table has left,
+	// or of an asking since asked again, are dropped.
+	rights    map[right]bool
+	rightsGen int
 }
 
 // newTableView returns the table of a query, with the cursor on the
@@ -221,8 +232,94 @@ func newTable(e env, q kube.Query, selected string) *tableView {
 	return v
 }
 
-// Init opens the watch and reads it.
-func (v *tableView) Init() tea.Cmd { return v.openWatch() }
+// Init opens the watch and reads it, and asks what the session may do
+// in the table.
+func (v *tableView) Init() tea.Cmd { return tea.Batch(v.openWatch(), v.askRights()) }
+
+// rightsMsg is the session's answers to the needs of a table's
+// bindings.
+type rightsMsg struct {
+	id      int64
+	gen     int
+	allowed map[right]bool
+}
+
+// askRights asks the session, in a command, for every right that a
+// binding applying to the table by its kind needs, in the table's
+// namespace: each right once, and all at once, for each is a request to
+// the API the first time. The session keeps its answers, so a second
+// table of the same kind and namespace asks the API nothing. The
+// answers the table has stay until the new ones are in: whoever changes
+// the namespace forgets them first.
+func (v *tableView) askRights() tea.Cmd {
+	v.rightsGen++
+	if v.plain {
+		return nil
+	}
+	res := v.q.Resource
+	var rights []right
+	for _, b := range applying(res, v.grant) {
+		for _, n := range b.Needs {
+			if r := n.right(res); !slices.Contains(rights, r) {
+				rights = append(rights, r)
+			}
+		}
+	}
+	sess, ns, id, gen := v.e.sess, v.rightsNamespace(), v.id, v.rightsGen
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+		defer cancel()
+		answers := make([]bool, len(rights))
+		var wg sync.WaitGroup
+		for i, r := range rights {
+			of := kube.Resource{GVR: schema.GroupVersionResource{Group: r.group, Resource: r.resource}}
+			wg.Go(func() { answers[i] = sess.Can(ctx, r.verb, of, r.sub, ns) })
+		}
+		wg.Wait()
+		allowed := make(map[right]bool, len(rights))
+		for i, r := range rights {
+			allowed[r] = answers[i]
+		}
+		return rightsMsg{id: id, gen: gen, allowed: allowed}
+	}
+}
+
+// forgetRights has the session forget the answers it keeps to the
+// questions askRights asks: of each resource a right is on, in the
+// table's namespace.
+func (v *tableView) forgetRights() {
+	if v.plain {
+		return
+	}
+	res := v.q.Resource
+	var done []right
+	for _, b := range applying(res, v.grant) {
+		for _, n := range b.Needs {
+			r := n.right(res)
+			r.verb, r.sub = "", ""
+			if slices.Contains(done, r) {
+				continue
+			}
+			done = append(done, r)
+			v.e.sess.ForgetRights(kube.Resource{GVR: schema.GroupVersionResource{Group: r.group, Resource: r.resource}}, v.rightsNamespace())
+		}
+	}
+}
+
+// rightsNamespace is the namespace the table's needs are asked in: the
+// one of the object its rows belong to (a deployment's pods, a pod's
+// containers), or else the query's. It is "" for every namespace and for
+// a resource of the cluster scope.
+func (v *tableView) rightsNamespace() string {
+	if v.q.Of != nil {
+		return v.q.Of.Namespace
+	}
+	return v.q.Namespace
+}
+
+// can reports whether the session's answers meet n; before they are in,
+// nothing is.
+func (v *tableView) can(n need) bool { return v.rights[n.right(v.q.Resource)] }
 
 // openWatch opens the watch of the query in a command, and reads it.
 func (v *tableView) openWatch() tea.Cmd {
@@ -327,6 +424,11 @@ func (v *tableView) Update(msg tea.Msg) (view, tea.Cmd) {
 		return v, v.bury()
 	case namespacesMsg:
 		v.ns = msg
+		return v, nil
+	case rightsMsg:
+		if msg.id == v.id && msg.gen == v.rightsGen && !v.closed {
+			v.rights = msg.allowed
+		}
 		return v, nil
 	case tea.KeyPressMsg:
 		return v, v.key(msg)

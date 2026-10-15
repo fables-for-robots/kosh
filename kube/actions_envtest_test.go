@@ -18,7 +18,7 @@ import (
 )
 
 // actionAPI is a Cluster from New against an API server of the test's,
-// a session of it with a full grant, and a client of the test's own.
+// a session of it with fullGrant, and a client of the test's own.
 type actionAPI struct {
 	c     *Cluster
 	s     Session

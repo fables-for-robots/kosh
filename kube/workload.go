@@ -18,23 +18,27 @@ func (s *session) Images(ctx context.Context, ref ObjectRef) ([]ContainerImage, 
 	if err := s.c.checkRef(ref); err != nil {
 		return nil, err
 	}
+	api, err := s.api()
+	if err != nil {
+		return nil, err
+	}
 	get := metav1.GetOptions{}
 	var spec *corev1.PodSpec
 	switch {
 	case ref.Resource.Is("apps", "deployments"):
-		o, err := s.c.typed.AppsV1().Deployments(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().Deployments(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return nil, err
 		}
 		spec = &o.Spec.Template.Spec
 	case ref.Resource.Is("apps", "statefulsets"):
-		o, err := s.c.typed.AppsV1().StatefulSets(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().StatefulSets(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return nil, err
 		}
 		spec = &o.Spec.Template.Spec
 	case ref.Resource.Is("apps", "daemonsets"):
-		o, err := s.c.typed.AppsV1().DaemonSets(ref.Namespace).Get(ctx, ref.Name, get)
+		o, err := api.typed.AppsV1().DaemonSets(ref.Namespace).Get(ctx, ref.Name, get)
 		if err != nil {
 			return nil, err
 		}
@@ -60,18 +64,19 @@ func (s *session) Replicas(ctx context.Context, ref ObjectRef) (int32, error) {
 	if err := s.c.checkRef(ref); err != nil {
 		return 0, err
 	}
+	api, err := s.api()
+	if err != nil {
+		return 0, err
+	}
 	get := metav1.GetOptions{}
-	var (
-		scale *autoscalingv1.Scale
-		err   error
-	)
+	var scale *autoscalingv1.Scale
 	switch {
 	case ref.Resource.Is("apps", "deployments"):
-		scale, err = s.c.typed.AppsV1().Deployments(ref.Namespace).GetScale(ctx, ref.Name, get)
+		scale, err = api.typed.AppsV1().Deployments(ref.Namespace).GetScale(ctx, ref.Name, get)
 	case ref.Resource.Is("apps", "statefulsets"):
-		scale, err = s.c.typed.AppsV1().StatefulSets(ref.Namespace).GetScale(ctx, ref.Name, get)
+		scale, err = api.typed.AppsV1().StatefulSets(ref.Namespace).GetScale(ctx, ref.Name, get)
 	case ref.Resource.Is("apps", "replicasets"):
-		scale, err = s.c.typed.AppsV1().ReplicaSets(ref.Namespace).GetScale(ctx, ref.Name, get)
+		scale, err = api.typed.AppsV1().ReplicaSets(ref.Namespace).GetScale(ctx, ref.Name, get)
 	default:
 		return 0, fmt.Errorf("%s has no replicas: only a deployment, statefulset or replicaset has", ref)
 	}

@@ -8,7 +8,6 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/kube"
 	"github.com/fables-for-robots/kosh/kube/kubetest"
 	"github.com/fables-for-robots/kosh/render"
@@ -339,7 +338,7 @@ func TestBindings(t *testing.T) {
 	var runs []ran
 	withBindings(t, &runs,
 		binding{Key: "z", Hint: hint{"z", "Zap"}, Order: 2},
-		binding{Key: "Z", Hint: hint{"shift-z", "Zap Hard"}, Order: 1, Applies: func(res kube.Resource, g keys.Grant) bool { return !g.ReadOnly }},
+		binding{Key: "Z", Hint: hint{"shift-z", "Zap Hard"}, Order: 1, Needs: []need{{Verb: "delete"}}},
 	)
 	sess := newSession()
 	q := query("pods", "default")
@@ -381,9 +380,11 @@ func TestBindings(t *testing.T) {
 		t.Errorf("z in an empty table ran %+v", runs[3:])
 	}
 
-	// A read-only key has not got the binding that does not apply to it.
+	// A key whose role does not allow what a binding needs has not got
+	// it.
 	runs = nil
-	ro := kubetest.New(keys.Grant{Name: "bob", ReadOnly: true})
+	ro := kubetest.New(viewGrant)
+	allowView(ro)
 	ro.SetTable(q, podsNamed("a"))
 	hs = newHarness(t, ro, 120, 30)
 	hs.wantHint("z", "Zap")
@@ -393,11 +394,11 @@ func TestBindings(t *testing.T) {
 	hs.press("esc")
 	hs.press("Z")
 	if len(runs) != 0 {
-		t.Errorf("Z ran for a read-only key: %+v", runs)
+		t.Errorf("Z ran for a view key: %+v", runs)
 	}
 	hs.press("z")
 	if len(runs) != 1 {
-		t.Errorf("z ran %d times for a read-only key", len(runs))
+		t.Errorf("z ran %d times for a view key", len(runs))
 	}
 }
 

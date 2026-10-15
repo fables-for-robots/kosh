@@ -56,15 +56,17 @@ func init() {
 		Hint:     hint{"s", "Shell"},
 		Order:    22, // after the logs' l and p
 		Applies:  shellApplies,
+		Needs:    []need{{Verb: "get", Resource: needPods}, {Verb: "create", Sub: "exec", Resource: needPods}},
 		Run:      actionGuard(shellOpen),
 		Handover: true,
 	})
 }
 
 // shellApplies reports whether a table of res has s: of pods and of a
-// pod's containers, for a full grant.
-func shellApplies(res kube.Resource, grant keys.Grant) bool {
-	return !grant.ReadOnly && (res.Is("", "pods") || logIsContainers(res))
+// pod's containers. The dialog reads the pod, and the shell execs in it:
+// the binding's needs.
+func shellApplies(res kube.Resource, _ keys.Grant) bool {
+	return res.Is("", "pods") || logIsContainers(res)
 }
 
 // shellOpen reads the pod of the row, and opens the dialog when it has a

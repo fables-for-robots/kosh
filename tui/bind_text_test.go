@@ -20,8 +20,10 @@ var textSecret = kubetest.Ref("secrets", "default", "creds")
 
 // textPodsAndSecrets returns a session of grant with a table of the pod
 // web-1 and one of the secret creds, both in default.
+// The session is allowed everything; a test of a narrower role allows
+// its own on a session of kubetest.New.
 func textPodsAndSecrets(grant keys.Grant) *kubetest.Session {
-	sess := kubetest.New(grant)
+	sess := newSessionOf(grant)
 	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
 	sess.SetTable(query("secrets", "default"), simpleTable("creds"))
 	return sess
@@ -70,24 +72,34 @@ func textHasBinding(bs []binding, key string, h hint, order int) bool {
 }
 
 func TestBindingsAreRegistered(t *testing.T) {
-	full := keys.Grant{Name: "alice"}
-	ro := keys.Grant{Name: "bob", ReadOnly: true}
-	for _, g := range []keys.Grant{full, ro} {
-		pods := bindingsFor(kubetest.Resource("pods"), g)
-		if !textHasBinding(pods, "d", hint{"d", "Describe"}, 10) || !textHasBinding(pods, "y", hint{"y", "YAML"}, 11) {
-			t.Errorf("read-only %v: the pods have not d and y as they should: %+v", g.ReadOnly, pods)
+	full := keys.Grant{Name: "alice", Role: clusterAdmin}
+	view := kubetest.New(viewGrant)
+	allowView(view)
+	pods, secrets := kubetest.Resource("pods"), kubetest.Resource("secrets")
+	for _, c := range []struct {
+		grant      keys.Grant
+		can        func(kube.Resource) func(need) bool
+		secretKeys bool
+	}{
+		{full, func(kube.Resource) func(need) bool { return canAll }, true},
+		// view may not read a Secret: no key of the secrets'.
+		{viewGrant, func(res kube.Resource) func(need) bool { return canOf(view, res, "default") }, false},
+	} {
+		bs := bindingsFor(pods, c.grant, c.can(pods))
+		if !textHasBinding(bs, "d", hint{"d", "Describe"}, 10) || !textHasBinding(bs, "y", hint{"y", "YAML"}, 11) {
+			t.Errorf("%s: the pods have not d and y as they should: %+v", c.grant.Role, bs)
 		}
-		if textHasBinding(pods, "x", hint{"x", "Decode"}, 12) {
-			t.Errorf("read-only %v: the pods have x", g.ReadOnly)
+		if textHasBinding(bs, "x", hint{"x", "Decode"}, 12) {
+			t.Errorf("%s: the pods have x", c.grant.Role)
 		}
-		secrets := bindingsFor(kubetest.Resource("secrets"), g)
+		bs = bindingsFor(secrets, c.grant, c.can(secrets))
 		for _, b := range []struct {
 			key   string
 			h     hint
 			order int
 		}{{"d", hint{"d", "Describe"}, 10}, {"y", hint{"y", "YAML"}, 11}, {"x", hint{"x", "Decode"}, 12}} {
-			if !textHasBinding(secrets, b.key, b.h, b.order) {
-				t.Errorf("read-only %v: the secrets have not %s as they should: %+v", g.ReadOnly, b.key, secrets)
+			if textHasBinding(bs, b.key, b.h, b.order) != c.secretKeys {
+				t.Errorf("%s: the secrets have %s: %v, want %v: %+v", c.grant.Role, b.key, !c.secretKeys, c.secretKeys, bs)
 			}
 		}
 	}
@@ -220,9 +232,9 @@ func TestDecodeOnlyOnSecrets(t *testing.T) {
 }
 
 func TestNoTextKeysOnContainersAndRules(t *testing.T) {
-	for _, g := range []keys.Grant{{Name: "alice"}, {Name: "bob", ReadOnly: true}} {
+	for _, g := range []keys.Grant{{Name: "alice", Role: clusterAdmin}, viewGrant} {
 		for _, res := range []kube.Resource{kube.Containers, kube.Rules} {
-			for _, b := range bindingsFor(res, g) {
+			for _, b := range bindingsFor(res, g, canAll) {
 				if b.Key == "d" || b.Key == "y" || b.Key == "x" {
 					t.Errorf("the %s have %s", res.GVR.Resource, b.Key)
 				}
@@ -280,34 +292,38 @@ func TestFirstLoadErrorIsAFlash(t *testing.T) {
 	}
 }
 
-func TestReadOnlySecret(t *testing.T) {
-	sess := textPodsAndSecrets(keys.Grant{Name: "bob@ci", ReadOnly: true})
+// A key whose role may list the Secrets and not get them sees their
+// table and no key that reads one, and the keys do nothing.
+func TestSecretsWithoutGetHaveNoKeys(t *testing.T) {
+	sess := kubetest.New(viewGrant)
+	allowView(sess)
+	sess.Allow("list", "", "secrets", "", "")
+	sess.Allow("watch", "", "secrets", "", "")
+	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
+	sess.SetTable(query("secrets", "default"), simpleTable("creds"))
 	sess.YAMLs[textSecret.String()] = "data:\n  password: aHVudGVyMg==\n"
 	sess.Descriptions[textSecret.String()] = "Name: creds\n"
 	sess.Secrets[textSecret.String()] = []kube.SecretEntry{{Key: "password", Value: "hunter2"}}
-	hs := newHarness(t, sess, 100, 30)
-	hs.command("secrets")
+	hs := newHarness(t, sess, 200, 30)
 	hs.wantHint("d", "Describe")
 	hs.wantHint("y", "YAML")
-	hs.wantHint("x", "Decode")
+	hs.command("secrets")
+	hs.wantFrame("creds")
+	hs.notFrame("Describe", "YAML", "Decode")
 	before := hs.frame()
-	for _, k := range []string{"d", "y", "x"} {
-		hs.clock.advance(time.Minute) // the flash before is gone
+	for _, k := range []string{"d", "y", "x", "enter"} {
 		hs.press(k)
 		if len(hs.root().stack) != 1 || hs.title() != "Secrets(default)[1]" {
 			t.Errorf("%s left the table: %q", k, hs.title())
 		}
-		if l := textFlash(hs); !strings.Contains(l, "this key is read-only") {
-			t.Errorf("after %s the flash is %q", k, l)
-		}
-		hs.notFrame("hunter2", "aHVudGVy")
 	}
-	// An error stays after its time until a key is pressed: k, which
-	// moves nothing in a table of one row.
-	hs.clock.advance(time.Minute)
-	hs.press("k")
 	if hs.frame() != before {
 		t.Errorf("the table is not as it was:\n%s\nwas\n%s", hs.frame(), before)
+	}
+	for _, c := range sess.Calls() {
+		if c.Method != "Watch" && c.Method != "Resolve" {
+			t.Errorf("the keys called %s", c.Method)
+		}
 	}
 }
 

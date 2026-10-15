@@ -28,7 +28,7 @@ import (
 // serveVars are the environment variables kosh serve reads.
 var serveVars = []string{
 	"KOSH_SSH_LISTEN", "KOSH_IROH", "KOSH_IROH_BIND", "KOSH_IROH_RELAY", "KOSH_IROH_MDNS",
-	"KOSH_STATE_DIR", "KOSH_AUTHORIZED_KEYS", "KUBECONFIG",
+	"KOSH_STATE_DIR", "KOSH_AUTHORIZED_KEYS", "KUBECONFIG", "KOSH_INSTANCE", "KOSH_NAMESPACE",
 }
 
 // defaultServe is what kosh serve runs with when nothing is set.
@@ -41,6 +41,8 @@ var defaultServe = serveOptions{
 	stateDir:       "/var/lib/kosh",
 	authorizedKeys: "/etc/kosh/authorized_keys",
 	kubeconfig:     "",
+	instance:       "kosh",
+	namespace:      "",
 }
 
 func TestServeFlagsAndEnvironment(t *testing.T) {
@@ -77,6 +79,12 @@ func TestServeFlagsAndEnvironment(t *testing.T) {
 
 		{"kubeconfig flag", []string{"--kubeconfig", "/c"}, nil, func(o *serveOptions) { o.kubeconfig = "/c" }},
 		{"kubeconfig variable", nil, map[string]string{"KUBECONFIG": "/c"}, func(o *serveOptions) { o.kubeconfig = "/c" }},
+
+		{"instance flag", []string{"--instance", "ops-kosh"}, nil, func(o *serveOptions) { o.instance = "ops-kosh" }},
+		{"instance variable", nil, map[string]string{"KOSH_INSTANCE": "ops-kosh"}, func(o *serveOptions) { o.instance = "ops-kosh" }},
+
+		{"namespace flag", []string{"--namespace", "ops"}, nil, func(o *serveOptions) { o.namespace = "ops" }},
+		{"namespace variable", nil, map[string]string{"KOSH_NAMESPACE": "ops"}, func(o *serveOptions) { o.namespace = "ops" }},
 
 		{"the command line wins",
 			[]string{"--ssh-listen", ":1", "--iroh=true", "--iroh-bind", "127.0.0.1:1", "--iroh-relay=true", "--iroh-mdns=true",
@@ -318,6 +326,38 @@ contexts:
 current-context: nowhere
 `)
 	return path
+}
+
+// An instance's name that could not be in a group's or a binding's name
+// is refused before anything starts.
+func TestServeRefusesABadInstance(t *testing.T) {
+	for _, bad := range []string{"a:b", "Kosh", "..", strings.Repeat("a", 64)} {
+		err := serve(context.Background(), serveOptions{
+			sshListen: freePort(t), stateDir: t.TempDir(), authorizedKeys: keyListFile(t),
+			kubeconfig: unreachableKubeconfig(t), instance: bad, log: (&recorder{}).logger(),
+		})
+		if err == nil || !strings.HasPrefix(err.Error(), "--instance: ") {
+			t.Errorf("--instance %q: %v, want a refusal", bad, err)
+		}
+	}
+}
+
+// kosh's namespace is the pod's, from its ServiceAccount's file, and else
+// --namespace; without either it is not known.
+func TestKoshNamespace(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "namespace")
+	o := serveOptions{namespaceFile: file, namespace: "flag"}
+	if got := o.koshNamespace(); got != "flag" {
+		t.Errorf("without the pod's file: %q, want flag", got)
+	}
+	writeFile(t, file, "tools\n")
+	if got := o.koshNamespace(); got != "tools" {
+		t.Errorf("with the pod's file: %q, want tools", got)
+	}
+	o = serveOptions{namespaceFile: filepath.Join(t.TempDir(), "none")}
+	if got := o.koshNamespace(); got != "" {
+		t.Errorf("without either: %q", got)
+	}
 }
 
 func TestServeFailsOnBadStateDir(t *testing.T) {

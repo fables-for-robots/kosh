@@ -6,6 +6,7 @@ package kubetest
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -29,9 +30,9 @@ type Call struct {
 // set before the session is used; the Set methods may be called at any
 // time, from any goroutine.
 type Session struct {
-	// GrantValue is what Grant returns. Every method of kube.Actions,
-	// and YAML, Describe and SecretData of a Secret, return
-	// kube.ErrReadOnly when it is read-only, as the real Session does.
+	// GrantValue is what Grant returns. The fake refuses nothing by
+	// it: the API server is what refuses a role, and a test that wants
+	// a refusal puts it into Errs.
 	GrantValue keys.Grant
 	// Version is what ClusterVersion returns.
 	Version string
@@ -66,6 +67,14 @@ type Session struct {
 	usage   kube.ClusterUsage
 	usageOK bool
 	usages  []*UsageWatch
+	allowed []right
+	// forgotten is what ForgetRights was asked, as Forgotten returns it.
+	forgotten []string
+}
+
+// right is one right Allow gave: each field is a value or "*" for any.
+type right struct {
+	verb, group, resource, subresource, namespace string
 }
 
 var _ kube.Session = (*Session)(nil)
@@ -231,20 +240,6 @@ func (s *Session) err(method string) error {
 	return s.Errs[method]
 }
 
-func (s *Session) mayChange() error {
-	if s.GrantValue.ReadOnly {
-		return kube.ErrReadOnly
-	}
-	return nil
-}
-
-func (s *Session) maySee(ref kube.ObjectRef) error {
-	if s.GrantValue.ReadOnly && ref.Resource.Is("", "secrets") {
-		return kube.ErrReadOnly
-	}
-	return nil
-}
-
 func (s *Session) Grant() keys.Grant      { return s.GrantValue }
 func (s *Session) ClusterVersion() string { return s.Version }
 
@@ -267,6 +262,52 @@ func (s *Session) Resolve(_ context.Context, name string) (kube.Resource, error)
 		}
 	}
 	return kube.Resource{}, fmt.Errorf("%q: %w", name, kube.ErrUnknownResource)
+}
+
+// Allow gives the session the right of verb on group/resource, or on
+// its subresource ("" for none), in namespace, for Can to answer. A
+// right with no namespace ("") is the cluster-wide one, which holds in
+// every namespace, as RBAC's does; a right in one namespace holds there
+// alone, not in another nor in every one (Can with ""). Any field may
+// be "*", which matches every value, "" among them. A session is
+// allowed nothing until a test allows it something.
+func (s *Session) Allow(verb, group, resource, subresource, namespace string) {
+	s.mu.Lock()
+	s.allowed = append(s.allowed, right{verb, group, resource, subresource, namespace})
+	s.mu.Unlock()
+}
+
+// Can reports whether Allow gave a right that matches the question. It is
+// not recorded: the tables ask it for every key they bind, and no test
+// of what a view asked wants it among the calls.
+func (s *Session) Can(_ context.Context, verb string, res kube.Resource, subresource, namespace string) bool {
+	match := func(want, got string) bool { return want == "*" || want == got }
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.allowed {
+		if match(r.verb, verb) && match(r.group, res.GVR.Group) && match(r.resource, res.GVR.Resource) &&
+			match(r.subresource, subresource) && (r.namespace == "" || match(r.namespace, namespace)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ForgetRights records what it was asked to forget, as Forgotten returns
+// it; the fake keeps no answer to forget. It is not among the calls, as
+// Can is not.
+func (s *Session) ForgetRights(res kube.Resource, namespace string) {
+	s.mu.Lock()
+	s.forgotten = append(s.forgotten, res.GVR.GroupResource().String()+" in "+namespace)
+	s.mu.Unlock()
+}
+
+// Forgotten returns what ForgetRights was asked, in order:
+// "deployments.apps in default", "pods in " for every namespace.
+func (s *Session) Forgotten() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.forgotten)
 }
 
 func (s *Session) Watch(q kube.Query) (kube.Watch, error) {
@@ -294,9 +335,6 @@ func (s *Session) ClusterUsage() kube.UsageWatch {
 
 func (s *Session) YAML(_ context.Context, ref kube.ObjectRef, managedFields bool) (string, error) {
 	s.record("YAML", ref, managedFields)
-	if err := s.maySee(ref); err != nil {
-		return "", err
-	}
 	if err := s.err("YAML"); err != nil {
 		return "", err
 	}
@@ -305,9 +343,6 @@ func (s *Session) YAML(_ context.Context, ref kube.ObjectRef, managedFields bool
 
 func (s *Session) Describe(_ context.Context, ref kube.ObjectRef) (string, error) {
 	s.record("Describe", ref)
-	if err := s.maySee(ref); err != nil {
-		return "", err
-	}
 	if err := s.err("Describe"); err != nil {
 		return "", err
 	}
@@ -316,9 +351,6 @@ func (s *Session) Describe(_ context.Context, ref kube.ObjectRef) (string, error
 
 func (s *Session) SecretData(_ context.Context, ref kube.ObjectRef) ([]kube.SecretEntry, error) {
 	s.record("SecretData", ref)
-	if s.GrantValue.ReadOnly {
-		return nil, kube.ErrReadOnly
-	}
 	if err := s.err("SecretData"); err != nil {
 		return nil, err
 	}
@@ -374,9 +406,6 @@ func (s *Session) Replicas(_ context.Context, ref kube.ObjectRef) (int32, error)
 }
 
 func (s *Session) action(method string, args ...any) error {
-	if err := s.mayChange(); err != nil {
-		return err
-	}
 	s.record(method, args...)
 	return s.err(method)
 }

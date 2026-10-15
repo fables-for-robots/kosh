@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/fables-for-robots/kosh/keys"
 )
 
 func timeAfterWait() <-chan time.Time { return time.After(waitTime) }
@@ -27,7 +29,7 @@ func contextEnds(t *testing.T, s Session, what string) {
 
 func TestSessionGetsItsGrant(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("guest", true)
+	key := h.key(view("guest"))
 	raw := h.dialRaw()
 	cl, err := connect(raw, h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
 	if err != nil {
@@ -35,10 +37,11 @@ func TestSessionGetsItsGrant(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cl.Close() })
 	tm := openTerm(t, cl)
-	tm.waitFor("grant:read-only")
+	tm.waitFor("role:ClusterRole/view")
 	s := h.nextSession()
-	if !s.Grant.ReadOnly || s.Grant.Name != "guest" || s.Grant.Fingerprint != ssh.FingerprintSHA256(key.PublicKey()) {
-		t.Errorf("Session.Grant = %+v, want guest, read-only, with the key's fingerprint", s.Grant)
+	want := keys.Grant{Name: view("guest"), Fingerprint: ssh.FingerprintSHA256(key.PublicKey()), Role: keys.Role{Kind: keys.KindClusterRole, Name: "view"}}
+	if s.Grant != want {
+		t.Errorf("Session.Grant = %+v, want %+v", s.Grant, want)
 	}
 	if s.Transport != "tcp" {
 		t.Errorf("Session.Transport = %q, want tcp", s.Transport)
@@ -55,7 +58,7 @@ func TestSessionGetsItsGrant(t *testing.T) {
 
 func TestContextEndsWithTheSession(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 
 	tm := openTerm(t, h.dial(key, "kosh"))
 	tm.waitFor(testWord)
@@ -74,18 +77,18 @@ func TestContextEndsWithTheSession(t *testing.T) {
 
 // otherKey is a key in the list that no session of the test uses, so
 // that a list without the test's key is not empty.
-func otherKey(t *testing.T) string { return keyLine(newSigner(t), "other", false) }
+func otherKey(t *testing.T) string { return keyLine(newSigner(t), admin("other")) }
 
 func TestKeyRemovedEndsTheSession(t *testing.T) {
 	h := newHarness(t)
 	alice, bob := newSigner(t), newSigner(t)
-	setKeys(t, h.list, keyLine(alice, "alice", false), keyLine(bob, "bob", false))
+	setKeys(t, h.list, keyLine(alice, admin("alice")), keyLine(bob, admin("bob")))
 	ta := openTerm(t, h.dial(alice, "kosh"))
 	ta.waitFor(testWord)
 	tb := openTerm(t, h.dial(bob, "kosh"))
 	tb.waitFor(testWord)
 
-	setKeys(t, h.list, keyLine(bob, "bob", false))
+	setKeys(t, h.list, keyLine(bob, admin("bob")))
 	if st := ta.exit(); st != 1 {
 		t.Errorf("the removed key's session: exit status %d, want 1", st)
 	}
@@ -97,7 +100,7 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 		return r.Msg == "session end" && r.Attrs["key"] == admin("alice")
 	})
 	if rec.Attrs["reason"] != MsgKeyRemoved || rec.Attrs["duration"] == "" || rec.Attrs["transport"] != "tcp" ||
-		rec.Attrs["remote"] == "" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) || rec.Attrs["read_only"] != "false" {
+		rec.Attrs["remote"] == "" || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(alice.PublicKey()) || rec.Attrs["role"] != "ClusterRole/cluster-admin" {
 		t.Errorf("the end of the session is logged as %v", rec)
 	}
 
@@ -110,32 +113,43 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	}
 }
 
+// A session ends when its key's role changes, its kind, its namespace or
+// its name, and when the key's name changes: a session acts as the key's
+// name and with its role's rights, both as they were when it began.
 func TestGrantChangedEndsTheSession(t *testing.T) {
 	h := newHarness(t)
 	alice := newSigner(t)
-	for _, ro := range []bool{false, true} {
-		setKeys(t, h.list, keyLine(alice, "alice", ro))
+	for _, c := range []struct{ from, to string }{
+		{admin("alice"), view("alice")},
+		{view("alice"), admin("alice")},
+		{view("alice"), "alice/edit@team-a"},
+		{"alice/edit@team-a", "alice/edit@team-b"},
+		{"alice/edit@team-b", "alice/admin@team-b"},
+		{admin("alice"), admin("alice-renamed")},
+	} {
+		setKeys(t, h.list, keyLine(alice, c.from))
 		tm := openTerm(t, h.dial(alice, "kosh"))
-		tm.waitFor(testWord)
-		setKeys(t, h.list, keyLine(alice, "alice", !ro))
+		tm.waitFor("name:" + c.from)
+		setKeys(t, h.list, keyLine(alice, c.to))
 		if st := tm.exit(); st != 1 {
-			t.Errorf("read-only %v to %v: exit status %d, want 1", ro, !ro, st)
+			t.Errorf("%s to %s: exit status %d, want 1", c.from, c.to, st)
 		}
 		if out := tm.stdout.String(); !strings.HasSuffix(out, MsgGrantChanged+"\r\n") {
-			t.Errorf("read-only %v to %v: the session did not end with %q", ro, !ro, MsgGrantChanged)
+			t.Errorf("%s to %s: the session did not end with %q", c.from, c.to, MsgGrantChanged)
 		}
 	}
 
-	setKeys(t, h.list, keyLine(alice, "alice", false))
+	// The same list read again changes nothing.
+	setKeys(t, h.list, keyLine(alice, "alice/edit@team-a"))
 	tm := openTerm(t, h.dial(alice, "kosh"))
-	tm.waitFor(testWord)
-	setKeys(t, h.list, keyLine(alice, "alice-renamed", false))
+	tm.waitFor("role:Role/team-a/edit")
+	setKeys(t, h.list, keyLine(alice, "alice/edit@team-a"), otherKey(t))
 	tm.press("q")
 	if st := tm.exit(); st != 0 {
-		t.Errorf("after a change of the name alone: exit status %d after q, want 0", st)
+		t.Errorf("after a change of the list that left the key as it was: exit status %d after q, want 0", st)
 	}
 	if strings.Contains(tm.stdout.String(), "kosh:") {
-		t.Errorf("after a change of the name alone the session was told %q", tm.stdout.String())
+		t.Errorf("after a change of the list that left the key as it was the session was told %q", tm.stdout.String())
 	}
 }
 
@@ -145,7 +159,7 @@ func TestGrantChangedEndsTheSession(t *testing.T) {
 func TestKeyRemovedBetweenHandshakeAndSession(t *testing.T) {
 	h := newHarness(t)
 	alice := newSigner(t)
-	setKeys(t, h.list, keyLine(alice, "alice", false))
+	setKeys(t, h.list, keyLine(alice, admin("alice")))
 	cl := h.dial(alice, "kosh")
 	setKeys(t, h.list, otherKey(t))
 	select {
@@ -180,7 +194,7 @@ func (c *countingConn) Read(p []byte) (int, error) {
 func TestReplaceDoesNotBlockOnSessions(t *testing.T) {
 	h := newHarness(t, withServer(func(s *Server) { s.endTimeout = 200 * time.Millisecond }))
 	alice := newSigner(t)
-	setKeys(t, h.list, keyLine(alice, "alice", false))
+	setKeys(t, h.list, keyLine(alice, admin("alice")))
 	cc := &countingConn{Conn: h.dialRaw()}
 	cl, err := connect(cc, h.addr, clientConfig("kosh", ssh.PublicKeys(alice)))
 	if err != nil {
@@ -243,7 +257,7 @@ func TestReplaceDoesNotBlockOnSessions(t *testing.T) {
 func TestShutdown(t *testing.T) {
 	h := newHarness(t)
 	alice, bob := newSigner(t), newSigner(t)
-	setKeys(t, h.list, keyLine(alice, "alice", false), keyLine(bob, "bob", false))
+	setKeys(t, h.list, keyLine(alice, admin("alice")), keyLine(bob, admin("bob")))
 	ca, cb := h.dial(alice, "kosh"), h.dial(bob, "kosh")
 	ta, tb := openTerm(t, ca), openTerm(t, cb)
 	ta.waitFor(testWord)
@@ -284,7 +298,7 @@ func TestShutdown(t *testing.T) {
 func TestClosingTheChannelEndsTheSession(t *testing.T) {
 	const idle = 200 * time.Millisecond
 	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = idle }))
-	cl := h.dial(h.key("alice", false), "kosh")
+	cl := h.dial(h.key(admin("alice")), "kosh")
 	tm := openTerm(t, cl)
 	tm.waitFor(testWord)
 	s := h.nextSession()
@@ -316,7 +330,7 @@ func windowChange(t *testing.T, sess *ssh.Session, cols, rows uint32) {
 
 func TestWindowChangeBeforeShell(t *testing.T) {
 	h := newHarness(t)
-	cl := h.dial(h.key("alice", false), "kosh")
+	cl := h.dial(h.key(admin("alice")), "kosh")
 	sess, err := cl.NewSession()
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +407,7 @@ func (c *pausedConn) resume() {
 // the client answers its close; window changes until then are dropped.
 func TestWindowChangeAfterTheSession(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	pc := &pausedConn{Conn: h.dialRaw()}
 	t.Cleanup(pc.resume)
 	cl, err := connect(pc, h.addr, clientConfig("kosh", ssh.PublicKeys(key)))

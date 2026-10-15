@@ -71,7 +71,7 @@ func TestOwner(t *testing.T) {
 	}
 }
 
-// Owner reads only an object's metadata: of a Secret, a read-only key's
+// Owner reads only an object's metadata: of a Secret, a view key's
 // question fetches nothing of its data into kosh.
 func TestOwnerReadsOnlyMetadata(t *testing.T) {
 	secret := &corev1.Secret{
@@ -83,8 +83,8 @@ func TestOwnerReadsOnlyMetadata(t *testing.T) {
 	e := newEnv(t, envConfig{}, secret)
 	e.typed.ClearActions()
 	e.dyn.ClearActions()
-	ro := readSessionOf(t, e, readOnlyGrant)
-	got, err := ro.Owner(context.Background(), ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "token"})
+	view := readSessionOf(t, e, viewGrant)
+	got, err := view.Owner(context.Background(), ObjectRef{Resource: e.resource(t, "", "secrets"), Namespace: "default", Name: "token"})
 	if err != nil {
 		t.Fatal(err)
 	}

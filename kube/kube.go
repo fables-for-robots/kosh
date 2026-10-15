@@ -2,12 +2,14 @@
 // of every kind, an object's YAML and description, logs, and the actions
 // that change something.
 //
-// A Cluster is the whole process's: its clients, what it knows of the
-// API's resources, and the informers all sessions share. A Session is one
-// SSH session's handle on it and carries that session's grant. The
-// Session is the one place where a grant is checked: every method that
-// changes the cluster, and every one that returns a Secret's contents,
-// refuses a read-only grant with ErrReadOnly.
+// A Cluster is the whole process's: the ServiceAccount's clients, what
+// it knows of the API's resources, the clients of every identity, and
+// the informers the sessions of a role share. A Session is one SSH
+// session's handle on it and acts as that session's key: every request
+// it makes impersonates the key's user, kosh:<key name>, with the
+// group of its role, so that the API server allows or refuses it by the
+// role. kosh refuses nothing by the grant itself; it shows and logs the
+// API's refusals.
 //
 // The terminal UI sees the cluster only through the Session interface,
 // so that it is tested against kube/kubetest.
@@ -26,9 +28,6 @@ import (
 )
 
 var (
-	// ErrReadOnly is what a read-only grant gets from a method that
-	// changes the cluster or returns a Secret's contents.
-	ErrReadOnly = errors.New("this key is read-only")
 	// ErrUnknownResource is what Resolve returns for a name that no
 	// resource of the cluster answers to.
 	ErrUnknownResource = errors.New("no such resource")
@@ -356,6 +355,19 @@ type Reader interface {
 	// ErrUnknownResource is returned.
 	Resolve(ctx context.Context, name string) (Resource, error)
 
+	// Can reports whether the session's role allows verb on res, or on
+	// its subresource ("log", "scale"; "" for none), in namespace: ""
+	// for the cluster scope, or for a namespaced resource every
+	// namespace. It asks the API server, as the key, with a
+	// SelfSubjectAccessReview, and keeps the answer for two minutes. An
+	// error is answered as false and logged once per session.
+	Can(ctx context.Context, verb string, res Resource, subresource, namespace string) bool
+	// ForgetRights drops the answers Can keeps to the questions on res,
+	// any verb or subresource, in namespace, so that the next Can of them
+	// asks the API server again: what reading a table again asks for, as
+	// a role's binding or rules may have changed since.
+	ForgetRights(res Resource, namespace string)
+
 	// Watch opens the table of q. The table of a resource the session
 	// may not list is a Watch whose Table has Err, not an error here.
 	Watch(q Query) (Watch, error)
@@ -367,14 +379,12 @@ type Reader interface {
 	ClusterUsage() UsageWatch
 
 	// YAML returns the object as YAML, read from the API now, without
-	// managedFields unless they are asked for. For a Secret it is
-	// refused to a read-only grant.
+	// managedFields unless they are asked for.
 	YAML(ctx context.Context, ref ObjectRef, managedFields bool) (string, error)
-	// Describe returns what kubectl describe prints of the object. For
-	// a Secret it is refused to a read-only grant.
+	// Describe returns what kubectl describe prints of the object.
 	Describe(ctx context.Context, ref ObjectRef) (string, error)
 	// SecretData returns the entries of a Secret, decoded and sorted by
-	// key. It is refused to a read-only grant.
+	// key.
 	SecretData(ctx context.Context, ref ObjectRef) ([]SecretEntry, error)
 
 	// Logs reads the log of a pod, or of the pods of a deployment,
@@ -395,10 +405,10 @@ type Reader interface {
 	Replicas(ctx context.Context, ref ObjectRef) (int32, error)
 }
 
-// Actions is what a session with a full key may do. Every method is
-// refused to a read-only grant with ErrReadOnly, before anything is sent
-// to the API, and every call is logged with the name of the key, what it
-// was for and what came of it.
+// Actions is what a session may do, as far as its role allows: the API
+// server refuses what the role does not, and every call is logged with
+// the name of the key, what it was for and what came of it, the API's
+// refusal among it.
 //
 // A method of Actions takes a context first and returns an error last.
 // The test that goes through all of them relies on it.
@@ -443,7 +453,7 @@ type Actions interface {
 	// status: the result has it. The error is ErrExecNotStarted,
 	// wrapped around the reason, when the command could not be started;
 	// the API's own error when it refused (not found, forbidden: the
-	// ServiceAccount needs get and create on pods/exec); and the
+	// role needs get on pods and create on pods/exec); and the
 	// context's when ctx or the session ended first.
 	//
 	// ctx is the session's turn, whose end is the session's end: a

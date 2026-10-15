@@ -128,7 +128,7 @@ func metricsEnv(t *testing.T, api *metricsAPI, opts Options) *env {
 // acquired acquires the poller of gvr and fails the test on an error.
 func acquired(t *testing.T, c *Cluster, gvr schema.GroupVersionResource) *metricsPoller {
 	t.Helper()
-	p, err := c.acquireMetrics(gvr)
+	p, err := c.acquireMetrics(fullKey(gvr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,10 +147,17 @@ func stopsListing(t *testing.T, api *metricsAPI, gvr schema.GroupVersionResource
 	}
 }
 
+// pollerOf returns a running poller of gvr, of any role; nil when none
+// runs.
 func (c *Cluster) pollerOf(gvr schema.GroupVersionResource) *metricsPoller {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.pollers[gvr]
+	for key, p := range c.pollers {
+		if key.gvr == gvr {
+			return p
+		}
+	}
+	return nil
 }
 
 func TestMetricsServedFollowsDiscovery(t *testing.T) {
@@ -384,7 +391,7 @@ func TestCloseStopsPollers(t *testing.T) {
 	if e.c.pollerOf(PodMetrics) != nil || e.c.pollerOf(NodeMetrics) != nil {
 		t.Error("a poller is kept after Close")
 	}
-	if _, err := e.c.acquireMetrics(PodMetrics); !errors.Is(err, errClosed) {
+	if _, err := e.c.acquireMetrics(fullKey(PodMetrics)); !errors.Is(err, errClosed) {
 		t.Errorf("acquire after Close: %v, want errClosed", err)
 	}
 	// A watch that closes after the Cluster releases what it holds.
@@ -394,7 +401,7 @@ func TestCloseStopsPollers(t *testing.T) {
 
 func TestAcquireMetricsOfAnotherKind(t *testing.T) {
 	e := newEnv(t, envConfig{})
-	if _, err := e.c.acquireMetrics(render.Pods); err == nil {
+	if _, err := e.c.acquireMetrics(fullKey(render.Pods)); err == nil {
 		t.Error("a poller of pods, not of their metrics")
 	}
 }

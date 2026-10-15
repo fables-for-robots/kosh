@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # kosh end to end, as its users meet it: kosh's image in a kind cluster of
 # its own, installed with the chart, reached with the real ssh and the
-# real iroh-ssh by the Go tests of e2e/ (built with the tag e2e). Run
+# real iroh-ssh by the Go tests of e2e/ (built with the tag e2e), as
+# three keys of three roles: alice@kosh-e2e/cluster-admin,
+# bob@kosh-e2e/view, and carol@kosh-e2e/edit@kosh-e2e-team, whose Role
+# edit the script makes in the namespace kosh-e2e-team. Run
 # from anywhere, on Linux with Docker, Nix and the network; it exits 0
 # only when every test passed.
 #
@@ -158,7 +161,7 @@ kind load docker-image "$TAG" --name "$CLUSTER"
 curl -fsSL --retry 3 -o "$WORK/metrics-server.yaml" "$METRICS_SERVER"
 echo "$METRICS_SERVER_SHA256  $WORK/metrics-server.yaml" | sha256sum -c --quiet - || fail "$METRICS_SERVER is not the one this script knows"
 # A registry that does not answer at once is tried again, three times.
-sed -n 's/^ *image: *//p' e2e/testdata/2-objects.yaml "$WORK/metrics-server.yaml" | while read -r image; do
+sed -n 's/^ *image: *//p' e2e/testdata/0-team.yaml e2e/testdata/2-objects.yaml "$WORK/metrics-server.yaml" | while read -r image; do
   for try in 1 2 3; do
     docker exec "$CLUSTER-control-plane" crictl pull "$image" >/dev/null && break
     [ "$try" != 3 ] || fail "$image could not be pulled into the node"
@@ -178,10 +181,14 @@ kubectl --namespace kube-system patch deployment metrics-server --type=json \
 kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=180s
 kubectl --namespace kube-system wait --for=condition=Available deployment/metrics-server --timeout=180s
 
-# 3. The keys and the state.
-step "the keys and the state"
-ssh-keygen -q -t ed25519 -N '' -C alice@kosh-e2e/admin -f "$WORK/full"
-ssh-keygen -q -t ed25519 -N '' -C bob@kosh-e2e -f "$WORK/readonly"
+# 3. The keys, carol's namespace and Role, and the state.
+step "the keys, the namespace kosh-e2e-team and the state"
+ssh-keygen -q -t ed25519 -N '' -C alice@kosh-e2e/cluster-admin -f "$WORK/full"
+ssh-keygen -q -t ed25519 -N '' -C bob@kosh-e2e/view -f "$WORK/view"
+ssh-keygen -q -t ed25519 -N '' -C carol@kosh-e2e/edit@kosh-e2e-team -f "$WORK/team"
+# Before kosh, which makes carol's RoleBinding at its start: the
+# namespace, and the Role the binding names.
+kubectl apply -f e2e/testdata/0-team.yaml
 mkdir -m 0700 "$WORK/state"
 docker run --rm --user "$(id -u):$(id -g)" -v "$WORK/state:/state" "$TAG" id --state-dir /state >"$WORK/id"
 cat "$WORK/id"
@@ -190,7 +197,7 @@ sed -n 's/^host key *//p' "$WORK/id" >"$WORK/host_key.pub"
 [ -n "$ENDPOINT" ] && [ -s "$WORK/host_key.pub" ] || fail "kosh id printed no endpoint ID or host key"
 kubectl create namespace "$NAMESPACE"
 kubectl --namespace "$NAMESPACE" create secret generic kosh-state --from-file="$WORK/state"
-cat "$WORK/full.pub" "$WORK/readonly.pub" >"$WORK/authorized_keys"
+cat "$WORK/full.pub" "$WORK/view.pub" "$WORK/team.pub" >"$WORK/authorized_keys"
 
 # 4. kosh, installed with its chart.
 step "kosh, installed with the chart"
@@ -221,6 +228,7 @@ kubectl wait --for=condition=Established crd/widgets.e2e.kosh.test --timeout=60s
 kubectl apply -f e2e/testdata/2-objects.yaml
 kubectl --namespace default wait --for=condition=Ready pod/marker --timeout=120s
 kubectl --namespace default rollout status deploy/web --timeout=120s
+kubectl --namespace kosh-e2e-team wait --for=condition=Ready pod/teamwork --timeout=120s
 
 # 7. The Service, on a local port.
 step "the Service, forwarded"
@@ -289,7 +297,8 @@ deadline=20m
 [ "${KOSH_E2E_SLOW:-}" != 1 ] || deadline=40m
 KOSH_E2E_SSH=127.0.0.1:$port \
   KOSH_E2E_FULL_KEY=$WORK/full \
-  KOSH_E2E_READONLY_KEY=$WORK/readonly \
+  KOSH_E2E_VIEW_KEY=$WORK/view \
+  KOSH_E2E_TEAM_KEY=$WORK/team \
   KOSH_E2E_HOST_KEY=$WORK/host_key.pub \
   KOSH_E2E_ENDPOINT=$ENDPOINT \
   KOSH_E2E_IROH_SSH=$iroh_ssh \

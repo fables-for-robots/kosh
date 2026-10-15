@@ -142,7 +142,7 @@ func shellPodYAML(annotation string, main, init, eph []shellCtr) string {
 
 var shellWeb = kubetest.Ref("pods", "default", "web")
 
-// shellSetup returns a full key's session whose pods are web and zeta,
+// shellSetup returns a cluster-admin key's session whose pods are web and zeta,
 // web's YAML being yaml, and a program with a hand-over in the pods.
 func shellSetup(t *testing.T, yaml string) (*kubetest.Session, *shellTerm, *harness) {
 	t.Helper()
@@ -204,8 +204,9 @@ var shellDefaultWords = []string{"sh", "-c", "command -v bash >/dev/null && exec
 
 func TestShellBinding(t *testing.T) {
 	yaml := shellPodYAML("", running("app"), nil, nil)
-	open := func(t *testing.T, grant keys.Grant, term *shellTerm) (*kubetest.Session, *harness) {
+	open := func(t *testing.T, grant keys.Grant, allow func(*kubetest.Session), term *shellTerm) (*kubetest.Session, *harness) {
 		sess := kubetest.New(grant)
+		allow(sess)
 		sess.SetTable(query("pods", "default"), podsNamed("web"))
 		sess.YAMLs[shellWeb.String()] = yaml
 		sess.SetTable(queryOf(kube.Containers, shellWeb), kube.Table{
@@ -217,11 +218,14 @@ func TestShellBinding(t *testing.T) {
 		sess.SetTable(kube.Query{Resource: kubetest.Resource("nodes")}, clusterTable("n1"))
 		return sess, newShellHarness(t, sess, term, 200, 40)
 	}
-	full := keys.Grant{Name: "alice@laptop"}
-	readOnly := keys.Grant{Name: "bob@laptop", ReadOnly: true}
+	full := keys.Grant{Name: "alice@laptop", Role: clusterAdmin}
+	allowAll := func(s *kubetest.Session) { s.Allow("*", "*", "*", "*", "*") }
+	// A role that may exec in pods and not get them, which the dialog
+	// reads them with.
+	execOnly := func(s *kubetest.Session) { s.Allow("create", "", "pods", "exec", "") }
 
-	t.Run("a full key with a hand-over", func(t *testing.T) {
-		sess, hs := open(t, full, newShellTerm())
+	t.Run("a cluster-admin key with a hand-over", func(t *testing.T) {
+		sess, hs := open(t, full, allowAll, newShellTerm())
 		if !shellHints(hs) {
 			t.Errorf("the pods have no <s> Shell: %v", hs.root().top().Hints())
 		}
@@ -267,13 +271,15 @@ func TestShellBinding(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		grant keys.Grant
+		allow func(*kubetest.Session)
 		term  *shellTerm
 	}{
-		{"a read-only key", readOnly, newShellTerm()},
-		{"no hand-over", full, nil},
+		{"a view key", viewGrant, allowView, newShellTerm()},
+		{"a key that may exec and not get the pod", full, execOnly, newShellTerm()},
+		{"no hand-over", full, allowAll, nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			sess, hs := open(t, c.grant, c.term)
+			sess, hs := open(t, c.grant, c.allow, c.term)
 			if shellHints(hs) {
 				t.Error("the pods have <s> Shell")
 			}
@@ -848,18 +854,6 @@ func TestShellDialogHoldsNothing(t *testing.T) {
 	}
 }
 
-func TestShellReadOnlyKeyRefused(t *testing.T) {
-	// The session refuses Exec whatever the UI does; the UI says so as
-	// everywhere.
-	sess, _, hs := shellSetup(t, shellPodYAML("", running("app"), nil, nil))
-	sess.Errs["Exec"] = kube.ErrReadOnly
-	hs.press("s", "enter")
-	hs.wantFrame("this key is read-only")
-	if actionBusy(sess) {
-		t.Error("the action keys are still held")
-	}
-}
-
 func TestShellErrorTextIsCleaned(t *testing.T) {
 	evil := "evil\x1b]0;owned\x07\x1b[2J\r"
 	sess := newSession()
@@ -873,7 +867,7 @@ func TestShellErrorTextIsCleaned(t *testing.T) {
 	e := env{sess: sess, now: hs.clock.now, handover: term.handover}
 	q := query("pods", "default")
 	var shell binding
-	for _, b := range bindingsFor(q.Resource, sess.Grant()) {
+	for _, b := range bindingsFor(q.Resource, sess.Grant(), canAll) {
 		if b.Key == "s" {
 			shell = b
 		}
@@ -924,7 +918,7 @@ func TestShellHoldsTheActionKeys(t *testing.T) {
 	e := env{sess: sess, now: hs.clock.now, handover: term.handover}
 	q := query("pods", "default")
 	var kill, shell binding
-	for _, b := range bindingsFor(q.Resource, sess.Grant()) {
+	for _, b := range bindingsFor(q.Resource, sess.Grant(), canAll) {
 		switch b.Key {
 		case "ctrl+k":
 			kill = b
@@ -1018,8 +1012,9 @@ func TestShellTableIsReadAgain(t *testing.T) {
 	}
 }
 
-func TestShellReadOnlyGrant(t *testing.T) {
-	sess := kubetest.New(keys.Grant{Name: "bob@laptop", ReadOnly: true})
+func TestShellViewKey(t *testing.T) {
+	sess := kubetest.New(viewGrant)
+	allowView(sess)
 	sess.SetTable(query("pods", "default"), podsNamed("web"))
 	sess.YAMLs[shellWeb.String()] = shellPodYAML("", running("app"), nil, nil)
 	term := newShellTerm()
@@ -1039,10 +1034,6 @@ func TestShellReadOnlyGrant(t *testing.T) {
 	}
 	if term.runs != 0 {
 		t.Error("the terminal was handed over")
-	}
-	// Called whatever the UI does, the session refuses it.
-	if _, err := sess.Exec(context.Background(), shellWeb, kube.ExecOptions{Command: []string{"sh"}}); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("the session's Exec gives %v to a read-only key", err)
 	}
 }
 
@@ -1132,7 +1123,7 @@ func TestShellEndsWithItsSession(t *testing.T) {
 	e := env{sess: sess, now: hs.clock.now, handover: handover}
 	q := query("pods", "default")
 	var shell binding
-	for _, b := range bindingsFor(q.Resource, sess.Grant()) {
+	for _, b := range bindingsFor(q.Resource, sess.Grant(), canAll) {
 		if b.Key == "s" {
 			shell = b
 		}

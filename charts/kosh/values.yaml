@@ -9,9 +9,16 @@ image:
 imagePullSecrets: []
 
 # The key list: the text of an OpenSSH authorized_keys file, one key to a
-# line, the comment after the key its name. A key whose name ends in /admin
-# is an admin; every other key is read-only. A line with an option is
-# rejected. Changing it does not restart kosh, which follows the file.
+# line, the comment after the key its name. The name ends in the role
+# whose rights the key has: name/<role> for the ClusterRole <role>
+# (alice@laptop/cluster-admin, bob@laptop/view), name/<role>@<namespace>
+# for the Role <role> in <namespace> (carol/edit@team-a). kosh binds each
+# role to the keys that name it. A line without a role, with an option,
+# or whose role or namespace is not a Kubernetes name, is rejected. Note
+# that /admin is the ClusterRole admin, not cluster-admin. Changing the
+# list does not restart kosh, which follows the file. Whoever may edit
+# this list, or the ConfigMap it is in, may give any key any role: keep
+# the release's namespace writable by cluster administrators alone.
 authorizedKeys: ""
 
 ssh:
@@ -65,10 +72,15 @@ state:
 rbac:
   # Bind the ServiceAccount to a ClusterRole.
   create: true
-  # The ClusterRole. An admin of kosh can do whatever this role can;
-  # cluster-admin says that plainly. A shell needs get and create on
-  # pods/exec. The CPU and memory columns and the header's CPU and MEM need
-  # get and list on pods and nodes in the group metrics.k8s.io.
+  # The ClusterRole. A session acts as its key, impersonated by the
+  # ServiceAccount, with the rights of the key's role; kosh makes the
+  # bindings of those roles. The least the ServiceAccount needs:
+  # impersonate on users and groups; get, list, create, update and delete
+  # on clusterrolebindings and rolebindings; get on clusterroles and
+  # roles; and bind on clusterroles and roles (or every right of the
+  # roles the key list names). A ServiceAccount that may impersonate
+  # anyone and bind any role is as powerful as cluster-admin, which says
+  # that plainly.
   clusterRole: cluster-admin
 
 serviceAccount:

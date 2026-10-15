@@ -36,7 +36,7 @@ func countLists(e *env, resource string) *atomic.Int32 {
 // acquire acquires the cache of gvr and releases it when the test ends.
 func acquire(t *testing.T, e *env, gvr schema.GroupVersionResource) *kindCache {
 	t.Helper()
-	k, err := e.c.acquire(gvr)
+	k, err := e.c.acquire(fullKey(gvr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestKindCacheStopsWhenIdle(t *testing.T) {
 	eventually(t, "the idle cache is dropped", func() bool {
 		e.c.mu.Lock()
 		defer e.c.mu.Unlock()
-		return e.c.caches[render.Pods] == nil
+		return e.c.caches[fullKey(render.Pods)] == nil
 	})
 	c := acquire(t, e, render.Pods)
 	defer e.c.release(c)
@@ -309,7 +309,7 @@ func TestKindCacheStopsWhenIdle(t *testing.T) {
 func TestAcquireAfterClose(t *testing.T) {
 	e := newEnv(t, envConfig{})
 	e.c.Close()
-	if _, err := e.c.acquire(render.Pods); err == nil {
+	if _, err := e.c.acquire(fullKey(render.Pods)); err == nil {
 		t.Error("acquire after Close starts an informer")
 	}
 }
@@ -321,7 +321,7 @@ func TestCloseStopsEverything(t *testing.T) {
 	eventually(t, "the first list", func() bool { return synced(k) })
 	j := acquire(t, e, render.Jobs)
 	e.c.release(j) // idle, with its timer running
-	e.c.tables = &fakeTables{table: &metav1.Table{}}
+	e.setTables(&fakeTables{table: &metav1.Table{}})
 	s := e.session(t)
 	if _, err := s.Watch(Query{Resource: e.resource(t, "example.com", "widgets")}); err != nil {
 		t.Fatal(err)

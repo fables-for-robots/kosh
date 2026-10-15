@@ -48,6 +48,10 @@ func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (Log
 	if err := s.c.checkRef(ref); err != nil {
 		return nil, err
 	}
+	api, err := s.api()
+	if err != nil {
+		return nil, err
+	}
 	var (
 		namespace string
 		sources   []logSource
@@ -55,7 +59,7 @@ func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (Log
 	)
 	switch {
 	case ref.Resource.Is("", "pods"):
-		p, err := s.c.typed.CoreV1().Pods(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+		p, err := api.typed.CoreV1().Pods(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -73,11 +77,11 @@ func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (Log
 	case ref.Resource.Is("apps", "deployments"), ref.Resource.Is("apps", "replicasets"),
 		ref.Resource.Is("apps", "statefulsets"), ref.Resource.Is("apps", "daemonsets"),
 		ref.Resource.Is("batch", "jobs"), ref.Resource.Is("", "services"):
-		ns, sel, err := s.c.podSelector(ctx, ref)
+		ns, sel, err := api.podSelector(ctx, ref)
 		if err != nil {
 			return nil, err
 		}
-		list, err := s.c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+		list, err := api.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
 		if err != nil {
 			return nil, err
 		}
@@ -102,7 +106,7 @@ func (s *session) Logs(ctx context.Context, ref ObjectRef, opts LogOptions) (Log
 		skipped = len(sources) - LogMaxContainers
 		sources = sources[:LogMaxContainers]
 	}
-	ls, err := s.c.startLogs(s.ctx, namespace, sources, podLogOptions(opts, previous), opts.From == LogHead, skipped)
+	ls, err := s.c.startLogs(s.ctx, api.openLog, namespace, sources, podLogOptions(opts, previous), opts.From == LogHead, skipped)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +175,7 @@ func podLogOptions(opts LogOptions, previous bool) corev1.PodLogOptions {
 // the stream's own closes lines once they have all ended.
 type logStream struct {
 	c       *Cluster
+	open    func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) // the session's
 	lines   chan []LogLine
 	skipped int
 	cancel  context.CancelFunc
@@ -182,14 +187,15 @@ type logStream struct {
 	budget int
 }
 
-// startLogs starts reading the logs of sources, each opened with opts
-// and its container; with head the whole stream ends after
+// startLogs starts reading the logs of sources, each opened by open
+// with opts and its container; with head the whole stream ends after
 // LogBufferLines lines. The stream ends with Close, with ctx and with
 // the Cluster.
-func (c *Cluster) startLogs(ctx context.Context, namespace string, sources []logSource, opts corev1.PodLogOptions, head bool, skipped int) (*logStream, error) {
+func (c *Cluster) startLogs(ctx context.Context, open func(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error), namespace string, sources []logSource, opts corev1.PodLogOptions, head bool, skipped int) (*logStream, error) {
 	readCtx, cancel := context.WithCancel(c.ctx)
 	ls := &logStream{
 		c:       c,
+		open:    open,
 		lines:   make(chan []LogLine),
 		skipped: skipped,
 		cancel:  cancel,
@@ -288,7 +294,7 @@ func (ls *logStream) read(ctx context.Context, namespace string, src logSource, 
 			return false
 		}
 	}
-	rc, err := ls.c.openLog(ctx, namespace, src.pod, opts)
+	rc, err := ls.open(ctx, namespace, src.pod, opts)
 	if err != nil {
 		if ctx.Err() == nil {
 			send(LogLine{Text: fmt.Sprintf("the log of container %s of pod %s cannot be read: %v", src.container, src.pod, err)})

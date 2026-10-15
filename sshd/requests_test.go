@@ -37,7 +37,7 @@ func TestEnvRequestsAreBounded(t *testing.T) {
 			handle(ss)
 		}
 	}))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	cl := h.dial(key, "kosh")
 
 	// A session on the first channel, so that the connection is not idle.
@@ -122,7 +122,7 @@ func TestEnvRequestsAreBounded(t *testing.T) {
 
 func TestOnlyKnownRequests(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	cl := h.dial(key, "kosh")
 	sess, err := cl.NewSession()
 	if err != nil {
@@ -245,8 +245,8 @@ func TestCutReason(t *testing.T) {
 
 func TestRemovedKeyLosesItsConnections(t *testing.T) {
 	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = time.Hour }))
-	alice := h.key("alice", false)
-	bob := h.key("bob", false)
+	alice := h.key(admin("alice"))
+	bob := h.key(admin("bob"))
 	busy, idle := h.dial(alice, "kosh"), h.dial(alice, "kosh")
 	other := h.dial(bob, "kosh")
 	tm := openTerm(t, busy)
@@ -288,11 +288,11 @@ func TestRemovedKeyLosesItsConnections(t *testing.T) {
 // new grant.
 func TestGrantChangedKeepsTheConnection(t *testing.T) {
 	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = time.Hour }))
-	alice := h.key("alice", false)
+	alice := h.key(admin("alice"))
 	cl := h.dial(alice, "kosh")
 	tm := openTerm(t, cl)
-	tm.waitFor("grant:full")
-	h.lines = []string{keyLine(alice, "alice", true)}
+	tm.waitFor("role:ClusterRole/cluster-admin")
+	h.lines = []string{keyLine(alice, view("alice"))}
 	setKeys(t, h.list, h.lines...)
 	if st := tm.exit(); st != 1 {
 		t.Errorf("exit status %d", st)
@@ -303,5 +303,5 @@ func TestGrantChangedKeepsTheConnection(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	again := openTerm(t, cl)
-	again.waitFor("grant:read-only")
+	again.waitFor("role:ClusterRole/view")
 }

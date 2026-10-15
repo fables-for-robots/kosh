@@ -57,7 +57,7 @@ type containersWatch struct {
 }
 
 func (s *session) watchContainers(pod ObjectRef) (Watch, error) {
-	k, err := s.c.acquire(pod.Resource.GVR)
+	k, err := s.c.acquire(s.cacheKey(pod.Resource, pod.Namespace))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func (s *session) watchContainers(pod ObjectRef) (Watch, error) {
 		namespace:   pod.Namespace,
 		name:        pod.Name,
 		changed:     ch,
-		metrics:     &metricsHold{c: s.c, gvr: PodMetrics, changed: ch},
+		metrics:     &metricsHold{c: s.c, key: metricsKeyOf(k, PodMetrics), changed: ch},
 		unsubscribe: unsubscribe,
 		stopCache:   ch.forward(s.c, changed),
 	}
@@ -126,9 +126,11 @@ func (w *containersWatch) Close() {
 }
 
 // rulesWatch is the table of the rules of a role, read with the typed
-// client now and every opts.TablePoll by a goroutine of its own.
+// client of the session now and every opts.TablePoll by a goroutine of
+// its own.
 type rulesWatch struct {
 	c         *Cluster
+	api       *clients
 	of        ObjectRef
 	changed   chan struct{}
 	cancel    context.CancelFunc
@@ -144,10 +146,15 @@ type rulesWatch struct {
 }
 
 func (s *session) watchRules(of ObjectRef) (Watch, error) {
+	api, err := s.api()
+	if err != nil {
+		return nil, err
+	}
 	c := s.c
 	ctx, cancel := context.WithCancel(c.ctx)
 	w := &rulesWatch{
 		c:       c,
+		api:     api,
 		of:      of,
 		changed: make(chan struct{}, 1),
 		cancel:  cancel,
@@ -188,7 +195,7 @@ func (w *rulesWatch) poll(ctx context.Context) {
 // read reads the rules once and signals when what the watch shows
 // changed.
 func (w *rulesWatch) read(ctx context.Context) {
-	rules, err := w.c.rulesOf(ctx, w.of)
+	rules, err := w.api.rulesOf(ctx, w.of)
 	if ctx.Err() != nil {
 		return
 	}
@@ -245,9 +252,9 @@ func (w *rulesWatch) Close() {
 
 // rulesOf reads the rules of a role or clusterrole, or of the role or
 // clusterrole a binding names.
-func (c *Cluster) rulesOf(ctx context.Context, of ObjectRef) ([]rbacv1.PolicyRule, error) {
+func (api *clients) rulesOf(ctx context.Context, of ObjectRef) ([]rbacv1.PolicyRule, error) {
 	get := metav1.GetOptions{}
-	rbac := c.typed.RbacV1()
+	rbac := api.typed.RbacV1()
 	switch {
 	case of.Resource.Is(rbacGroup, "roles"):
 		r, err := rbac.Roles(of.Namespace).Get(ctx, of.Name, get)
@@ -266,25 +273,25 @@ func (c *Cluster) rulesOf(ctx context.Context, of ObjectRef) ([]rbacv1.PolicyRul
 		if err != nil {
 			return nil, err
 		}
-		return c.rulesOfRole(ctx, b.Namespace, b.RoleRef)
+		return api.rulesOfRole(ctx, b.Namespace, b.RoleRef)
 	case of.Resource.Is(rbacGroup, "clusterrolebindings"):
 		b, err := rbac.ClusterRoleBindings().Get(ctx, of.Name, get)
 		if err != nil {
 			return nil, err
 		}
-		return c.rulesOfRole(ctx, "", b.RoleRef)
+		return api.rulesOfRole(ctx, "", b.RoleRef)
 	}
 	return nil, ErrNoRelation
 }
 
 // rulesOfRole reads the rules of the role a binding of namespace names:
 // a Role of that namespace, or a ClusterRole.
-func (c *Cluster) rulesOfRole(ctx context.Context, namespace string, ref rbacv1.RoleRef) ([]rbacv1.PolicyRule, error) {
+func (api *clients) rulesOfRole(ctx context.Context, namespace string, ref rbacv1.RoleRef) ([]rbacv1.PolicyRule, error) {
 	switch {
 	case ref.Kind == "Role" && namespace != "":
-		return c.rulesOf(ctx, ObjectRef{Resource: Resource{GVR: rbacv1.SchemeGroupVersion.WithResource("roles")}, Namespace: namespace, Name: ref.Name})
+		return api.rulesOf(ctx, ObjectRef{Resource: Resource{GVR: rbacv1.SchemeGroupVersion.WithResource("roles")}, Namespace: namespace, Name: ref.Name})
 	case ref.Kind == "ClusterRole":
-		return c.rulesOf(ctx, ObjectRef{Resource: Resource{GVR: rbacv1.SchemeGroupVersion.WithResource("clusterroles")}, Name: ref.Name})
+		return api.rulesOf(ctx, ObjectRef{Resource: Resource{GVR: rbacv1.SchemeGroupVersion.WithResource("clusterroles")}, Name: ref.Name})
 	}
 	return nil, fmt.Errorf("the binding names a %s, which has no rules kosh can read", ref.Kind)
 }

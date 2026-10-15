@@ -87,7 +87,11 @@ func (v *tableView) key(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return popView()
 	case "ctrl+r":
-		return v.readNow()
+		// The rights too, the answers the session keeps forgotten: a
+		// question the API did not answer was answered no, and a key's
+		// binding may have been made, or its role changed, since.
+		v.forgetRights()
+		return tea.Batch(v.readNow(), v.askRights())
 	case "enter":
 		return v.enter()
 	case "J":
@@ -234,15 +238,16 @@ func (v *tableView) bindingHints() []hint {
 	return hs
 }
 
-// bindings are the table's bindings: none for a plain table, and none
-// that hands the terminal over when the session has no terminal to hand
-// over.
+// bindings are the table's bindings: none for a plain table, none whose
+// needs the session's answers do not meet (none with a need before the
+// answers are in), and none that hands the terminal over when the
+// session has no terminal to hand over.
 func (v *tableView) bindings() []binding {
 	if v.plain {
 		return nil
 	}
 	var out []binding
-	for _, b := range bindingsFor(v.q.Resource, v.grant) {
+	for _, b := range bindingsFor(v.q.Resource, v.grant, v.can) {
 		if b.Handover && v.e.handover == nil {
 			continue
 		}

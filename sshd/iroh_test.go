@@ -67,7 +67,7 @@ func (il *irohListener) connect(t *testing.T, signer ssh.Signer) (*ssh.Client, e
 
 func TestIrohAcceptedKey(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	il := h.serveIroh()
 	cl, err := il.connect(t, key)
 	if err != nil {
@@ -103,7 +103,7 @@ func TestIrohAcceptedKey(t *testing.T) {
 
 func TestIrohRejectedKey(t *testing.T) {
 	h := newHarness(t)
-	h.key("alice", false)
+	h.key(admin("alice"))
 	il := h.serveIroh()
 	if cl, err := il.connect(t, newSigner(t)); err == nil {
 		_ = cl.Close()
@@ -143,7 +143,7 @@ func isTimeout(err error) bool {
 func TestIrohSessionEndsTheConnection(t *testing.T) {
 	const idle = 200 * time.Millisecond
 	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = idle }))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	il := h.serveIroh()
 	cl, err := il.connect(t, key)
 	if err != nil {
@@ -168,7 +168,7 @@ func TestShutdownTellsSessionsOverIroh(t *testing.T) {
 	for _, transport := range []string{"iroh", "tcp"} {
 		t.Run(transport, func(t *testing.T) {
 			h := newHarness(t)
-			key := h.key("alice", false)
+			key := h.key(admin("alice"))
 			var (
 				cl    *ssh.Client
 				il    *irohListener

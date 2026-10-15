@@ -9,21 +9,25 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Owner reads the object's metadata alone, with the metadata client,
-// and returns its owner: the owner reference that is the controller, or
-// else the first. ErrNoOwner when it has none; an error that names the
-// kind when the owner's kind is not a resource of the cluster. Nothing
-// but the metadata is read: of a Secret, not its data.
+// Owner reads the object's metadata alone, with the session's metadata
+// client, and returns its owner: the owner reference that is the
+// controller, or else the first. ErrNoOwner when it has none; an error
+// that names the kind when the owner's kind is not a resource of the
+// cluster. Nothing but the metadata is read: of a Secret, not its data.
 func (s *session) Owner(ctx context.Context, ref ObjectRef) (ObjectRef, error) {
 	ctx, release := s.bound(ctx)
 	defer release()
 	if err := s.c.checkRef(ref); err != nil {
 		return ObjectRef{}, err
 	}
-	if s.c.meta == nil {
+	api, err := s.api()
+	if err != nil {
+		return ObjectRef{}, err
+	}
+	if api.meta == nil {
 		return ObjectRef{}, errors.New("kosh cannot read the metadata of objects: the cluster was made without a connection")
 	}
-	o, err := s.c.meta.Resource(ref.Resource.GVR).Namespace(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	o, err := api.meta.Resource(ref.Resource.GVR).Namespace(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		return ObjectRef{}, err
 	}

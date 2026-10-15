@@ -61,17 +61,19 @@ type usageMsg struct {
 }
 
 func newRoot(e env, version string) *root {
+	grant := e.sess.Grant()
 	return &root{
 		e:       e,
 		version: version,
-		grant:   e.sess.Grant(),
+		grant:   grant,
 		cluster: e.sess.ClusterVersion(),
-		ns:      namespaces{current: "default"},
+		ns:      startNamespaces(grant),
 	}
 }
 
-// Init resolves pods and opens their table in the namespace default,
-// and opens the cluster's usage for the header.
+// Init resolves pods and opens their table in the starting namespace:
+// the one of the key's Role, or default. It opens the cluster's usage
+// for the header.
 func (r *root) Init() tea.Cmd {
 	r.usageWatch = r.e.sess.ClusterUsage()
 	return tea.Batch(r.resolve("pods", "pods", "", false, true, true), r.waitUsage())

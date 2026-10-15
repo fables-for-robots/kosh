@@ -1,0 +1,40 @@
+Key:     bob@laptop/view   <esc> Back
+Cluster: v1.33.1
+kosh:    v0.1.0
+
+
+
+┌──────────────────────────────────────────────────────── Help ────────────────────────────────────────────────────────┐
+│PODS                                  GENERAL                                                                         │
+│<j/down>        Down                  <:>      Command                                                                │
+│<k/up>          Up                    </>      Filter                                                                 │
+│<ctrl-f/pgdown> Page Down             <?>      Help                                                                   │
+│<ctrl-b/pgup>   Page Up               <ctrl-a> Aliases                                                                │
+│<g/home>        Top                   <ctrl-e> Toggle Header                                                          │
+│<shift-g/end>   Bottom                <[>      History Back                                                           │
+│<left/right>    Column                <]>      History Forward                                                        │
+│<shift-n>       Sort Name             <->      Last View                                                              │
+│<shift-a>       Sort Age              <esc>    Back                                                                   │
+│<shift-s>       Sort Status           <ctrl-c> Quit                                                                   │
+│<shift-o>       Sort Column                                                                                           │
+│<ctrl-w>        Wide                                                                                                  │
+│<ctrl-z>        Faults                                                                                                │
+│</>             Filter                                                                                                │
+│<space>         Mark                                                                                                  │
+│<shift-j>       Owner                                                                                                 │
+│<?>             Help                                                                                                  │
+│<ctrl-space>    Mark Range                                                                                            │
+│<ctrl-\>        Clear Marks                                                                                           │
+│<enter>         Go Into                                                                                               │
+│<ctrl-r>        Read Again                                                                                            │
+│<esc>           Clear Filter / Back                                                                                   │
+│<0-9>           Namespace Shortcut                                                                                    │
+│<d>             Describe                                                                                              │
+│<y>             YAML                                                                                                  │
+│<l>             Logs                                                                                                  │
+│<p>             Logs Previous                                                                                         │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+<pods> <help>
+

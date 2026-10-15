@@ -71,7 +71,7 @@ func (h *harness) connections() int {
 func removedKeySession(t *testing.T, h *harness) (*ssh.Client, *writeWatch) {
 	t.Helper()
 	w := &writeWatch{Conn: h.dialRaw()}
-	cl, err := connect(w, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key("ann", false))))
+	cl, err := connect(w, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key(admin("ann")))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestCutOffConnectionHasNoLinger(t *testing.T) {
 		s.endTimeout = 100 * time.Millisecond
 		s.keyLinger = time.Hour
 	}))
-	cl := h.dial(h.key("ann", false), "u")
+	cl := h.dial(h.key(admin("ann")), "u")
 	tm := openTerm(t, cl)
 	tm.waitFor("LASTLINE")
 	tm.press("!")
@@ -256,7 +256,7 @@ func TestKeyRemovedJustAfterASession(t *testing.T) {
 	const linger = 500 * time.Millisecond
 	h := newHarness(t, withServer(func(s *Server) { s.keyLinger = linger }))
 	w := &writeWatch{Conn: h.dialRaw()}
-	cl, err := connect(w, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key("ann", false))))
+	cl, err := connect(w, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key(admin("ann")))))
 	if err != nil {
 		t.Fatal(err)
 	}

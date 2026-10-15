@@ -13,10 +13,16 @@ package e2e
 // Each test reads kosh's screen as a user would see it, through the
 // screen model of screen_test.go.
 //
+// scripts/test-e2e.sh lists three keys, of three roles: the full key
+// alice@kosh-e2e/cluster-admin, the view key bob@kosh-e2e/view, and the
+// team key carol@kosh-e2e/edit@kosh-e2e-team, of the Role edit the script
+// makes in kosh-e2e-team (testdata/0-team.yaml).
+//
 // The tests of the cluster run in the order of this file, against one
-// cluster and one kosh: TestRoleCanBeChanged, TestKeyRemovedEndsTheSession
-// and TestShellEndsWithItsKey change kosh's role and its key list, and
-// put them back; TestStopTellsTheSessions restarts kosh and comes last.
+// cluster and one kosh: TestRoleCanBeChanged, TestKeyRemovedEndsTheSession,
+// TestShellEndsWithItsKey, TestBindingsExistAndGo and TestOldAdminListWarns
+// change kosh's role and its key list, and put them back;
+// TestStopTellsTheSessions restarts kosh and comes last.
 // The other tests of a shell come before them. The tests of the metrics
 // come after the shell's, and TestMetricsColumnsFollowTheAPI, which runs
 // only with KOSH_E2E_SLOW=1, takes the metrics API away and puts it back.
@@ -67,7 +73,8 @@ const wait = 30 * time.Second
 type config struct {
 	sshAddr  string // KOSH_E2E_SSH: the address the Service is forwarded to
 	fullKey  string // KOSH_E2E_FULL_KEY: the full key's private key file; its .pub beside it
-	roKey    string // KOSH_E2E_READONLY_KEY: the read-only key's
+	viewKey  string // KOSH_E2E_VIEW_KEY: the view key's
+	teamKey  string // KOSH_E2E_TEAM_KEY: the team key's
 	hostKey  string // KOSH_E2E_HOST_KEY: a file with kosh's host key, as kosh id printed it
 	endpoint string // KOSH_E2E_ENDPOINT: kosh's endpoint ID
 	irohSSH  string // KOSH_E2E_IROH_SSH: the iroh-ssh to run
@@ -83,7 +90,8 @@ type config struct {
 var cfg = config{
 	sshAddr:   os.Getenv("KOSH_E2E_SSH"),
 	fullKey:   os.Getenv("KOSH_E2E_FULL_KEY"),
-	roKey:     os.Getenv("KOSH_E2E_READONLY_KEY"),
+	viewKey:   os.Getenv("KOSH_E2E_VIEW_KEY"),
+	teamKey:   os.Getenv("KOSH_E2E_TEAM_KEY"),
 	hostKey:   os.Getenv("KOSH_E2E_HOST_KEY"),
 	endpoint:  os.Getenv("KOSH_E2E_ENDPOINT"),
 	irohSSH:   os.Getenv("KOSH_E2E_IROH_SSH"),
@@ -110,7 +118,7 @@ func need(t *testing.T, names ...string) {
 // its cluster.
 func inCluster(t *testing.T) {
 	t.Helper()
-	need(t, "KOSH_E2E_SSH", "KOSH_E2E_FULL_KEY", "KOSH_E2E_READONLY_KEY", "KOSH_E2E_HOST_KEY",
+	need(t, "KOSH_E2E_SSH", "KOSH_E2E_FULL_KEY", "KOSH_E2E_VIEW_KEY", "KOSH_E2E_TEAM_KEY", "KOSH_E2E_HOST_KEY",
 		"KOSH_E2E_ENDPOINT", "KOSH_E2E_IROH_SSH", "KUBECONFIG")
 }
 
@@ -144,8 +152,12 @@ func loadKey(t *testing.T, file string) key {
 	return key{signer: signer, file: file, name: comment, line: strings.TrimSpace(string(pub))}
 }
 
-func fullKey(t *testing.T) key     { return loadKey(t, cfg.fullKey) }
-func readOnlyKey(t *testing.T) key { return loadKey(t, cfg.roKey) }
+func fullKey(t *testing.T) key { return loadKey(t, cfg.fullKey) }
+func viewKey(t *testing.T) key { return loadKey(t, cfg.viewKey) }
+func teamKey(t *testing.T) key { return loadKey(t, cfg.teamKey) }
+
+// teamNamespace is the namespace of the team key's Role.
+const teamNamespace = "kosh-e2e-team"
 
 // hostKey is kosh's host key.
 func hostKey(t *testing.T) ssh.PublicKey {
@@ -720,7 +732,7 @@ func TestSSHScales(t *testing.T) {
 	c.waitFor("Pods(default)")
 	c.send(":deploy" + keyEnter)
 	c.waitRow("web")
-	// The hint a read-only key is not shown (TestReadOnlyKey).
+	// The hint a view key is not shown (TestViewHasNoActionKeys).
 	c.waitUntil(wait, "the hint <s> Scale", func(lines []string) bool { return lineWithHint(lines, "s", "Scale") })
 	c.send("s")
 	c.waitFor("Scale deployments/default/web?", "Replicas")
@@ -820,13 +832,122 @@ func noSecret(t *testing.T, c *term, when string) {
 	}
 }
 
-func TestReadOnlyKey(t *testing.T) {
-	inCluster(t)
-	k := readOnlyKey(t)
-	c := connect(t, k, 120, 40)
-	c.waitUntil(wait, "the key's name with [read-only] in the header", func(lines []string) bool {
-		return lineWith(lines, "Key:", k.name+" [read-only]")
+// wideW and wideH are a terminal whose header has room for every column
+// of hints of the tables of pods and deployments, the keys of the
+// bindings among them.
+const wideW, wideH = 240, 40
+
+// keysIn waits until the header shows the hint <d> Describe, which a
+// table binds, with the rest of its keys, once the API server has
+// answered what the key's role may do there; and returns the header.
+func (c *term) keysIn() []string {
+	c.t.Helper()
+	c.waitUntil(wait, "the hint <d> Describe: the role's answers are in", func(lines []string) bool {
+		return lineWithHint(headerLines(lines), "d", "Describe")
 	})
+	return headerLines(c.scr.lines())
+}
+
+// help opens the help of the view, and waits until it shows: Read Again
+// is a key of every table's, and of the help alone among what a table's
+// header shows at this width.
+func (c *term) help() {
+	c.t.Helper()
+	c.send("?")
+	c.waitUntil(wait, "the help", func(lines []string) bool { return lineWith(lines, "Read Again") })
+}
+
+// The hints of the keys that change the cluster, on a table of pods and
+// on a table of deployments.
+var (
+	podActions        = [][2]string{{"ctrl-d", "Delete"}, {"e", "Edit"}, {"ctrl-k", "Kill"}, {"s", "Shell"}}
+	deploymentActions = [][2]string{{"ctrl-d", "Delete"}, {"e", "Edit"}, {"s", "Scale"}, {"r", "Restart"}, {"i", "Set Image"}}
+)
+
+// hasHints fails the test unless the header has every one of hints, or,
+// with want false, none of them.
+func hasHints(t *testing.T, who string, header []string, hints [][2]string, want bool) {
+	t.Helper()
+	for _, h := range hints {
+		if lineWithHint(header, h[0], h[1]) != want {
+			t.Errorf("%s: the hint <%s> %s shown %v, want %v:\n%s", who, h[0], h[1], !want, want, strings.Join(header, "\n"))
+		}
+	}
+}
+
+// A view key sees the cluster and has none of the keys that change it:
+// the header names the key, role and all, without [read-only], and s on
+// a deployment does nothing. The full key, on a terminal as wide, is the
+// control: its header has every one of those keys.
+func TestViewHasNoActionKeys(t *testing.T) {
+	inCluster(t)
+	full, k := fullKey(t), viewKey(t)
+	a := connect(t, full, wideW, wideH)
+	a.waitRow("marker", "Running")
+	hasHints(t, full.name+" on pods", a.keysIn(), podActions, true)
+	a.send(":deploy" + keyEnter)
+	a.waitRow("web")
+	hasHints(t, full.name+" on deployments", a.keysIn(), deploymentActions, true)
+	a.help()
+	hasHints(t, full.name+" in the help of deployments", a.scr.lines(), deploymentActions, true)
+
+	c := connect(t, k, wideW, wideH)
+	c.waitRow("marker", "Running")
+	header := c.keysIn()
+	if !lineWith(header, "Key:", k.name) || lineWith(header, "[read-only]") {
+		t.Errorf("the header does not name %s alone:\n%s", k.name, strings.Join(header, "\n"))
+	}
+	hasHints(t, k.name+" on pods", header, podActions, false)
+	c.send(":deploy" + keyEnter)
+	c.waitRow("web")
+	hasHints(t, k.name+" on deployments", c.keysIn(), deploymentActions, false)
+	// The help lists what is bound, and nothing more.
+	c.help()
+	hasHints(t, k.name+" in the help of deployments", c.scr.lines(), deploymentActions, false)
+	if !lineWithHint(c.scr.lines(), "d", "Describe") {
+		t.Errorf("the help of a view key has no <d> Describe:\n%s", c.scr)
+	}
+	c.send(keyEsc)
+	c.waitRow("web")
+
+	before := replicas(t)
+	// What TestSSHScales types to scale web to 3.
+	c.send("s")
+	c.send(scaleTo3...)
+	c.send(scaleConfirm...)
+	// Nothing is to be waited for: what s would open or do would be there
+	// by now.
+	time.Sleep(2 * time.Second)
+	if lineWith(c.scr.lines(), "Replicas") || lineWith(c.scr.lines(), "Scale deployments/") {
+		t.Errorf("s opened something for a view key:\n%s", c.scr)
+	}
+	if after := replicas(t); after != before {
+		t.Errorf("the replicas of web went from %s to %s", before, after)
+	}
+	if lines := logLines(t, "action", "key", k.name, "action", "scale"); len(lines) > 0 {
+		t.Errorf("kosh's log has a scale of the view key: %s", lines[0])
+	}
+}
+
+// joined is the screen's lines, trimmed, in one line: a message the flash
+// wrapped, whole.
+func joined(lines []string) string {
+	var trimmed []string
+	for _, l := range lines {
+		trimmed = append(trimmed, strings.TrimSpace(l))
+	}
+	return strings.Join(trimmed, " ")
+}
+
+// A view key cannot read a Secret: view grants nothing of secrets, and
+// the API server refuses the key the table, which says so; the keys that
+// would show a Secret are not bound, and its value reaches the terminal
+// in no form. kubectl, as the key's user, is refused the Secret itself.
+func TestViewCannotDecodeASecret(t *testing.T) {
+	inCluster(t)
+	k := viewKey(t)
+	c := connect(t, k, wideW, wideH)
+	c.waitFor("Pods(default)")
 	// From here on, every write to the terminal is looked at for the
 	// Secret's value in each of its forms, to the end of the test and
 	// what is received while it ends.
@@ -837,58 +958,130 @@ func TestReadOnlyKey(t *testing.T) {
 		}
 	})
 
-	c.send(":deploy" + keyEnter)
-	c.waitRow("web")
-	if lineWithHint(c.scr.lines(), "s", "Scale") {
-		t.Errorf("a read-only key is offered <s> Scale:\n%s", c.scr)
-	}
-	before := replicas(t)
-	// What TestSSHScales types to scale web to 3.
-	c.send("s")
-	c.send(scaleTo3...)
-	c.send(scaleConfirm...)
-	// Nothing is to be waited for: what s would open or do would be there
-	// by now.
-	time.Sleep(2 * time.Second)
-	if lineWith(c.scr.lines(), "Replicas") || lineWith(c.scr.lines(), "Scale deployments/") {
-		t.Errorf("s opened something for a read-only key:\n%s", c.scr)
-	}
-	if after := replicas(t); after != before {
-		t.Errorf("the replicas of web went from %s to %s", before, after)
-	}
-	if lines := logLines(t, "action", "key", k.name, "action", "scale"); len(lines) > 0 {
-		t.Errorf("kosh's log has a scale of the read-only key: %s", lines[0])
-	}
-
-	// The keys above may have gone into web's pods: name the namespace.
 	c.send(":secrets default" + keyEnter)
-	c.waitFor("Secrets(default)")
-	c.waitRow("hidden")
+	c.waitUntil(wait, "the table of secrets with the API's refusal", func(lines []string) bool {
+		all := joined(lines)
+		return lineWith(lines, "Secrets(default)") && strings.Contains(all, "forbidden") && strings.Contains(all, `cannot list resource "secrets"`)
+	})
 	noSecret(t, &c.term, "the table of secrets")
+	if row(c.scr.lines(), "hidden") != "" {
+		t.Errorf("a view key has the row of the Secret hidden:\n%s", c.scr)
+	}
+	hasHints(t, k.name+" on secrets", headerLines(c.scr.lines()), [][2]string{{"x", "Decode"}, {"y", "YAML"}, {"d", "Describe"}}, false)
 	for _, key := range []string{"y", "d", "x"} {
 		c.send(key)
-		c.waitUntil(wait, key+" on a Secret is refused, and the table stays", func(lines []string) bool {
-			return lineWith(lines, "this key is read-only") && lineWith(lines, "Secrets(default)") && row(lines, "hidden") != ""
-		})
-		noSecret(t, &c.term, key+" on the Secret")
-		// An error stays until a key is pressed, and 5 seconds at least:
-		// k, the cursor up on the only row, then the next key's own
-		// refusal is to be seen.
-		c.send("k")
-		c.waitUntil(wait, "the flash is gone", func(lines []string) bool { return !lineWith(lines, "this key is read-only") })
-		if row(c.scr.lines(), "hidden") == "" {
-			t.Fatalf("after %s the table of secrets is gone:\n%s", key, c.scr)
+	}
+	// Nothing is to be waited for: what the keys would open would be
+	// there by now.
+	time.Sleep(2 * time.Second)
+	noSecret(t, &c.term, "after y, d and x")
+	if lineWith(c.scr.lines(), "this key is read-only") {
+		t.Errorf("kosh refused the key itself, as before roles:\n%s", c.scr)
+	}
+
+	// The API server decides: it refuses the key's user, in the role's
+	// group, the Secret.
+	out, err := run("kubectl", "--namespace", "default", "get", "secret", "hidden", "-o", "yaml",
+		"--as", "kosh:"+k.name, "--as-group", viewBinding(t).group)
+	if err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Errorf("kubectl as the view key's user: %v, want forbidden", err)
+	}
+	for _, f := range secretForms {
+		if strings.Contains(out, f) || (err != nil && strings.Contains(err.Error(), f)) {
+			t.Errorf("kubectl as the view key's user was given the Secret's value")
 		}
-		noSecret(t, &c.term, "after "+key)
 	}
-
 	noSecret(t, &c.term, "at the end")
+}
 
-	for _, action := range []string{"yaml", "describe", "secret-data"} {
-		eventually(t, wait, "kosh's log has the refused "+action, func() bool {
-			return len(logLines(t, "refused", "key", k.name, "action", action, "object", "secrets/default/hidden")) > 0
-		}, func() string { return "kosh's log:\n" + koshLog(t) })
+// A key with a Role starts in the Role's namespace, on its pods; its
+// namespace shortcuts are all and that namespace, without default; and
+// its header has no CPU and MEM lines, since a Role cannot grant nodes.
+func TestRoleStartsInItsNamespace(t *testing.T) {
+	inCluster(t)
+	k := teamKey(t)
+	c := connect(t, k, wideW, wideH)
+	c.waitFor("Pods(" + teamNamespace + ")")
+	c.waitRow("teamwork", "Running")
+	c.waitUntil(wait, "the key's name and the shortcuts <0> all and <1> "+teamNamespace, func(lines []string) bool {
+		h := headerLines(lines)
+		return lineWith(h, "Key:", k.name) && lineWithHint(h, "0", "all") && lineWithHint(h, "1", teamNamespace)
+	})
+	c.keysIn()
+	// The lines of a ClusterRole's key come with the first reading of the
+	// metrics, at once (TestHeaderShowsClusterUsage).
+	time.Sleep(2 * time.Second)
+	header := headerLines(c.scr.lines())
+	if lineWith(header, "default") {
+		t.Errorf("default is among the shortcuts of a Role's key:\n%s", strings.Join(header, "\n"))
 	}
+	if lineWith(header, "CPU:") || lineWith(header, "MEM:") {
+		t.Errorf("the header of a Role's key has the cluster's CPU and MEM:\n%s", strings.Join(header, "\n"))
+	}
+}
+
+// A key of the Role edit in kosh-e2e-team has the keys its Role allows
+// there, and none in default, where the API refuses it the pods.
+func TestRoleHasDeleteOnlyInItsNamespace(t *testing.T) {
+	inCluster(t)
+	k := teamKey(t)
+	c := connect(t, k, wideW, wideH)
+	c.waitRow("teamwork", "Running")
+	header := c.keysIn()
+	// The Role has delete on pods, and neither update nor pods/exec.
+	hasHints(t, k.name+" in "+teamNamespace, header, [][2]string{{"ctrl-d", "Delete"}, {"ctrl-k", "Kill"}}, true)
+	hasHints(t, k.name+" in "+teamNamespace, header, [][2]string{{"e", "Edit"}, {"s", "Shell"}}, false)
+
+	c.send(":pods default" + keyEnter)
+	c.waitUntil(wait, "the pods of default with the API's refusal", func(lines []string) bool {
+		return lineWith(lines, "Pods(default)") && strings.Contains(joined(lines), "forbidden")
+	})
+	// Nothing is to be waited for: no answer is yes in default, and the
+	// answers of the namespace the table left are forgotten.
+	time.Sleep(2 * time.Second)
+	if row(c.scr.lines(), "marker") != "" {
+		t.Errorf("the team key sees the pods of default:\n%s", c.scr)
+	}
+	hasHints(t, k.name+" in default", headerLines(c.scr.lines()), append(slices.Clone(podActions), [2]string{"d", "Describe"}), false)
+
+	c.send(":pods " + teamNamespace + keyEnter)
+	c.waitRow("teamwork")
+	hasHints(t, k.name+" back in "+teamNamespace, c.keysIn(), [][2]string{{"ctrl-d", "Delete"}}, true)
+}
+
+// A key with a Role is refused every namespace at once, and the
+// namespaces: 0 and :ns show the API's refusal, whole, and 1 is its
+// namespace again.
+func TestAllNamespacesRefusedToARole(t *testing.T) {
+	inCluster(t)
+	k := teamKey(t)
+	c := connect(t, k, wideW, wideH)
+	c.waitRow("teamwork", "Running")
+
+	refused := func(title string) {
+		t.Helper()
+		c.waitUntil(wait, title+" with the API's refusal", func(lines []string) bool {
+			all := joined(lines)
+			return lineWith(lines, title) && strings.Contains(all, "forbidden") && strings.Contains(all, "at the cluster scope")
+		})
+		for _, l := range c.scr.lines() {
+			if strings.Contains(l, "forbidden") && strings.HasSuffix(strings.TrimRight(l, " "), "…") {
+				t.Errorf("the refusal is cut: %q\n%s", l, c.scr)
+			}
+		}
+		if row(c.scr.lines(), "teamwork") != "" || row(c.scr.lines(), "marker") != "" {
+			t.Errorf("%s has rows for the team key:\n%s", title, c.scr)
+		}
+	}
+	c.send("0")
+	refused("Pods(all)")
+	c.send(":ns" + keyEnter)
+	refused("Namespaces(all)")
+	c.send(":pods" + keyEnter)
+	c.waitFor("Pods(all)")
+	c.send("1")
+	c.waitFor("Pods(" + teamNamespace + ")")
+	c.waitRow("teamwork", "Running")
 }
 
 func TestUnknownKeyIsRefused(t *testing.T) {
@@ -1016,7 +1209,7 @@ func TestProbesAreNotInTheLog(t *testing.T) {
 // of what such a request would answer reaches the terminal.
 func TestNamespaceMustBeAName(t *testing.T) {
 	inCluster(t)
-	c := connect(t, readOnlyKey(t), 120, 40)
+	c := connect(t, viewKey(t), 120, 40)
 	c.waitFor("Pods(default)")
 	// gitVersion is in what the API server's /version answers.
 	c.scr.watch("gitVersion")
@@ -1157,12 +1350,12 @@ func TestIrohSSH(t *testing.T) {
 	}
 }
 
-func TestIrohSSHReadOnly(t *testing.T) {
+func TestIrohSSHView(t *testing.T) {
 	inCluster(t)
-	k := readOnlyKey(t)
+	k := viewKey(t)
 	p := irohSSH(t, k)
-	overIroh(t, p, "the read-only key in the header", func(lines []string) bool {
-		return lineWith(lines, "Pods(default)") && lineWith(lines, "Key:", k.name+" [read-only]")
+	overIroh(t, p, "the view key in the header", func(lines []string) bool {
+		return lineWith(lines, "Pods(default)") && lineWith(lines, "Key:", k.name) && !lineWith(lines, "[read-only]")
 	})
 	p.send(":q" + keyEnter)
 	if status := p.exitedWith(wait); status != 0 {
@@ -1679,27 +1872,29 @@ func TestShellOverIroh(t *testing.T) {
 	}
 }
 
-// A read-only key has no shell: no hint, and s does nothing. TestShell
-// is the positive control: a full key sees <s> Shell.
-func TestShellReadOnlyKey(t *testing.T) {
+// A view key has no shell: view grants no pods/exec, so no hint, and s
+// does nothing. TestShell is the positive control: a full key sees <s>
+// Shell, at the same width.
+func TestShellViewKey(t *testing.T) {
 	inCluster(t)
-	k := readOnlyKey(t)
+	k := viewKey(t)
 	c := connect(t, k, 120, 40)
-	c.waitUntil(wait, "the key's name with [read-only] in the header", func(lines []string) bool {
-		return lineWith(lines, "Key:", k.name+" [read-only]")
+	c.waitUntil(wait, "the key's name in the header", func(lines []string) bool {
+		return lineWith(lines, "Key:", k.name)
 	})
 	c.waitRow("marker", "Running")
 	c.fills(120, 40)
+	c.keysIn()
 	before := c.scr.lines()
 	if lineWithHint(headerLines(before), "s", "Shell") {
-		t.Errorf("a read-only key is offered <s> Shell:\n%s", c.scr)
+		t.Errorf("a view key is offered <s> Shell:\n%s", c.scr)
 	}
 	c.send("s")
 	// Nothing is to be waited for: what s would open would be there by now.
 	time.Sleep(2 * time.Second)
 	after := c.scr.lines()
 	if dialogLines(after) != nil || lineWith(after, "A shell in pod") {
-		t.Errorf("s opened something for a read-only key:\n%s", c.scr)
+		t.Errorf("s opened something for a view key:\n%s", c.scr)
 	}
 	// The frame is as it was: the header, the table's title, the crumbs
 	// and the flash. (The table's ages may have moved on.)
@@ -1718,7 +1913,7 @@ func TestShellReadOnlyKey(t *testing.T) {
 		t.Errorf("the frame changed after s.\nbefore:\n%s\nafter:\n%s", strings.Join(before, "\n"), c.scr)
 	}
 	if lines := logLines(t, "action", "key", k.name, "action", "exec"); len(lines) > 0 {
-		t.Errorf("kosh's log has an exec of the read-only key: %s", lines[0])
+		t.Errorf("kosh's log has an exec of the view key: %s", lines[0])
 	}
 }
 
@@ -2100,14 +2295,16 @@ func bindingRole(t *testing.T, name string) string {
 	return strings.TrimSpace(kubectl(t, "get", "clusterrolebinding", name, "--ignore-not-found", "-o", "jsonpath={.roleRef.name}"))
 }
 
-// koshMayScale is kubectl auth can-i for kosh's ServiceAccount and a
-// scale in default: "yes" or "no".
-func koshMayScale(t *testing.T) string {
+// koshMay is kubectl auth can-i for kosh's ServiceAccount: "yes" or "no".
+func koshMay(t *testing.T, args ...string) string {
 	t.Helper()
-	out, _ := run("kubectl", "auth", "can-i", "update", "deployments.apps/scale", "--namespace", "default",
-		"--as", "system:serviceaccount:"+namespace+":"+release)
+	out, _ := run("kubectl", append(append([]string{"auth", "can-i"}, args...), "--as", "system:serviceaccount:"+namespace+":"+release)...)
 	return strings.TrimSpace(out)
 }
+
+// koshMayImpersonate is whether kosh's ServiceAccount may impersonate the
+// users of the keys: "yes" or "no".
+func koshMayImpersonate(t *testing.T) string { return koshMay(t, "impersonate", "users") }
 
 // setRole installs the chart again with rbac.clusterRole, keeping every
 // other value.
@@ -2119,17 +2316,60 @@ func setRole(t *testing.T, role string) {
 	}
 }
 
-// The ClusterRole can be changed with helm upgrade, and a full key then
-// meets the API's refusal, readably.
+// untilKosh waits until kosh itself acts as its ServiceAccount now may,
+// which the API server can tell kosh some time after it tells kubectl:
+// it connects as k, opens the deployments, and waits up to within for
+// ready; a session that does not get there is closed and another opened,
+// until total has passed. Each attempt is a new session, as a session
+// keeps the answers it was given for two minutes: one that was answered
+// before kosh's rights changed is left behind, not waited on. It returns
+// the session that got there and how long it took, and fails the test
+// when none did.
+func untilKosh(t *testing.T, k key, what string, total, within time.Duration, ready func(c *goSession) bool) (*goSession, time.Duration) {
+	t.Helper()
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		c := connect(t, k, wideW, wideH)
+		c.waitFor("Pods(default)")
+		c.send(":deploy" + keyEnter)
+		c.waitFor("Deployments(default)")
+		deadline := time.Now().Add(within)
+		for time.Now().Before(deadline) {
+			if ready(c) {
+				took := time.Since(start)
+				t.Logf("%s: %v, at the session %d", what, took.Round(100*time.Millisecond), attempt)
+				return c, took
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		_ = c.client.Close()
+		if time.Since(start) > total {
+			t.Fatalf("%s: not in %v, after %d sessions.\nthe last screen:\n%s\nkosh's log:\n%s", what, total, attempt, c.scr, koshLog(t))
+		}
+	}
+}
+
+// The ClusterRole of kosh's ServiceAccount can be changed with helm
+// upgrade. One that may not impersonate, as view, leaves every key
+// without its role's rights: the full key's session is given no key that
+// changes the cluster, and kosh's log says that the key's rights could
+// not be checked.
 func TestRoleCanBeChanged(t *testing.T) {
 	inCluster(t)
+	k := fullKey(t)
 	setRole(t, "view")
 	t.Cleanup(func() {
 		setRole(t, "cluster-admin")
 		eventually(t, wait, "cluster-admin is kosh's again", func() bool {
 			return bindingRole(t, release+"-cluster-admin") == "cluster-admin" && bindingRole(t, release+"-view") == "" &&
-				koshMayScale(t) == "yes"
-		}, func() string { return "can-i: " + koshMayScale(t) })
+				koshMayImpersonate(t) == "yes"
+		}, func() string { return "can-i impersonate: " + koshMayImpersonate(t) })
+		// kosh itself may impersonate again, for the tests after this
+		// one: a new session has the full key's keys.
+		c, _ := untilKosh(t, k, "kosh may impersonate again", 3*time.Minute, 20*time.Second, func(c *goSession) bool {
+			return lineWithHint(headerLines(c.scr.lines()), "s", "Scale")
+		})
+		_ = c.client.Close()
 	})
 	if got := bindingRole(t, release+"-view"); got != "view" {
 		t.Errorf("the binding %s-view binds %q, want view", release, got)
@@ -2137,54 +2377,55 @@ func TestRoleCanBeChanged(t *testing.T) {
 	if got := bindingRole(t, release+"-cluster-admin"); got != "" {
 		t.Errorf("the binding %s-cluster-admin is still there, binding %s", release, got)
 	}
-	eventually(t, wait, "kosh may no longer scale", func() bool { return koshMayScale(t) == "no" },
-		func() string { return "can-i: " + koshMayScale(t) })
+	eventually(t, wait, "kosh may no longer impersonate", func() bool { return koshMayImpersonate(t) == "no" },
+		func() string { return "can-i impersonate: " + koshMayImpersonate(t) })
 
+	// The API server may go on allowing kosh for a while after kubectl
+	// is told no: a session is tried until kosh's log says that its key's
+	// rights could not be checked, which a session says once.
 	before := replicas(t)
-	c := connect(t, fullKey(t), 120, 40)
-	c.waitFor("Pods(default)")
-	c.send(":deploy" + keyEnter)
-	c.waitRow("web")
+	warned := len(logLines(t, "the key's rights could not be checked", "key", k.name))
+	c, _ := untilKosh(t, k, "kosh is refused the impersonation", 3*time.Minute, 20*time.Second, func(*goSession) bool {
+		n := len(logLines(t, "the key's rights could not be checked", "key", k.name))
+		ok := n > warned
+		warned = n
+		return ok
+	})
+	// The answers are in: no key is bound on a "no".
+	time.Sleep(time.Second)
+	hasHints(t, k.name+" on deployments, kosh's ServiceAccount view", headerLines(c.scr.lines()),
+		append(slices.Clone(deploymentActions), [2]string{"d", "Describe"}), false)
 	c.send("s")
-	c.waitFor("Scale deployments/default/web?", "Replicas")
 	c.send(scaleTo3...)
 	c.send(scaleConfirm...)
-	c.waitUntil(wait, "the API's refusal, whole", func(lines []string) bool {
-		var trimmed []string
-		for _, l := range lines {
-			trimmed = append(trimmed, strings.TrimSpace(l))
-		}
-		all := strings.Join(trimmed, " ")
-		return strings.Contains(all, "forbidden") && strings.Contains(all, "cannot update")
-	})
-	for _, l := range c.scr.lines() {
-		if strings.Contains(l, "forbidden") && strings.HasSuffix(strings.TrimRight(l, " "), "…") {
-			t.Errorf("the refusal is cut: %q\n%s", l, c.scr)
-		}
+	time.Sleep(2 * time.Second)
+	if lineWith(c.scr.lines(), "Scale deployments/") {
+		t.Errorf("s opened a scale with kosh's ServiceAccount view:\n%s", c.scr)
 	}
 	if after := replicas(t); after != before {
-		t.Errorf("the replicas of web went from %s to %s under the role view", before, after)
+		t.Errorf("the replicas of web went from %s to %s with kosh's ServiceAccount view", before, after)
 	}
 }
 
-// It takes the read-only key out of the list, and puts it back.
+// It takes the view key and the team key out of the list, and puts them
+// back.
 func TestKeyRemovedEndsTheSession(t *testing.T) {
 	inCluster(t)
-	full, ro := fullKey(t), readOnlyKey(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
 	f := connect(t, full, 120, 40)
 	f.waitFor("Pods(default)", full.name)
-	r := connect(t, ro, 120, 40)
-	r.waitFor("Pods(default)", ro.name+" [read-only]")
+	r := connect(t, view, 120, 40)
+	r.waitFor("Pods(default)", view.name)
 
 	setKeys(t, full.line)
 	t.Cleanup(func() {
 		// Back as it was, and waited for, so that a test after this one
 		// does not meet the kubelet's delay.
-		setKeys(t, full.line, ro.line)
+		setKeys(t, full.line, view.line, team.line)
 		var err error
-		eventually(t, 150*time.Second, "the read-only key is accepted again", func() bool {
+		eventually(t, 150*time.Second, "the view key is accepted again", func() bool {
 			var c *goSession
-			if c, err = dialSSH(t, ro, 120, 40); err == nil {
+			if c, err = dialSSH(t, view, 120, 40); err == nil {
 				_ = c.client.Close()
 				return true
 			}
@@ -2195,10 +2436,10 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 
 	// The kubelet updates a mounted ConfigMap in its own time.
 	err := r.ended(120 * time.Second)
-	t.Logf("the read-only key's session ended %v after the list changed", time.Since(changed).Round(100*time.Millisecond))
+	t.Logf("the view key's session ended %v after the list changed", time.Since(changed).Round(100*time.Millisecond))
 	var exit *ssh.ExitError
 	if !errors.As(err, &exit) || exit.ExitStatus() != 1 {
-		t.Errorf("the read-only key's session ended with %v, want status 1", err)
+		t.Errorf("the view key's session ended with %v, want status 1", err)
 	}
 	said := r.scr.String() + "\n" + r.stderr.String()
 	if !strings.Contains(said, "this key is no longer accepted") {
@@ -2212,11 +2453,11 @@ func TestKeyRemovedEndsTheSession(t *testing.T) {
 	f.waitFor("Namespaces(all)")
 	f.waitRow("kosh")
 
-	if c, err := dialSSH(t, ro, 120, 40); err == nil {
+	if c, err := dialSSH(t, view, 120, 40); err == nil {
 		_ = c.client.Close()
-		t.Error("the read-only key is still accepted for a new connection")
+		t.Error("the view key is still accepted for a new connection")
 	} else if !strings.Contains(err.Error(), "unable to authenticate") {
-		t.Errorf("a new connection of the read-only key: %v, want a failed handshake", err)
+		t.Errorf("a new connection of the view key: %v, want a failed handshake", err)
 	}
 }
 
@@ -2289,12 +2530,12 @@ func waitAccepted(t *testing.T, k key, want bool, within time.Duration) {
 // it did, and does not require either.
 func TestShellEndsWithItsKey(t *testing.T) {
 	inCluster(t)
-	full, ro := fullKey(t), readOnlyKey(t)
-	k := newKey(t, "carol@kosh-e2e/admin")
-	setKeys(t, full.line, ro.line, k.line)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
+	k := newKey(t, "erin@kosh-e2e/cluster-admin")
+	setKeys(t, full.line, view.line, team.line, k.line)
 	t.Cleanup(func() {
 		// The list as it was, and waited for.
-		setKeys(t, full.line, ro.line)
+		setKeys(t, full.line, view.line, team.line)
 		waitAccepted(t, k, false, 150*time.Second)
 	})
 	waitAccepted(t, k, true, 150*time.Second)
@@ -2311,7 +2552,7 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	end := []string{"key", k.name, "action", "exec", "object", "pods/default/marker", "phase", "end"}
 	shells := len(logLines(t, "action", end...))
 
-	setKeys(t, full.line, ro.line)
+	setKeys(t, full.line, view.line, team.line)
 	changed := time.Now()
 	status := p.exitedWith(120 * time.Second)
 	t.Logf("ssh ended %v after the list changed, with status %d", time.Since(changed).Round(100*time.Millisecond), status)
@@ -2353,6 +2594,229 @@ func TestShellEndsWithItsKey(t *testing.T) {
 	f.send(":ns" + keyEnter)
 	f.waitFor("Namespaces(all)")
 	f.waitRow("kosh")
+}
+
+// rbacBinding is a ClusterRoleBinding or a RoleBinding, as kubectl has
+// it, with what the tests look at.
+type rbacBinding struct {
+	Metadata struct {
+		Labels      map[string]string `json:"labels"`
+		Annotations map[string]string `json:"annotations"`
+	} `json:"metadata"`
+	RoleRef struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	} `json:"roleRef"`
+	Subjects []struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	} `json:"subjects"`
+}
+
+// getBinding returns the binding of kind (clusterrolebinding or
+// rolebinding) named name, in namespace ns for a RoleBinding, or nil when
+// there is none.
+func getBinding(t *testing.T, kind, ns, name string) *rbacBinding {
+	t.Helper()
+	args := []string{"get", kind, name, "--ignore-not-found", "-o", "json"}
+	if ns != "" {
+		args = append(args, "--namespace", ns)
+	}
+	out := kubectl(t, args...)
+	if strings.TrimSpace(out) == "" {
+		return nil
+	}
+	var b rbacBinding
+	if err := json.Unmarshal([]byte(out), &b); err != nil {
+		t.Fatalf("%s %s: %v", kind, name, err)
+	}
+	return &b
+}
+
+// koshBinding is a binding kosh makes for a role of its key list (§4 of
+// the roles design).
+type koshBinding struct {
+	kind, ns, name string // as getBinding takes them
+	roleKind, role string // the roleRef
+	group          string // the one subject, a Group
+	annotation     string // kosh.fables-for-robots.dev/role
+	instance       string // kosh.fables-for-robots.dev/instance
+}
+
+// koshInstance is the name of kosh's instance as the chart gave it: the
+// --instance of kosh serve in the Deployment.
+func koshInstance(t *testing.T) string {
+	t.Helper()
+	var args []string
+	out := kubectl(t, "--namespace", namespace, "get", "deployment", release, "-o", "jsonpath={.spec.template.spec.containers[0].args}")
+	if err := json.Unmarshal([]byte(out), &args); err != nil {
+		t.Fatalf("the arguments of kosh serve, %q: %v", out, err)
+	}
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(a, "--instance="); ok {
+			return v
+		}
+	}
+	t.Fatalf("kosh serve has no --instance: %q", args)
+	return ""
+}
+
+// bindingOf is the binding kosh makes for the ClusterRole role, or with a
+// namespace for the Role role there.
+func bindingOf(t *testing.T, role, ns string) koshBinding {
+	t.Helper()
+	inst := koshInstance(t)
+	if ns == "" {
+		name := "kosh:" + inst + ":clusterrole:" + role
+		return koshBinding{"clusterrolebinding", "", name, "ClusterRole", role, name, "ClusterRole/" + role, inst}
+	}
+	return koshBinding{"rolebinding", ns, "kosh:" + inst + ":role:" + role, "Role", role,
+		"kosh:" + inst + ":role:" + ns + ":" + role, "Role/" + ns + "/" + role, inst}
+}
+
+// The bindings of the three keys of scripts/test-e2e.sh.
+func fullBinding(t *testing.T) koshBinding { return bindingOf(t, "cluster-admin", "") }
+func viewBinding(t *testing.T) koshBinding { return bindingOf(t, "view", "") }
+func teamBinding(t *testing.T) koshBinding { return bindingOf(t, "edit", teamNamespace) }
+
+// is reports what of b differs from what kosh makes for w, or "".
+func (w koshBinding) is(b *rbacBinding) string {
+	switch {
+	case b == nil:
+		return "there is none"
+	case b.RoleRef.Kind != w.roleKind || b.RoleRef.Name != w.role:
+		return fmt.Sprintf("its roleRef is %s %s", b.RoleRef.Kind, b.RoleRef.Name)
+	case len(b.Subjects) != 1 || b.Subjects[0].Kind != "Group" || b.Subjects[0].Name != w.group:
+		return fmt.Sprintf("its subjects are %+v", b.Subjects)
+	case b.Metadata.Labels["app.kubernetes.io/managed-by"] != "kosh" || b.Metadata.Labels["kosh.fables-for-robots.dev/instance"] != w.instance:
+		return fmt.Sprintf("its labels are %v", b.Metadata.Labels)
+	case b.Metadata.Annotations["kosh.fables-for-robots.dev/role"] != w.annotation:
+		return fmt.Sprintf("its annotations are %v", b.Metadata.Annotations)
+	}
+	return ""
+}
+
+// logTime is the time of a line of kosh's log.
+func logTime(t *testing.T, line string) time.Time {
+	t.Helper()
+	m := regexp.MustCompile(`^time=(\S+)`).FindStringSubmatch(line)
+	if m == nil {
+		t.Fatalf("no time in %q", line)
+	}
+	at, err := time.Parse(time.RFC3339Nano, m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+// kosh has made the binding of each role of its key list, named and
+// labelled with its instance; a role that leaves the list has its binding
+// deleted as soon as kosh reads the list, and the bindings of the roles
+// still named stay. It takes the team key out of the list, and puts it
+// back.
+func TestBindingsExistAndGo(t *testing.T) {
+	inCluster(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
+	teamB := teamBinding(t)
+	t.Logf("kosh's instance: %s", teamB.instance)
+	// Made at kosh's start, or again after the list was put back by a
+	// test before this one.
+	for _, w := range []koshBinding{fullBinding(t), viewBinding(t), teamB} {
+		var why string
+		eventually(t, wait, "the binding "+w.name, func() bool {
+			why = w.is(getBinding(t, w.kind, w.ns, w.name))
+			return why == ""
+		}, func() string { return why + "\nkosh's log:\n" + koshLog(t) })
+	}
+
+	readings := len(logLines(t, "key list changed"))
+	setKeys(t, full.line, view.line)
+	changed := time.Now()
+	t.Cleanup(func() {
+		// Back as it was, and waited for.
+		setKeys(t, full.line, view.line, team.line)
+		waitAccepted(t, team, true, 150*time.Second)
+		eventually(t, wait, "the team key's RoleBinding is made again", func() bool {
+			return teamB.is(getBinding(t, teamB.kind, teamB.ns, teamB.name)) == ""
+		}, func() string { return "kosh's log:\n" + koshLog(t) })
+	})
+	// The kubelet updates the mounted key list in its own time, up to a
+	// minute or two; what is kosh's is measured from its own reading.
+	eventually(t, 150*time.Second, "the team key's RoleBinding is deleted", func() bool {
+		return getBinding(t, teamB.kind, teamB.ns, teamB.name) == nil
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	t.Logf("the team key's RoleBinding was deleted %v after the list changed", time.Since(changed).Round(100*time.Millisecond))
+	var deleted []string
+	eventually(t, wait, "kosh's log says that it deleted the binding", func() bool {
+		deleted = logLines(t, "a binding no key needs is deleted", "binding", teamNamespace+"/"+teamB.name)
+		return len(deleted) > 0
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	read := logLines(t, "key list changed")
+	if len(read) <= readings {
+		t.Fatalf("kosh's log has no reading of the changed list:\n%s", koshLog(t))
+	}
+	took := logTime(t, deleted[len(deleted)-1]).Sub(logTime(t, read[readings]))
+	t.Logf("kosh deleted it %v after it read the list", took)
+	if took < 0 || took > 10*time.Second {
+		t.Errorf("kosh deleted the binding %v after it read the list, want within 10s", took)
+	}
+	for _, w := range []koshBinding{fullBinding(t), viewBinding(t)} {
+		if why := w.is(getBinding(t, w.kind, w.ns, w.name)); why != "" {
+			t.Errorf("the binding %s of a role still named: %s", w.name, why)
+		}
+	}
+	if accepted(t, team) {
+		t.Error("the team key is still accepted")
+	}
+}
+
+// A key list of before 0.5.0 names its admins …/admin, which is now the
+// ClusterRole admin: kosh warns of it, with the key, and binds that
+// ClusterRole, which gives no node.
+func TestOldAdminListWarns(t *testing.T) {
+	inCluster(t)
+	full, view, team := fullKey(t), viewKey(t), teamKey(t)
+	old := newKey(t, "dave@kosh-e2e/admin")
+	setKeys(t, full.line, view.line, team.line, old.line)
+	t.Cleanup(func() {
+		// The list as it was, and waited for.
+		setKeys(t, full.line, view.line, team.line)
+		waitAccepted(t, old, false, 150*time.Second)
+	})
+	const warning = "a key's role is the ClusterRole admin, which is not cluster-admin: before 0.5.0 /admin meant full access"
+	var warned []string
+	eventually(t, 150*time.Second, "kosh's log warns of the ClusterRole admin", func() bool {
+		warned = logLines(t, warning, "keys", old.name)
+		return len(warned) > 0
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	if !hasAttr(warned[0], "level", "WARN") {
+		t.Errorf("the warning is not at warn level: %s", warned[0])
+	}
+	t.Logf("kosh's log: %s", warned[0])
+	adminBinding := bindingOf(t, "admin", "")
+	var why string
+	eventually(t, wait, "the binding of the ClusterRole admin", func() bool {
+		why = adminBinding.is(getBinding(t, adminBinding.kind, adminBinding.ns, adminBinding.name))
+		return why == ""
+	}, func() string { return why })
+	out, _ := run("kubectl", "auth", "can-i", "list", "nodes", "--as", "kosh:"+old.name, "--as-group", adminBinding.group)
+	if strings.TrimSpace(out) != "no" {
+		t.Errorf("the ClusterRole admin may list the nodes: can-i says %q", strings.TrimSpace(out))
+	}
+
+	// admin may write ConfigMaps in kosh's namespace, so edit the key
+	// list: kosh warns of it, and of no other role of the list.
+	const editor = "a key's role may edit the key list, and so grant itself any role"
+	var editors []string
+	eventually(t, wait, "kosh's log warns that admin may edit the key list", func() bool {
+		editors = logLines(t, editor, "role", "ClusterRole/admin", "keys", old.name, "namespace", namespace)
+		return len(editors) > 0
+	}, func() string { return "kosh's log:\n" + koshLog(t) })
+	t.Logf("kosh's log: %s", editors[0])
+	if all := logLines(t, editor); len(all) != len(logLines(t, editor, "role", "ClusterRole/admin")) {
+		t.Errorf("kosh warns of another role than admin: %q", all)
+	}
 }
 
 // The last test: it restarts kosh. A stop tells every session first,

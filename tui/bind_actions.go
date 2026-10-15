@@ -13,33 +13,56 @@ import (
 )
 
 // The keys that change the cluster (spec §11.1). Each asks first, in a
-// dialog that starts on Cancel, and none is a key of a read-only grant.
+// dialog that starts on Cancel, and each is bound only when the key's
+// role allows what it does (the roles' spec, §5).
 
 // actionBindings are the keys of the actions, which init binds.
 var actionBindings = []binding{
-	{Key: "ctrl+d", Hint: hint{"ctrl-d", "Delete"}, Order: 30, Applies: actionApplies(actionCan("delete")), Run: actionGuard(actionDelete)},
-	{Key: "e", Hint: hint{"e", "Edit"}, Order: 31, Applies: actionApplies(actionCan("update")), Run: actionGuard(editorOpen)},
-	{Key: "ctrl+k", Hint: hint{"ctrl-k", "Kill"}, Order: 32, Applies: actionApplies(actionIs("", "pods")), Run: actionGuard(actionKill)},
-	{Key: "s", Hint: hint{"s", "Scale"}, Order: 33, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "replicasets")), Run: actionGuard(actionScale)},
-	{Key: "r", Hint: hint{"r", "Restart"}, Order: 34, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "daemonsets")), Run: actionGuard(actionRestart)},
-	{Key: "i", Hint: hint{"i", "Set Image"}, Order: 35, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "daemonsets")), Run: actionGuard(actionSetImage)},
-	{Key: "ctrl+l", Hint: hint{"ctrl-l", "Rollback"}, Order: 36, Applies: actionApplies(actionIs("apps", "replicasets")), Run: actionGuard(actionRollback)},
-	{Key: "t", Hint: hint{"t", "Trigger"}, Order: 37, Applies: actionApplies(actionIs("batch", "cronjobs")), Run: actionGuard(actionTrigger)},
-	{Key: "s", Hint: hint{"s", "Suspend/Resume"}, Order: 38, Applies: actionApplies(actionIs("batch", "cronjobs")), Run: actionGuard(actionSuspend)},
-	{Key: "c", Hint: hint{"c", "Cordon"}, Order: 39, Applies: actionApplies(actionIs("", "nodes")), Run: actionGuard(actionCordon(true))},
-	{Key: "u", Hint: hint{"u", "Uncordon"}, Order: 40, Applies: actionApplies(actionIs("", "nodes")), Run: actionGuard(actionCordon(false))},
-	{Key: "r", Hint: hint{"r", "Drain"}, Order: 41, Applies: actionApplies(actionIs("", "nodes")), Run: actionGuard(actionDrain)},
+	{Key: "ctrl+d", Hint: hint{"ctrl-d", "Delete"}, Order: 30, Applies: actionApplies(actionCan("delete")),
+		Needs: []need{{Verb: "delete"}}, Run: actionGuard(actionDelete)},
+	{Key: "e", Hint: hint{"e", "Edit"}, Order: 31, Applies: actionApplies(actionCan("update")),
+		Needs: []need{{Verb: "get"}, {Verb: "update"}}, Run: actionGuard(editorOpen)},
+	{Key: "ctrl+k", Hint: hint{"ctrl-k", "Kill"}, Order: 32, Applies: actionApplies(actionIs("", "pods")),
+		Needs: []need{{Verb: "delete", Resource: needPods}}, Run: actionGuard(actionKill)},
+	{Key: "s", Hint: hint{"s", "Scale"}, Order: 33, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "replicasets")),
+		Needs: []need{{Verb: "get", Sub: "scale"}, {Verb: "update", Sub: "scale"}}, Run: actionGuard(actionScale)},
+	{Key: "r", Hint: hint{"r", "Restart"}, Order: 34, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "daemonsets")),
+		Needs: []need{{Verb: "patch"}}, Run: actionGuard(actionRestart)},
+	{Key: "i", Hint: hint{"i", "Set Image"}, Order: 35, Applies: actionApplies(actionIs("apps", "deployments", "statefulsets", "daemonsets")),
+		Needs: []need{{Verb: "patch"}}, Run: actionGuard(actionSetImage)},
+	{Key: "ctrl+l", Hint: hint{"ctrl-l", "Rollback"}, Order: 36, Applies: actionApplies(actionIs("apps", "replicasets")),
+		Needs: []need{{Verb: "get", Resource: needReplicaSets}, {Verb: "patch", Resource: needDeployments}}, Run: actionGuard(actionRollback)},
+	{Key: "t", Hint: hint{"t", "Trigger"}, Order: 37, Applies: actionApplies(actionIs("batch", "cronjobs")),
+		Needs: []need{{Verb: "get", Resource: needCronJobs}, {Verb: "create", Resource: needJobs}}, Run: actionGuard(actionTrigger)},
+	{Key: "s", Hint: hint{"s", "Suspend/Resume"}, Order: 38, Applies: actionApplies(actionIs("batch", "cronjobs")),
+		Needs: []need{{Verb: "patch", Resource: needCronJobs}}, Run: actionGuard(actionSuspend)},
+	{Key: "c", Hint: hint{"c", "Cordon"}, Order: 39, Applies: actionApplies(actionIs("", "nodes")),
+		Needs: []need{{Verb: "patch", Resource: needNodes}}, Run: actionGuard(actionCordon(true))},
+	{Key: "u", Hint: hint{"u", "Uncordon"}, Order: 40, Applies: actionApplies(actionIs("", "nodes")),
+		Needs: []need{{Verb: "patch", Resource: needNodes}}, Run: actionGuard(actionCordon(false))},
+	{Key: "r", Hint: hint{"r", "Drain"}, Order: 41, Applies: actionApplies(actionIs("", "nodes")),
+		Needs: actionDrainNeeds, Run: actionGuard(actionDrain)},
+}
+
+// actionDrainNeeds are what a drain needs: it cordons the node, lists
+// the pods of every namespace for the node's, and evicts them. A table
+// of nodes is of the cluster scope, so they are asked of every
+// namespace.
+var actionDrainNeeds = []need{
+	{Verb: "patch", Resource: needNodes},
+	{Verb: "list", Resource: needPods},
+	{Verb: "create", Sub: "eviction", Resource: needPods},
 }
 
 func init() { bind(actionBindings...) }
 
-// actionApplies is the one check of whether a key of an action applies:
-// never for a read-only grant (spec §12), never to the containers or the
-// rules, which are no objects of the API, and otherwise when kind says
-// the resource has it.
+// actionApplies is the one check of whether a key of an action applies
+// by kind: never to the containers or the rules, which are no objects of
+// the API, and otherwise when kind says the resource has it. Whether
+// the key's role allows it is the binding's Needs.
 func actionApplies(kind func(kube.Resource) bool) func(kube.Resource, keys.Grant) bool {
-	return func(res kube.Resource, grant keys.Grant) bool {
-		if grant.ReadOnly || res.GVR == kube.Containers.GVR || res.GVR == kube.Rules.GVR {
+	return func(res kube.Resource, _ keys.Grant) bool {
+		if res.GVR == kube.Containers.GVR || res.GVR == kube.Rules.GVR {
 			return false
 		}
 		return kind(res)

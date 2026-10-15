@@ -11,10 +11,11 @@ import (
 	"github.com/fables-for-robots/kosh/kube"
 )
 
-// The fake keeps the rule of the real Session: every method of
-// kube.Actions refuses a read-only grant, and records nothing.
-func TestReadOnlyGrantIsRefusedEveryAction(t *testing.T) {
-	s := New(keys.Grant{Name: "guest", ReadOnly: true})
+// The fake refuses nothing by the grant, as the real Session does not:
+// the API server refuses a role, and a test that wants that puts the
+// refusal into Errs.
+func TestAViewGrantIsRefusedNothing(t *testing.T) {
+	s := New(keys.Grant{Name: "guest/view", Role: keys.Role{Kind: keys.KindClusterRole, Name: "view"}})
 	actions := reflect.TypeOf((*kube.Actions)(nil)).Elem()
 	v := reflect.ValueOf(s)
 	for i := 0; i < actions.NumMethod(); i++ {
@@ -24,31 +25,24 @@ func TestReadOnlyGrantIsRefusedEveryAction(t *testing.T) {
 			args = append(args, reflect.Zero(m.Type.In(a)))
 		}
 		out := v.MethodByName(m.Name).Call(args)
-		err, _ := out[len(out)-1].Interface().(error)
-		if !errors.Is(err, kube.ErrReadOnly) {
-			t.Errorf("%s: %v, want ErrReadOnly", m.Name, err)
+		if err, _ := out[len(out)-1].Interface().(error); err != nil {
+			t.Errorf("%s: %v", m.Name, err)
 		}
 	}
-	if calls := s.Calls(); len(calls) != 0 {
-		t.Errorf("recorded %v", calls)
+	if calls := s.Calls(); len(calls) != actions.NumMethod() {
+		t.Errorf("recorded %d calls, want %d", len(calls), actions.NumMethod())
 	}
-}
 
-func TestReadOnlyGrantSeesNoSecret(t *testing.T) {
-	s := New(keys.Grant{Name: "guest", ReadOnly: true})
 	ref := Ref("secrets", "default", "db")
-	ctx := context.Background()
-	if _, err := s.YAML(ctx, ref, false); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("YAML: %v", err)
+	s.Secrets[ref.String()] = []kube.SecretEntry{{Key: "password", Value: "hunter2"}}
+	got, err := s.SecretData(context.Background(), ref)
+	if err != nil || len(got) != 1 || got[0].Value != "hunter2" {
+		t.Errorf("SecretData: %v, %v", got, err)
 	}
-	if _, err := s.Describe(ctx, ref); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("Describe: %v", err)
-	}
-	if _, err := s.SecretData(ctx, ref); !errors.Is(err, kube.ErrReadOnly) {
-		t.Errorf("SecretData: %v", err)
-	}
-	if _, err := s.YAML(ctx, Ref("configmaps", "default", "cfg"), false); err != nil {
-		t.Errorf("YAML of a configmap: %v", err)
+	forbidden := errors.New("secrets \"db\" is forbidden")
+	s.Errs["SecretData"] = forbidden
+	if _, err := s.SecretData(context.Background(), ref); !errors.Is(err, forbidden) {
+		t.Errorf("SecretData with a refusal in Errs: %v", err)
 	}
 }
 
@@ -117,5 +111,52 @@ func TestFakeUsage(t *testing.T) {
 	}
 	if got, ok := u.Current(); ok || !got.Served {
 		t.Errorf("%+v, %v; want served and not ok", got, ok)
+	}
+}
+
+func TestCanAnswersWhatWasAllowed(t *testing.T) {
+	s := New(keys.Grant{})
+	ctx := context.Background()
+	pods, deployments := Resource("pods"), Resource("deployments")
+	if s.Can(ctx, "get", pods, "", "default") {
+		t.Error("allowed before Allow")
+	}
+	s.Allow("delete", "", "pods", "", "team-a")
+	s.Allow("get", "*", "*", "", "*")
+	s.Allow("*", "apps", "deployments", "scale", "default")
+	s.Allow("list", "", "pods", "", "")
+	s.Allow("watch", "", "pods", "", "team-a")
+	for _, tc := range []struct {
+		verb string
+		res  kube.Resource
+		sub  string
+		ns   string
+		want bool
+	}{
+		{"delete", pods, "", "team-a", true},
+		{"delete", pods, "", "default", false},
+		{"delete", pods, "", "", false},
+		{"delete", pods, "eviction", "team-a", false},
+		{"delete", deployments, "", "team-a", false},
+		{"get", pods, "", "", true},
+		{"get", deployments, "", "kube-system", true},
+		{"get", pods, "log", "default", false},
+		{"update", deployments, "scale", "default", true},
+		{"update", deployments, "scale", "team-a", false},
+		{"update", deployments, "", "default", false},
+		// A right with no namespace is the cluster-wide one: it holds in
+		// every namespace. A right in one namespace holds there alone.
+		{"list", pods, "", "default", true},
+		{"list", pods, "", "", true},
+		{"watch", pods, "", "team-a", true},
+		{"watch", pods, "", "default", false},
+		{"watch", pods, "", "", false},
+	} {
+		if got := s.Can(ctx, tc.verb, tc.res, tc.sub, tc.ns); got != tc.want {
+			t.Errorf("Can(%s, %s, %q, %q) = %v, want %v", tc.verb, tc.res.GVR.Resource, tc.sub, tc.ns, got, tc.want)
+		}
+	}
+	if n := len(s.Called("Can")); n != 0 {
+		t.Errorf("Can was recorded %d times among the calls", n)
 	}
 }

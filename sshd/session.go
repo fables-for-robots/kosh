@@ -144,7 +144,7 @@ func (s *Server) run(c *conn, ss ssh.Session) {
 	s.register(sess)
 	defer s.unregister(sess)
 	log := s.log.With("transport", c.transport, "remote", c.remote,
-		"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "read_only", sess.grant.ReadOnly)
+		"key", sess.grant.Name, "fingerprint", fingerprint(sess.key), "role", sess.grant.Role.String())
 
 	panicked := func(in string, value any, stack []byte) {
 		log.Error("session's program panicked", "in", in, "panic", fmt.Sprint(value), "stack", string(stack))
@@ -429,8 +429,8 @@ func (s *Server) register(sess *session) {
 }
 
 // keysChanged is called when the key list has changed. A session whose
-// key is gone is ended with MsgKeyRemoved, and one whose key went from
-// full to read-only or back with MsgGrantChanged; then a connection whose
+// key is gone is ended with MsgKeyRemoved, and one whose grant changed,
+// its role or its name, with MsgGrantChanged; then a connection whose
 // key is gone is closed once it has no session. It does not wait for any
 // session: it is called in the goroutine of the list's Replace.
 func (s *Server) keysChanged() {
@@ -445,7 +445,7 @@ func (s *Server) keysChanged() {
 		switch {
 		case !ok:
 			ends = append(ends, ending{sess, MsgKeyRemoved})
-		case g.ReadOnly != sess.grant.ReadOnly:
+		case g != sess.grant:
 			ends = append(ends, ending{sess, MsgGrantChanged})
 		}
 	}

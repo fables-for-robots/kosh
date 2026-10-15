@@ -117,8 +117,13 @@ func auditOneAction(t *testing.T, f *actionFixture) auditRecord {
 		t.Errorf("refusals %+v", r)
 	}
 	r := recs[0]
-	if r.Level != slog.LevelInfo {
-		t.Errorf("level %v, want info", r.Level)
+	// The API's refusal of the role is a warning; anything else is info.
+	want := slog.LevelInfo
+	if e, _ := r.attr("error"); strings.HasPrefix(e, "the API answered Forbidden") || strings.HasPrefix(e, "the API answered Unauthorized") {
+		want = slog.LevelWarn
+	}
+	if r.Level != want {
+		t.Errorf("level %v, want %v", r.Level, want)
 	}
 	for k, v := range map[string]string{"key": fullGrant.Name, "fingerprint": fullGrant.Fingerprint} {
 		if got, _ := r.attr(k); got != v {
@@ -648,7 +653,12 @@ func TestAPIWarningsOfAClient(t *testing.T) {
 	auditNoMarker(t, &actionFixture{log: log})
 }
 
-func TestReadOnlyRefusalsAreLogged(t *testing.T) {
+// A read that the API refuses the session's role is logged as kosh's
+// own refusals were: at warn level, with the key, its role, the read and
+// the object, and of the API's answer only its reason and code, since
+// its text is the API's. kosh refuses nothing itself: the request is
+// sent.
+func TestRefusalsOfTheAPIAreLogged(t *testing.T) {
 	secret := &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "token"},
@@ -660,17 +670,25 @@ func TestReadOnlyRefusalsAreLogged(t *testing.T) {
 		call func(s *session, ref ObjectRef) error
 	}{
 		{"yaml", func(s *session, ref ObjectRef) error { _, err := s.YAML(ctx, ref, true); return err }},
-		{"describe", func(s *session, ref ObjectRef) error { _, err := s.Describe(ctx, ref); return err }},
 		{"secret-data", func(s *session, ref ObjectRef) error { _, err := s.SecretData(ctx, ref); return err }},
 	}
+	// The API refuses the Secret with a text that holds the marker, as a
+	// webhook's may.
+	forbid := func(e *env) {
+		refuse := func(a k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "token", errors.New(auditMarker))
+		}
+		e.typed.PrependReactor("get", "secrets", refuse)
+		e.dyn.PrependReactor("get", "secrets", refuse)
+	}
 
-	t.Run("read-only, a Secret", func(t *testing.T) {
-		f := actionEnv(t, readOnlyGrant, nil, secret, readConfigMap())
+	t.Run("refused, a Secret", func(t *testing.T) {
+		f := actionEnv(t, viewGrant, forbid, secret, readConfigMap())
 		ref := f.ref(t, "", "secrets", "default", "token")
 		for _, r := range reads {
 			f.log.reset()
-			if err := r.call(f.s, ref); !errors.Is(err, ErrReadOnly) {
-				t.Errorf("%s: %v, want ErrReadOnly", r.word, err)
+			if err := r.call(f.s, ref); !apierrors.IsForbidden(err) {
+				t.Errorf("%s: %v, want the API's refusal", r.word, err)
 			}
 			recs, all := f.log.with("refused"), f.log.all()
 			if len(recs) != 1 || len(all) != 1 {
@@ -681,10 +699,12 @@ func TestReadOnlyRefusalsAreLogged(t *testing.T) {
 				t.Errorf("%s: level %v, want warn", r.word, recs[0].Level)
 			}
 			want := map[string]string{
-				"key":         readOnlyGrant.Name,
-				"fingerprint": readOnlyGrant.Fingerprint,
+				"key":         viewGrant.Name,
+				"fingerprint": viewGrant.Fingerprint,
+				"role":        "ClusterRole/view",
 				"action":      r.word,
 				"object":      "secrets/default/token",
+				"reason":      "the API answered Forbidden (403)",
 			}
 			for k, v := range want {
 				if got, ok := recs[0].attr(k); !ok || got != v {
@@ -693,18 +713,18 @@ func TestReadOnlyRefusalsAreLogged(t *testing.T) {
 			}
 			auditNoMarker(t, f)
 		}
-		if aa := readActionsOn(f.env, "secrets"); len(aa) != 0 {
-			t.Errorf("the Secret was read: %v", aa)
+		if aa := readActionsOn(f.env, "secrets"); len(aa) != len(reads) {
+			t.Errorf("the API was asked %v, want one get of the Secret per read", aa)
 		}
 	})
 
-	t.Run("read-only, a ConfigMap", func(t *testing.T) {
-		f := actionEnv(t, readOnlyGrant, nil, secret, readConfigMap())
+	t.Run("allowed, a ConfigMap", func(t *testing.T) {
+		f := actionEnv(t, viewGrant, forbid, secret, readConfigMap())
 		ref := f.ref(t, "", "configmaps", "default", "settings")
-		for _, r := range reads {
+		for _, r := range reads[:1] {
 			f.log.reset()
-			if err := r.call(f.s, ref); errors.Is(err, ErrReadOnly) {
-				t.Errorf("%s: ErrReadOnly for a ConfigMap", r.word)
+			if err := r.call(f.s, ref); err != nil {
+				t.Errorf("%s: %v", r.word, err)
 			}
 			if all := f.log.all(); len(all) != 0 {
 				t.Errorf("%s: records %+v, want none", r.word, all)
@@ -712,13 +732,13 @@ func TestReadOnlyRefusalsAreLogged(t *testing.T) {
 		}
 	})
 
-	t.Run("full, a Secret", func(t *testing.T) {
+	t.Run("allowed, a Secret", func(t *testing.T) {
 		f := actionEnv(t, fullGrant, nil, secret, readConfigMap())
 		ref := f.ref(t, "", "secrets", "default", "token")
 		for _, r := range reads {
 			f.log.reset()
-			if err := r.call(f.s, ref); errors.Is(err, ErrReadOnly) {
-				t.Errorf("%s: ErrReadOnly for a full grant", r.word)
+			if err := r.call(f.s, ref); err != nil {
+				t.Errorf("%s: %v", r.word, err)
 			}
 			if all := f.log.all(); len(all) != 0 {
 				t.Errorf("%s: records %+v, want none", r.word, all)
