@@ -100,9 +100,7 @@ func TestParseRoleForms(t *testing.T) {
 		comment string
 		name    string
 		role    Role
-		// reason is the exact reason of a rejection; mentions is a part
-		// of one whose words are the validator's.
-		reason, mentions string
+		reason  string // of a rejection
 	}{
 		{comment: "a/cluster-admin", name: "a", role: clusterRole("cluster-admin")},
 		{comment: "bob@laptop/view", name: "bob@laptop", role: clusterRole("view")},
@@ -125,30 +123,32 @@ func TestParseRoleForms(t *testing.T) {
 		{comment: "/", reason: reasonNoRole},
 		{comment: "alice/@team-a", reason: reasonNoRole},
 		{comment: "dragan\u2215admin", reason: reasonNoRole},
-		{comment: "a/role@ns@x", mentions: `"role@ns@x"`},
-		{comment: "alice/a b", mentions: `"a b"`},
-		{comment: "dragan/admin laptop", mentions: `"admin laptop"`},
-		{comment: "dragan/admin\u200b", mentions: `"admin\u200b"`},
-		{comment: "alice/..", mentions: `".."`},
-		{comment: "alice/.", mentions: `"."`},
-		{comment: "alice/v%w", mentions: `"v%w"`},
-		{comment: "alice/edit@Team", mentions: `"Team"`},
-		{comment: "alice/edit@team.a", mentions: `"team.a"`},
-		{comment: "alice/edit@" + strings.Repeat("n", 64), mentions: strings.Repeat("n", 64)},
-		{comment: "alice/edit@", mentions: `"edit"`},
+		{comment: "a/role@ns@x", reason: `the role "role@ns@x" has more than one @`},
+		{comment: "alice/a b", reason: `the role "a b" holds a space`},
+		{comment: "dragan/admin laptop", reason: `the role "admin laptop" holds a space`},
+		{comment: "alice/..", reason: reasonBadRole},
+		{comment: "alice/.", reason: reasonBadRole},
+		{comment: "alice/v%w", reason: reasonBadRole},
+		{comment: "alice/edit@Team", reason: reasonBadNamespace},
+		{comment: "alice/edit@team.a", reason: reasonBadNamespace},
+		{comment: "alice/edit@" + strings.Repeat("n", 64), reason: reasonBadNamespace},
+		{comment: "alice/edit@", reason: `the role "edit" has no namespace after its @`},
+
+		// A character that does not show, anywhere in the name, could
+		// show one role and grant another.
+		{comment: "bob/view\x1b[8m/cluster-admin", reason: reasonHidden},
+		{comment: "bob/view\rx/cluster-admin", reason: reasonHidden},
+		{comment: "x\u202bview\u200f/cluster-admin", reason: reasonHidden},
+		{comment: "bob\u200b/view", reason: reasonHidden},
+		{comment: "bob/vi\u200bew", reason: reasonHidden},
+		{comment: "dragan/admin\u200b", reason: reasonHidden},
+		{comment: "bob\tlaptop/view", reason: reasonHidden},
+		{comment: "bob\u2028/view", reason: reasonHidden},
+		{comment: "bob/edit@team-a\u00a0x", reason: reasonHidden},
 	} {
 		t.Run(strconv.Quote(tc.comment), func(t *testing.T) {
 			name, role, reason := ParseRole(tc.comment)
-			switch {
-			case tc.reason != "":
-				if reason != tc.reason {
-					t.Errorf("reason = %q, want %q", reason, tc.reason)
-				}
-			case tc.mentions != "":
-				if !strings.Contains(reason, tc.mentions) {
-					t.Errorf("reason = %q, want one that names %s", reason, tc.mentions)
-				}
-			default:
+			if tc.reason == "" {
 				if reason != "" {
 					t.Fatalf("rejected: %s", reason)
 				}
@@ -156,6 +156,9 @@ func TestParseRoleForms(t *testing.T) {
 					t.Errorf("= %q, %+v; want %q, %+v", name, role, tc.name, tc.role)
 				}
 				return
+			}
+			if reason != tc.reason {
+				t.Errorf("reason = %q, want %q", reason, tc.reason)
 			}
 			if name != "" || role != (Role{}) {
 				t.Errorf("a rejection with %q, %+v", name, role)

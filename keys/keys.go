@@ -5,10 +5,11 @@
 // A line is a key and, after it, a comment that is the key's name. The
 // name ends in the role whose rights a session of the key has: after its
 // last /, "view" is the ClusterRole view and "edit@team-a" the Role edit
-// in the namespace team-a. A line without a name or a role, with a role
-// or namespace that Kubernetes would not take, with an option, or that
-// does not parse, is rejected: it gives no access. Empty lines and lines
-// that begin with # are skipped.
+// in the namespace team-a. A line without a name or a role, with a name
+// that holds a character that does not show, with a role or namespace
+// that Kubernetes would not take, with an option, or that does not parse,
+// is rejected: it gives no access. Empty lines and lines that begin with
+// # are skipped.
 package keys
 
 import (
@@ -83,12 +84,16 @@ func (r Role) String() string {
 	return r.Kind + "/" + r.Name
 }
 
-// Why a comment names no key: it is empty, it has no role after a /, or
-// nothing before it.
+// Why a comment names no key: it is empty, it holds what cannot be
+// seen, it has no role after a /, or nothing before it; or the role or
+// namespace is not one Kubernetes takes.
 const (
-	reasonNoComment = "no name, no role"
-	reasonNoRole    = "the name does not end in /<role> or /<role>@<namespace>"
-	reasonNoName    = "a key needs a name before its role"
+	reasonNoComment    = "no name, no role"
+	reasonHidden       = "the name holds a character that does not show"
+	reasonNoRole       = "the name does not end in /<role> or /<role>@<namespace>"
+	reasonNoName       = "a key needs a name before its role"
+	reasonBadRole      = "the role is not a name: no /, not . or .., no %"
+	reasonBadNamespace = "the namespace is not a DNS label: lower-case letters, digits and dashes, 63 at most"
 )
 
 // ParseRole splits a key's comment, without the space around it, into the
@@ -99,6 +104,13 @@ func ParseRole(comment string) (name string, role Role, reason string) {
 	comment = strings.TrimSpace(comment)
 	if comment == "" {
 		return "", Role{}, reasonNoComment
+	}
+	// A control, format or other unseen character could make the line
+	// show one role and grant another: an escape that hides the role, a
+	// carriage return that draws it over the name, a bidi mark that
+	// reorders them. The name also goes into the audit log and the header.
+	if strings.ContainsFunc(comment, func(r rune) bool { return !unicode.IsPrint(r) || unicode.Is(unicode.Cf, r) }) {
+		return "", Role{}, reasonHidden
 	}
 	slash := strings.LastIndexByte(comment, '/')
 	if slash < 0 {
@@ -114,14 +126,13 @@ func ParseRole(comment string) (name string, role Role, reason string) {
 	case strings.Contains(namespace, "@"):
 		return "", Role{}, fmt.Sprintf("the role %q has more than one @", last)
 	}
-	// Kubernetes takes a role whose name holds a space or a character
-	// that does not show; in a key's name it is a mistake, such as a
-	// comment that goes on after the role.
-	if strings.ContainsFunc(roleName, func(r rune) bool { return r == ' ' || !unicode.IsPrint(r) }) {
-		return "", Role{}, fmt.Sprintf("the role %q holds a space or a character that does not show", roleName)
+	// Kubernetes takes a role whose name holds a space; in a key's name it
+	// is a mistake, such as a comment that goes on after the role.
+	if strings.ContainsRune(roleName, ' ') {
+		return "", Role{}, fmt.Sprintf("the role %q holds a space", roleName)
 	}
-	if errs := apipath.IsValidPathSegmentName(roleName); len(errs) > 0 {
-		return "", Role{}, fmt.Sprintf("the role %q is not a name Kubernetes takes: %s", roleName, strings.Join(errs, "; "))
+	if len(apipath.IsValidPathSegmentName(roleName)) > 0 {
+		return "", Role{}, reasonBadRole
 	}
 	if !namespaced {
 		return name, Role{Kind: KindClusterRole, Name: roleName}, ""
@@ -129,8 +140,8 @@ func ParseRole(comment string) (name string, role Role, reason string) {
 	if namespace == "" {
 		return "", Role{}, fmt.Sprintf("the role %q has no namespace after its @", roleName)
 	}
-	if errs := validation.IsDNS1123Label(namespace); len(errs) > 0 {
-		return "", Role{}, fmt.Sprintf("the namespace %q is not a name Kubernetes takes: %s", namespace, strings.Join(errs, "; "))
+	if len(validation.IsDNS1123Label(namespace)) > 0 {
+		return "", Role{}, reasonBadNamespace
 	}
 	return name, Role{Kind: KindRole, Namespace: namespace, Name: roleName}, ""
 }
