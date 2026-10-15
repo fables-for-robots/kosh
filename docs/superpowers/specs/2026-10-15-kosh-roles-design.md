@@ -127,10 +127,20 @@ type Role struct {
 // "kosh:" + Name.
 func (g Grant) User() string
 
-// Group returns the group that carries the role's binding:
-// "kosh:clusterrole:<role>" or "kosh:role:<namespace>:<role>".
-func (r Role) Group() string
+// Group returns the group that carries the role's binding for the
+// kosh instance named instance: "kosh:<instance>:clusterrole:<role>" or
+// "kosh:<instance>:role:<namespace>:<role>".
+func (r Role) Group(instance string) string
 ```
+
+**The instance.** Several koshes may serve one cluster (two releases, a
+`kosh serve --kubeconfig` beside a deployed one, the e2e's own second
+kosh), each with its own key list. Each is an **instance**, named by
+`--instance` (the chart passes `<namespace>-<release>`; the default is
+`kosh`); the name is a path segment without `:` (`[a-z0-9.-]`, at most
+63 characters). The instance's name is in every group, every binding's
+name and the cache users (§3.3), so that two instances never share a
+binding and one never prunes another's (§4).
 
 `ReadOnly` is gone from `Grant`, and with it `ErrReadOnly`, `mayChange`
 and `maySee` (§12): the API server refuses, and kosh shows and logs its
@@ -155,7 +165,7 @@ every request of a session carries impersonation:
 
 ```
 Impersonate-User:  kosh:<key name>
-Impersonate-Group: <role's group>
+Impersonate-Group: <role's group, with the instance's name>
 ```
 
 (client-go's `rest.ImpersonationConfig{UserName, Groups}`; the API server
@@ -183,9 +193,9 @@ things: **one cache per `(role, gvr)`**, and for a namespaced Role **per
 `(role, gvr, namespace)`**, listing that namespace alone (a cluster-wide
 list by a Role-bound identity is refused, and would show the refusal for
 every namespace). The cache's own requests impersonate the role's user,
-named as its group is (`kosh:clusterrole:view`,
-`kosh:role:team-a:edit`; the two prefixes keep a ClusterRole `team-a:edit`
-and a Role `edit` in `team-a` apart) with the role's group: the audit
+named as its group is (`kosh:<instance>:clusterrole:view`,
+`kosh:<instance>:role:team-a:edit`; the two prefixes keep a ClusterRole
+`team-a:edit` and a Role `edit` in `team-a` apart) with the role's group: the audit
 log then says that the list was made for the role's cache, not for
 whichever key opened it first. `kindCache` gains the
 identity and the namespace; `acquire`/`release`, the idle stop and
@@ -240,21 +250,28 @@ kosh makes the bindings its key list needs, and no other, at every
 reading of the list (at start and every change), as the ServiceAccount:
 
 - For every distinct ClusterRole in the list: a **ClusterRoleBinding**
-  named `kosh:clusterrole:<role>`, `roleRef` the ClusterRole, one subject
-  `Group kosh:clusterrole:<role>`.
-- For every distinct Role: a **RoleBinding** named `kosh:role:<role>` in
-  its namespace, `roleRef` the Role, one subject `Group
-  kosh:role:<namespace>:<role>`.
-- Every binding kosh makes carries the label
-  `app.kubernetes.io/managed-by: kosh` and the annotation
+  named `kosh:<instance>:clusterrole:<role>`, `roleRef` the ClusterRole,
+  one subject `Group kosh:<instance>:clusterrole:<role>`.
+- For every distinct Role: a **RoleBinding** named
+  `kosh:<instance>:role:<role>` in its namespace, `roleRef` the Role,
+  one subject `Group kosh:<instance>:role:<namespace>:<role>`.
+- Every binding kosh makes carries the labels
+  `app.kubernetes.io/managed-by: kosh` and
+  `kosh.fables-for-robots.dev/instance: <instance>`, and the annotation
   `kosh.fables-for-robots.dev/role: ClusterRole/<name>` or
   `Role/<namespace>/<name>`.
 - A binding that exists with the right `roleRef` and subject is left as
   it is; one with another `roleRef` is replaced (a `roleRef` cannot be
-  changed); one with other subjects has its subjects set.
-- A binding with kosh's label that the list no longer needs is deleted
-  (ClusterRoleBindings, and RoleBindings in every namespace, listed by
-  the label). A namespace that is gone takes its RoleBindings with it.
+  changed); one with other subjects has its subjects set. A binding at
+  kosh's name without the labels is adopted (labelled) when its
+  `roleRef` and subjects are already right, and otherwise left alone
+  with a warning; one labelled by another manager is left alone with a
+  warning.
+- A binding with both of kosh's labels, the instance's own, that the
+  list no longer needs is deleted (ClusterRoleBindings, and RoleBindings
+  in every namespace, listed by the labels). Another instance's bindings
+  are never touched. A namespace that is gone takes its RoleBindings
+  with it.
 - Order: bindings are made before the new list takes effect for
   sessions, and deleted after the sessions of the keys that lost them
   have been ended, so that no session acts without its binding and none
@@ -350,6 +367,20 @@ the table and no keys.)
   (before the listeners open, logged; a failure does not stop the
   start) and on every change.
 - `kosh id` and the rest are unchanged.
+
+### 4.1 The key list is a way to any role
+
+Whoever can change the key list can name any role kosh's ServiceAccount
+may bind, `cluster-admin` among them: the list is the access control. A
+key whose role can write ConfigMaps in kosh's namespace (the ClusterRoles
+`admin` and `edit` bound cluster-wide, any Role there with `update` on
+`configmaps`) can therefore grant itself anything. At every reading of
+the list kosh asks the API server, as each role, whether it may `update`
+or `patch` `configmaps` in kosh's own namespace (the ServiceAccount's
+namespace, from the pod, or `--namespace`), and logs `WARN "a key's role
+may edit the key list, and so grant itself any role"` with the keys for
+every role that may and is not `cluster-admin`. The README says it in
+plain words; the chart's notes say it at install.
 
 ## 7. The chart and RBAC
 
