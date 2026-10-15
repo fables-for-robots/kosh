@@ -42,7 +42,7 @@ func stillAnswers(t *testing.T, tm *term) {
 
 func TestPanicInUpdateEndsOnlyThatSession(t *testing.T) {
 	h := newHarness(t)
-	alice, bob := h.key("alice", false), h.key("bob", false)
+	alice, bob := h.key(admin("alice")), h.key(admin("bob"))
 	ta, tb := openTerm(t, h.dial(alice, "kosh")), openTerm(t, h.dial(bob, "kosh"))
 	ta.waitFor(testWord)
 	tb.waitFor(testWord)
@@ -54,7 +54,7 @@ func TestPanicInUpdateEndsOnlyThatSession(t *testing.T) {
 func TestPanicInViewAndInit(t *testing.T) {
 	t.Run("View", func(t *testing.T) {
 		h := newHarness(t)
-		alice, bob := h.key("alice", false), h.key("bob", false)
+		alice, bob := h.key(admin("alice")), h.key(admin("bob"))
 		ta, tb := openTerm(t, h.dial(alice, "kosh")), openTerm(t, h.dial(bob, "kosh"))
 		ta.waitFor(testWord)
 		tb.waitFor(testWord)
@@ -64,10 +64,10 @@ func TestPanicInViewAndInit(t *testing.T) {
 	})
 	t.Run("Init", func(t *testing.T) {
 		h := newHarness(t)
-		bob := h.key("bob", false)
+		bob := h.key(admin("bob"))
 		tb := openTerm(t, h.dial(bob, "kosh"))
 		tb.waitFor(testWord)
-		ta := openTerm(t, h.dial(h.key(panicInitName, false), "kosh"))
+		ta := openTerm(t, h.dial(h.key(admin(panicInitName)), "kosh"))
 		crashes(t, h, ta, admin(panicInitName), "Init")
 		stillAnswers(t, tb)
 	})
@@ -77,7 +77,7 @@ func TestPanicInViewAndInit(t *testing.T) {
 // ends with tea.ErrProgramPanic.
 func TestPanicInACommand(t *testing.T) {
 	h := newHarness(t)
-	alice, bob := h.key("alice", false), h.key("bob", false)
+	alice, bob := h.key(admin("alice")), h.key(admin("bob"))
 	ta, tb := openTerm(t, h.dial(alice, "kosh")), openTerm(t, h.dial(bob, "kosh"))
 	ta.waitFor(testWord)
 	tb.waitFor(testWord)

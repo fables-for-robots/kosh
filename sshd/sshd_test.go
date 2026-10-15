@@ -48,7 +48,7 @@ func TestNewValidates(t *testing.T) {
 
 func TestAcceptedKeyGetsTheProgram(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	tm := openTerm(t, h.dial(key, "kosh"))
 	tm.waitFor(testWord)
 	if n := h.srv.Sessions(); n != 1 {
@@ -56,7 +56,7 @@ func TestAcceptedKeyGetsTheProgram(t *testing.T) {
 	}
 	rec := h.log.waitFor(t, "of the start of the session", func(r logRecord) bool { return r.Msg == "session start" })
 	if rec.Attrs["key"] != admin("alice") || rec.Attrs["fingerprint"] != ssh.FingerprintSHA256(key.PublicKey()) ||
-		rec.Attrs["read_only"] != "false" || rec.Attrs["transport"] != "tcp" || rec.Attrs["remote"] == "" {
+		rec.Attrs["role"] != "ClusterRole/cluster-admin" || rec.Attrs["transport"] != "tcp" || rec.Attrs["remote"] == "" {
 		t.Errorf("the start of the session is logged as %v", rec)
 	}
 	tm.press("q")
@@ -72,7 +72,7 @@ func TestAcceptedKeyGetsTheProgram(t *testing.T) {
 
 func TestRejectedKey(t *testing.T) {
 	h := newHarness(t)
-	h.key("alice", false)
+	h.key(admin("alice"))
 	stranger := newSigner(t)
 	raw := h.dialRaw()
 	if _, err := connect(raw, h.addr, clientConfig("kosh", ssh.PublicKeys(stranger))); err == nil {
@@ -90,7 +90,7 @@ func TestRejectedKey(t *testing.T) {
 
 func TestNoPasswordAuth(t *testing.T) {
 	h := newHarness(t)
-	h.key("alice", false)
+	h.key(admin("alice"))
 	var passwords, interactive, publicKeys atomic.Int32
 	cfg := clientConfig("kosh",
 		ssh.PasswordCallback(func() (string, error) {
@@ -120,7 +120,7 @@ func TestNoPasswordAuth(t *testing.T) {
 
 func TestAnyUserName(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	for _, user := range []string{"root", "kosh", "x"} {
 		tm := openTerm(t, h.dial(key, user))
 		tm.waitFor(testWord)
@@ -133,7 +133,7 @@ func TestAnyUserName(t *testing.T) {
 
 func TestVersionString(t *testing.T) {
 	h := newHarness(t)
-	cl := h.dial(h.key("alice", false), "kosh")
+	cl := h.dial(h.key(admin("alice")), "kosh")
 	if got, want := string(cl.ServerVersion()), "SSH-2.0-kosh_test-1.2.3"; got != want {
 		t.Errorf("server version %q, want %q", got, want)
 	}
@@ -141,7 +141,7 @@ func TestVersionString(t *testing.T) {
 
 func TestTwentyAuthenticationTries(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	strangers := func(n int) []ssh.Signer {
 		var s []ssh.Signer
 		for range n {
@@ -164,7 +164,7 @@ func TestTwentyAuthenticationTries(t *testing.T) {
 
 func TestServeTwoListeners(t *testing.T) {
 	h := newHarness(t)
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	la, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -218,7 +218,7 @@ func TestServeTwoListeners(t *testing.T) {
 
 func TestNoTerminal(t *testing.T) {
 	h := newHarness(t)
-	tm := openSession(t, h.dial(h.key("alice", false), "kosh"), false, "")
+	tm := openSession(t, h.dial(h.key(admin("alice")), "kosh"), false, "")
 	if st := tm.exit(); st != 1 {
 		t.Errorf("exit status %d, want 1", st)
 	}
@@ -233,7 +233,7 @@ func TestNoTerminal(t *testing.T) {
 
 func TestCommandIsRefused(t *testing.T) {
 	h := newHarness(t)
-	cl := h.dial(h.key("alice", false), "kosh")
+	cl := h.dial(h.key(admin("alice")), "kosh")
 	defer h.refusalLogged(MsgNoCommands, admin("alice"))
 	for _, pty := range []bool{false, true} {
 		tm := openSession(t, cl, pty, "ls")
@@ -251,7 +251,7 @@ func TestCommandIsRefused(t *testing.T) {
 
 func TestNothingElseIsServed(t *testing.T) {
 	h := newHarness(t)
-	cl := h.dial(h.key("alice", false), "kosh")
+	cl := h.dial(h.key(admin("alice")), "kosh")
 	agentChannels := cl.HandleChannelOpen("auth-agent@openssh.com")
 
 	var oce *ssh.OpenChannelError

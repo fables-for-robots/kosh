@@ -94,7 +94,7 @@ func TestSilentPeerIsClosedByTheDeadline(t *testing.T) {
 
 func TestGarbagePeerIsClosed(t *testing.T) {
 	h := newHarness(t, withConfig(func(c *Config) { c.HandshakeTimeout = 200 * time.Millisecond }))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 
 	http := h.dialRaw()
 	if _, err := io.WriteString(http, "GET / HTTP/1.1\r\n\r\n"); err != nil {
@@ -117,7 +117,7 @@ func TestHandshakeLimit(t *testing.T) {
 		c.MaxHandshakes = 3
 		c.HandshakeTimeout = 500 * time.Millisecond
 	}))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 
 	idle := make([]net.Conn, 3)
 	banners := make([]string, 3)
@@ -168,7 +168,7 @@ func TestAskingAboutAKeyDoesNotLeaveTheHandshake(t *testing.T) {
 		c.MaxHandshakes = 1
 		c.HandshakeTimeout = 300 * time.Millisecond
 	}))
-	signer := &blockingSigner{Signer: h.key("alice", false), asked: make(chan struct{}), release: make(chan struct{})}
+	signer := &blockingSigner{Signer: h.key(admin("alice")), asked: make(chan struct{}), release: make(chan struct{})}
 	c := h.dialRaw()
 	connected := make(chan error, 1)
 	go func() {
@@ -229,7 +229,7 @@ func stillOpen(t *testing.T, cl *ssh.Client, d time.Duration, what string) {
 func TestConnectionWithoutASessionIsClosed(t *testing.T) {
 	const idle = 100 * time.Millisecond
 	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = idle }))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 
 	// No session at all.
 	cl := h.dial(key, "kosh")
@@ -295,7 +295,7 @@ func keepaliveFast(c *Config) {
 
 func TestKeepaliveClosesADeadPeer(t *testing.T) {
 	h := newHarness(t, withConfig(keepaliveFast))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	dc := &deafConn{Conn: h.dialRaw()}
 	cl, err := connect(dc, h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
 	if err != nil {
@@ -314,7 +314,7 @@ func TestKeepaliveClosesADeadPeer(t *testing.T) {
 
 func TestKeepaliveLeavesALivePeer(t *testing.T) {
 	h := newHarness(t, withConfig(keepaliveFast))
-	key := h.key("alice", false)
+	key := h.key(admin("alice"))
 	sc, chans, reqs, err := ssh.NewClientConn(h.dialRaw(), h.addr, clientConfig("kosh", ssh.PublicKeys(key)))
 	if err != nil {
 		t.Fatal(err)
@@ -390,7 +390,7 @@ func rejectedAsTooMany(t *testing.T, cl *ssh.Client) {
 func TestSessionChannelLimit(t *testing.T) {
 	h := newHarness(t)
 	raw := h.dialRaw()
-	cl, err := connect(raw, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key("alice", false))))
+	cl, err := connect(raw, h.addr, clientConfig("kosh", ssh.PublicKeys(h.key(admin("alice")))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestSessionChannelLimit(t *testing.T) {
 
 func TestConnectionsPerKeyLimit(t *testing.T) {
 	h := newHarness(t, withConfig(func(c *Config) { c.IdleConnection = time.Minute }))
-	alice, bob := h.key("alice", false), h.key("bob", false)
+	alice, bob := h.key(admin("alice")), h.key(admin("bob"))
 	clients := make([]*ssh.Client, maxConnectionsPerKey)
 	for i := range clients {
 		clients[i] = h.dial(alice, "kosh")

@@ -26,6 +26,8 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -35,13 +37,22 @@ import (
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/fables-for-robots/kosh/irohnet"
-	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/state"
 )
 
-// startAPIServer starts kube-apiserver and etcd for one test, and stops
-// them when it ends. It skips the test without KUBEBUILDER_ASSETS.
+// startAPIServer starts kube-apiserver and etcd for one test, with RBAC
+// on, and stops them when it ends. It returns the configuration of the
+// administrator, which may impersonate anyone: kosh runs as it unless a
+// test says otherwise. It skips the test without KUBEBUILDER_ASSETS.
 func startAPIServer(t *testing.T) *rest.Config {
+	t.Helper()
+	_, cfg := startEnvtest(t)
+	return cfg
+}
+
+// startEnvtest is startAPIServer, with the environment, whose AddUser
+// makes users.
+func startEnvtest(t *testing.T) (*envtest.Environment, *rest.Config) {
 	t.Helper()
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS is not set: run scripts/envtest-assets.sh")
@@ -50,6 +61,9 @@ func startAPIServer(t *testing.T) *rest.Config {
 	// not set; envtest is all of it the tests use.
 	ctrllog.SetLogger(logr.Discard())
 	env := &envtest.Environment{}
+	// envtest's default, said here because a view key's refusals rely on
+	// it.
+	env.ControlPlane.GetAPIServer().Configure().Set("authorization-mode", "RBAC")
 	cfg, err := env.Start()
 	if err != nil {
 		t.Fatalf("starting the API server: %v", err)
@@ -59,7 +73,29 @@ func startAPIServer(t *testing.T) *rest.Config {
 			t.Errorf("stopping the API server: %v", err)
 		}
 	})
-	return cfg
+	fillView(t, cfg)
+	return env, cfg
+}
+
+// fillView gives the ClusterRole view the rules it aggregates, as a
+// cluster has them: envtest runs no controller-manager, whose controller
+// fills the aggregated ClusterRoles, and view is empty without it.
+func fillView(t *testing.T, admin *rest.Config) {
+	t.Helper()
+	ctx := context.Background()
+	rbac := kubernetes.NewForConfigOrDie(admin).RbacV1()
+	aggregated, err := rbac.ClusterRoles().Get(ctx, "system:aggregate-to-view", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := rbac.ClusterRoles().Get(ctx, "view", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Rules = aggregated.Rules
+	if _, err := rbac.ClusterRoles().Update(ctx, view, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // kubeconfigOf writes a kubeconfig that reaches the API server of cfg
@@ -86,8 +122,9 @@ type user struct {
 	line   string
 }
 
-// newUser makes a key named name, read-only or full.
-func newUser(t *testing.T, name string, readOnly bool) user {
+// newUser makes a key named name/role: role names a ClusterRole, or a
+// Role as role@namespace.
+func newUser(t *testing.T, name, role string) user {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -97,10 +134,7 @@ func newUser(t *testing.T, name string, readOnly bool) user {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !readOnly {
-		name += keys.AdminSuffix
-	}
-	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name + "/" + role
 	return user{signer: signer, line: line}
 }
 
@@ -189,8 +223,7 @@ func (s *screen) text() string {
 	return ansi.Strip(s.buf.String())
 }
 
-// client is an SSH client with one session that has a terminal of 100
-// by 30.
+// client is an SSH client with one session that has a terminal.
 type client struct {
 	conn   net.Conn
 	ssh    *ssh.Client
@@ -201,8 +234,13 @@ type client struct {
 }
 
 // connect makes an SSH connection over conn with u's key, checks the
-// host key against k's, and opens a session with a terminal.
+// host key against k's, and opens a session with a terminal of 100 by 30.
 func connect(k *kosh, conn net.Conn, u user) (*client, error) {
+	return connectSized(k, conn, u, 100, 30)
+}
+
+// connectSized is connect with a terminal of width by height.
+func connectSized(k *kosh, conn net.Conn, u user, width, height int) (*client, error) {
 	cfg := &ssh.ClientConfig{
 		User:            "kosh",
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(u.signer)},
@@ -220,7 +258,7 @@ func connect(k *kosh, conn net.Conn, u user) (*client, error) {
 		_ = c.ssh.Close()
 		return nil, err
 	}
-	if err := c.sess.RequestPty("xterm-256color", 30, 100, ssh.TerminalModes{}); err != nil {
+	if err := c.sess.RequestPty("xterm-256color", height, width, ssh.TerminalModes{}); err != nil {
 		_ = c.ssh.Close()
 		return nil, err
 	}
@@ -245,15 +283,21 @@ func connect(k *kosh, conn net.Conn, u user) (*client, error) {
 	return c, nil
 }
 
-// dialTCP connects to k's SSH port as u and fails the test when it
-// cannot.
+// dialTCP connects to k's SSH port as u, with a terminal of 100 by 30,
+// and fails the test when it cannot.
 func dialTCP(t *testing.T, k *kosh, u user) *client {
+	t.Helper()
+	return dialTCPSized(t, k, u, 100, 30)
+}
+
+// dialTCPSized is dialTCP with a terminal of width by height.
+func dialTCPSized(t *testing.T, k *kosh, u user, width, height int) *client {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", k.serving.ssh.String(), 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := connect(k, conn, u)
+	c, err := connectSized(k, conn, u, width, height)
 	if err != nil {
 		t.Fatalf("connecting: %v\nlog:\n%s", err, k.log.dump())
 	}
@@ -306,7 +350,7 @@ func (c *client) ended(t *testing.T, within time.Duration) error {
 
 func TestServeEndToEnd(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice@laptop", false)
+	alice := newUser(t, "alice@laptop", "cluster-admin")
 	k := startKosh(t, envOptions(t, cfg, alice))
 
 	rec, ok := k.log.find("kosh is serving")
@@ -341,7 +385,7 @@ func TestServeEndToEnd(t *testing.T) {
 	for _, r := range k.log.records() {
 		if name, ok := r.Attrs["key"]; ok {
 			named++
-			if name != "alice@laptop"+keys.AdminSuffix || r.Attrs["fingerprint"] != fp {
+			if name != "alice@laptop/cluster-admin" || r.Attrs["fingerprint"] != fp {
 				t.Errorf("%v: a key without its fingerprint %s", r, fp)
 			}
 		}
@@ -349,33 +393,141 @@ func TestServeEndToEnd(t *testing.T) {
 	if named == 0 {
 		t.Errorf("no line names the key:\n%s", k.log.dump())
 	}
+	if rec, _ := k.log.find("session start"); rec.Attrs["role"] != "ClusterRole/cluster-admin" {
+		t.Errorf("%v: the session's start does not name the key's role", rec)
+	}
 }
 
-func TestServeReadOnlyKey(t *testing.T) {
+// managedBy is the label kosh puts on the bindings it makes.
+const managedBy = "app.kubernetes.io/managed-by"
+
+// clusterBinding returns the ClusterRoleBinding kosh makes for the
+// ClusterRole role, checked against §4 of the roles design, or nil when
+// there is none.
+func clusterBinding(t *testing.T, typed kubernetes.Interface, role string) *rbacv1.ClusterRoleBinding {
+	t.Helper()
+	name := "kosh:clusterrole:" + role
+	b, err := typed.RbacV1().ClusterRoleBindings().Get(context.Background(), name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []rbacv1.Subject{{APIGroup: "rbac.authorization.k8s.io", Kind: "Group", Name: name}}
+	if b.RoleRef != (rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: role}) ||
+		len(b.Subjects) != 1 || b.Subjects[0] != want[0] || b.Labels[managedBy] != "kosh" ||
+		b.Annotations["kosh.fables-for-robots.dev/role"] != "ClusterRole/"+role {
+		t.Errorf("the binding of %s: roleRef %+v, subjects %+v, labels %v, annotations %v", role, b.RoleRef, b.Subjects, b.Labels, b.Annotations)
+	}
+	return b
+}
+
+// A view key sees the cluster and has none of the keys that change it;
+// the header names the key, role and all, and kosh made the binding of
+// each role before the first session.
+func TestServeViewKey(t *testing.T) {
 	cfg := startAPIServer(t)
-	bob := newUser(t, "bob", true)
-	k := startKosh(t, envOptions(t, cfg, bob))
-	c := dialTCP(t, k, bob)
-	c.waitFor(t, "Pods(default)", "bob [read-only]")
+	typed := kubernetes.NewForConfigOrDie(cfg)
+	alice := newUser(t, "alice", "cluster-admin")
+	bob := newUser(t, "bob", "view")
+	k := startKosh(t, envOptions(t, cfg, alice, bob))
+	for _, role := range []string{"cluster-admin", "view"} {
+		if clusterBinding(t, typed, role) == nil {
+			t.Errorf("no binding of %s once kosh serves:\n%s", role, k.log.dump())
+		}
+	}
+
+	// The keys are bound once the API server has answered what the role
+	// may do, all of them at once; a terminal this wide has room in the
+	// header for every hint of the table of pods.
+	a := dialTCPSized(t, k, alice, 260, 30)
+	a.waitFor(t, "Pods(default)", "alice/cluster-admin", "<ctrl-d>", "Delete", "<d>", "Describe")
+	c := dialTCPSized(t, k, bob, 260, 30)
+	c.waitFor(t, "Pods(default)", "bob/view", "<d>", "Describe")
+	for _, not := range []string{"<ctrl-d>", "Delete", "<e>", "<s>", "Shell", "<ctrl-k>", "[read-only]"} {
+		if text := c.screen.text(); strings.Contains(text, not) {
+			t.Errorf("a view key's screen has %q:\n%s", not, text)
+		}
+	}
+	if rec, _ := k.log.find("session start"); rec.Attrs["role"] == "" {
+		t.Errorf("%v: the session's start does not name the key's role", rec)
+	}
+}
+
+// A change of the key list that narrows a key's role ends its session
+// with the new binding already made, and the binding no key needs is
+// deleted.
+func TestServeBindingsFollowTheList(t *testing.T) {
+	cfg := startAPIServer(t)
+	typed := kubernetes.NewForConfigOrDie(cfg)
+	alice := newUser(t, "alice", "cluster-admin")
+	o := envOptions(t, cfg, alice)
+	k := startKosh(t, o)
+	if clusterBinding(t, typed, "view") != nil {
+		t.Fatal("a binding of view before any key names it")
+	}
+	c := dialTCP(t, k, alice)
+	c.waitFor(t, "Pods(default)", "alice/cluster-admin")
+
+	writeFile(t, o.authorizedKeys, strings.Replace(alice.line, "/cluster-admin", "/view", 1)+"\n")
+	err := c.ended(t, 10*time.Second)
+	var exit *ssh.ExitError
+	if !errors.As(err, &exit) || exit.ExitStatus() != 1 {
+		t.Errorf("the session ended with %v, want status 1", err)
+	}
+	<-c.screen.done
+	if text := c.screen.text(); !strings.Contains(text, "kosh: what this key may do has changed") {
+		t.Errorf("the session was not told:\n%s", text)
+	}
+	// The binding of the new role was made before the session ended.
+	if clusterBinding(t, typed, "view") == nil {
+		t.Errorf("no binding of view when the session ended:\n%s", k.log.dump())
+	}
+	eventually(t, waitTime, "the binding of cluster-admin is deleted", func() bool {
+		return clusterBinding(t, typed, "cluster-admin") == nil
+	})
+	dialTCP(t, k, alice).waitFor(t, "Pods(default)", "alice/view")
+}
+
+// A kosh whose user may not make the bindings logs it and serves all the
+// same: its sessions get the API's refusals.
+func TestServeStartsWithoutTheBindings(t *testing.T) {
+	env, admin := startEnvtest(t)
+	nobody, err := env.AddUser(envtest.User{Name: "nobody"}, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := newUser(t, "alice", "cluster-admin")
+	o := envOptions(t, nobody.Config(), alice)
+	k := startKosh(t, o)
+	rec, ok := k.log.find("the bindings of the key list could not be made")
+	if !ok || rec.Level != slog.LevelError {
+		t.Errorf("no error that the bindings could not be made:\n%s", k.log.dump())
+	}
+	if clusterBinding(t, kubernetes.NewForConfigOrDie(admin), "cluster-admin") != nil {
+		t.Error("a binding was made by a user that may not")
+	}
+	dialTCP(t, k, alice).waitFor(t, "Pods(default)", "alice/cluster-admin", "forbidden")
 }
 
 func TestServeUnknownKeyIsRefused(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	k := startKosh(t, envOptions(t, cfg, alice))
 	conn, err := net.DialTimeout("tcp", k.serving.ssh.String(), 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := connect(k, conn, newUser(t, "mallory", false)); err == nil || !strings.Contains(err.Error(), "unable to authenticate") {
+	if _, err := connect(k, conn, newUser(t, "mallory", "cluster-admin")); err == nil || !strings.Contains(err.Error(), "unable to authenticate") {
 		t.Errorf("a key that is not in the list: %v", err)
 	}
 }
 
 func TestServeKeyListIsFollowed(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
-	carol := newUser(t, "carol", false)
+	alice := newUser(t, "alice", "cluster-admin")
+	carol := newUser(t, "carol", "cluster-admin")
 	o := envOptions(t, cfg, alice, carol)
 	k := startKosh(t, o)
 	c := dialTCP(t, k, alice)
@@ -397,7 +549,7 @@ func TestServeKeyListIsFollowed(t *testing.T) {
 
 func TestServeStops(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	k := startKosh(t, envOptions(t, cfg, alice))
 	c := dialTCP(t, k, alice)
 	c.waitFor(t, "Pods(default)")
@@ -434,7 +586,7 @@ func TestServeStops(t *testing.T) {
 
 func TestServeOverIroh(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	o := envOptions(t, cfg, alice)
 	o.sshListen = ""
 	o.iroh = true
@@ -563,7 +715,7 @@ func TestServeVanishedClientLeavesNothing(t *testing.T) {
 	kl := newKubelet(t)
 	runningPod(t, kubernetes.NewForConfigOrDie(cfg), kl)
 
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	o := envOptions(t, cfg, alice)
 	// An informer nobody watches is stopped at once, so that a watch
 	// the session left open shows as an informer that runs.
@@ -659,7 +811,7 @@ func TestServeFailsOnPortInUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = l.Close() }()
-	o := envOptions(t, cfg, newUser(t, "alice", false))
+	o := envOptions(t, cfg, newUser(t, "alice", "cluster-admin"))
 	o.sshListen = l.Addr().String()
 	failsLeavingNothing(t, o, "the SSH port could not be bound")
 }
@@ -673,7 +825,7 @@ func TestServeFailsWhenIrohCannotBind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = pc.Close() }()
-	o := envOptions(t, cfg, newUser(t, "alice", false))
+	o := envOptions(t, cfg, newUser(t, "alice", "cluster-admin"))
 	o.sshListen = freePort(t)
 	o.iroh, o.irohLocal, o.irohBind = true, true, pc.LocalAddr().String()
 	failsLeavingNothing(t, o, "the iroh endpoint could not be bound")
@@ -715,7 +867,7 @@ func (l *failingListener) Accept() (net.Conn, error) {
 func listenerEnds(t *testing.T, err error) error {
 	t.Helper()
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	o := envOptions(t, cfg, alice)
 	fl := &failingListener{err: err, fail: make(chan struct{})}
 	o.wrapTCP = func(l net.Listener) net.Listener {
@@ -780,7 +932,7 @@ func (l *blockingListener) Close() error {
 // returns, and the log says what it was still waiting for.
 func TestServeStopIsBounded(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	o := envOptions(t, cfg, alice)
 	bl := &blockingListener{release: make(chan struct{})}
 	o.wrapTCP = func(l net.Listener) net.Listener {
@@ -828,7 +980,7 @@ func TestStandardLogGoesToTheLog(t *testing.T) {
 		stdlogOnce = sync.Once{}
 	})
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	k := startKosh(t, envOptions(t, cfg, alice))
 
 	stdlog.Print("marker line")
@@ -880,7 +1032,7 @@ func TestStandardLogLineIsCut(t *testing.T) {
 // buffer it asks for, which depends on the machine.
 func TestServeStopIsQuiet(t *testing.T) {
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	o := envOptions(t, cfg, alice)
 	o.iroh = true
 	o.irohLocal = true
@@ -944,7 +1096,7 @@ func TestStandardLogIsNotRoutedIntoTheDefaultSlog(t *testing.T) {
 	routeStdlog(earlier.logger())
 
 	cfg := startAPIServer(t)
-	alice := newUser(t, "alice", false)
+	alice := newUser(t, "alice", "cluster-admin")
 	o := envOptions(t, cfg, alice)
 	k := &kosh{opts: o, log: &recorder{}, done: make(chan error, 1)}
 	o.log = slog.New(slog.Default().Handler())

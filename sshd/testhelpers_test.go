@@ -167,19 +167,18 @@ func newSigner(t *testing.T) ssh.Signer {
 	return s
 }
 
-// keyLine is a line of a key list for signer, named name, with the
-// admin suffix on the name unless readOnly: the key's name in the list,
-// the log and the header is then admin(name).
-func keyLine(signer ssh.Signer, name string, readOnly bool) string {
-	if !readOnly {
-		name = admin(name)
-	}
+// keyLine is a line of a key list for signer, named name: a name that
+// ends in its role, as admin and view make them.
+func keyLine(signer ssh.Signer, name string) string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + " " + name
 }
 
-// admin is the name of an admin's key made with keyLine or harness.key
-// from name.
-func admin(name string) string { return name + keys.AdminSuffix }
+// admin is the name of a key of the ClusterRole cluster-admin, made from
+// name.
+func admin(name string) string { return name + "/cluster-admin" }
+
+// view is the name of a key of the ClusterRole view, made from name.
+func view(name string) string { return name + "/view" }
 
 // setKeys makes lines the key list.
 func setKeys(t *testing.T, list *keys.List, lines ...string) {
@@ -199,9 +198,9 @@ const testWord = "KOSHWORD"
 // panicInitName is the key name whose sessions' models panic in Init.
 const panicInitName = "panic-init"
 
-// testModel draws testWord and the session's grant. q quits; p panics in
-// Update, v makes View panic, c runs a command that panics; f makes it
-// draw a full screen of new text every millisecond.
+// testModel draws testWord and the session's role and name. q quits; p
+// panics in Update, v makes View panic, c runs a command that panics; f
+// makes it draw a full screen of new text every millisecond.
 type testModel struct {
 	s             Session
 	width, height int
@@ -256,11 +255,7 @@ func (m testModel) View() tea.View {
 		line := strings.Repeat(string(rune('a'+m.frame%26)), max(m.width, 1))
 		return tea.NewView(strings.Repeat(line+"\n", max(m.height, 1)))
 	}
-	grant := "full"
-	if m.s.Grant.ReadOnly {
-		grant = "read-only"
-	}
-	return tea.NewView(testWord + "\ngrant:" + grant + "\nname:" + m.s.Grant.Name + "\n")
+	return tea.NewView(testWord + "\nrole:" + m.s.Grant.Role.String() + "\nname:" + m.s.Grant.Name + "\n")
 }
 
 // The server.
@@ -377,10 +372,10 @@ func newHarness(t *testing.T, opts ...option) *harness {
 }
 
 // key adds a new key to the key list, and returns it.
-func (h *harness) key(name string, readOnly bool) ssh.Signer {
+func (h *harness) key(name string) ssh.Signer {
 	h.t.Helper()
 	s := newSigner(h.t)
-	h.lines = append(h.lines, keyLine(s, name, readOnly))
+	h.lines = append(h.lines, keyLine(s, name))
 	setKeys(h.t, h.list, h.lines...)
 	return s
 }

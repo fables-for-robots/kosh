@@ -26,7 +26,7 @@ const (
 // have open at once. Each lets its client send up to x/crypto's channel
 // window, 2 MiB, that nothing reads, and costs goroutines; and while one
 // session of a connection runs, the rule of IdleConnection does not
-// close it. Without a bound, any key, a read-only one too, could exhaust
+// close it. Without a bound, any key, of any role, could exhaust
 // the server's memory through one connection, or run any number of
 // programs on it.
 const maxSessionChannels = 10
