@@ -70,7 +70,7 @@ spec:
           image: registry.k8s.io/pause:3.10
           imagePullPolicy: IfNotPresent
 ---
-# hidden holds a value no read-only key may see.
+# hidden holds a value no view key may see.
 apiVersion: v1
 kind: Secret
 metadata:

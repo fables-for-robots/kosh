@@ -1,0 +1,35 @@
+# The namespace of carol's key, carol@kosh-e2e/edit@kosh-e2e-team, a Role
+# edit in it, and a pod for her to see. The Role is short, and is not the
+# ClusterRole edit: what it allows is what the tests look for.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kosh-e2e-team
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: edit
+  namespace: kosh-e2e-team
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, patch]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: teamwork
+  namespace: kosh-e2e-team
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
+      imagePullPolicy: IfNotPresent

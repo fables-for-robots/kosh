@@ -17,7 +17,10 @@
 # kosh needs an API server: the script makes a kind cluster of its own,
 # kosh-mdns-<random>, with a kubeconfig of its own, unless
 # KOSH_E2E_KUBECONFIG names one; the KUBECONFIG of the environment is not
-# used. It removes what it built, started and made when it ends.
+# used. Its key is of the ClusterRole view, whose binding kosh makes; in a
+# cluster that is not the script's own, the binding is deleted at the end
+# unless it was there before. It removes what it built, started and made
+# when it ends.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -48,6 +51,10 @@ CLUSTER=kosh-mdns-$RANDOM_ID
 
 CREATED_CLUSTER=
 KOSH=
+# The binding kosh makes for its key's role, and whether the script is to
+# delete it.
+BINDING=kosh:clusterrole:view
+DELETE_BINDING=
 BUILDING=      # a build of iroh-ssh is under way, in $CACHE/iroh-ssh-build
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -60,6 +67,7 @@ cleanup() {
     kill "$KOSH" 2>/dev/null
     wait "$KOSH" 2>/dev/null
   fi
+  [ -z "$DELETE_BINDING" ] || kubectl delete clusterrolebinding "$BINDING" --ignore-not-found >/dev/null
   [ -z "$BUILDING" ] || rm -rf "$CACHE/iroh-ssh-build"
   if [ "$status" != 0 ] && [ -s "$WORK/kosh.log" ]; then
     echo "== kosh's log, the test having failed"
@@ -104,7 +112,10 @@ fi
 # kosh, as a process, found by nothing but mDNS.
 step "kosh serve, with the relays off"
 go build -o "$WORK/kosh" ./cmd/kosh
-ssh-keygen -q -t ed25519 -N '' -C alice@kosh-mdns -f "$WORK/full"
+ssh-keygen -q -t ed25519 -N '' -C alice@kosh-mdns/view -f "$WORK/full"
+if [ -z "$CREATED_CLUSTER" ] && kubectl get clusterrolebinding "$BINDING" 2>&1 | grep -q NotFound; then
+  DELETE_BINDING=1
+fi
 cp "$WORK/full.pub" "$WORK/authorized_keys"
 "$WORK/kosh" id --state-dir "$WORK/state" >"$WORK/id"
 ENDPOINT=$(sed -n 's/^endpoint ID *//p' "$WORK/id")
