@@ -87,7 +87,9 @@ func (v *tableView) key(k tea.KeyPressMsg) tea.Cmd {
 		}
 		return popView()
 	case "ctrl+r":
-		return v.readNow()
+		// The rights too: a question the API did not answer was answered
+		// no, and is asked again.
+		return tea.Batch(v.readNow(), v.askRights())
 	case "enter":
 		return v.enter()
 	case "J":

@@ -9,7 +9,10 @@ import (
 
 // helpView lists the keys of the view it was opened from and the root's.
 type helpView struct {
-	sections []helpSection
+	// of is the view it was opened from, nil for none. Its keys are
+	// read at every drawing: a table binds its keys when the session's
+	// answers are in, which may be after the help opened.
+	of view
 	// first is the first column drawn, which left and right move when
 	// the columns do not all fit; cols is how many there were when the
 	// view was last drawn, and cut whether they did not all fit then.
@@ -32,18 +35,23 @@ type helpful interface {
 // openHelp pushes the help of the top view: every key of it, and the
 // root's.
 func (r *root) openHelp() tea.Cmd {
+	return pushView(&helpView{of: r.top()})
+}
+
+// sections are the keys of the view the help was opened from, as they
+// are now, and the root's.
+func (v *helpView) sections() []helpSection {
 	var sections []helpSection
-	if top := r.top(); top != nil {
-		hs := top.Hints()
-		if h, ok := top.(helpful); ok {
+	if v.of != nil {
+		hs := v.of.Hints()
+		if h, ok := v.of.(helpful); ok {
 			hs = h.helpHints()
 		}
 		if len(hs) > 0 {
-			sections = append(sections, helpSection{strings.ToUpper(cleanLine(top.Crumb())), hs})
+			sections = append(sections, helpSection{strings.ToUpper(cleanLine(v.of.Crumb())), hs})
 		}
 	}
-	sections = append(sections, helpSection{"GENERAL", rootHints()})
-	return pushView(&helpView{sections: sections})
+	return append(sections, helpSection{"GENERAL", rootHints()})
 }
 
 func (v *helpView) Init() tea.Cmd { return nil }
@@ -82,7 +90,7 @@ func (v *helpView) View(w, h int) string {
 		width int
 	}
 	var cols []column
-	for _, s := range v.sections {
+	for _, s := range v.sections() {
 		for i, hints := range columnsOf(s.hints, h-1) {
 			part := helpLines(hints, keyWidth(hints))
 			title := s.title

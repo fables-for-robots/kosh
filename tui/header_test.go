@@ -175,7 +175,7 @@ func TestHeaderAlignsTheTextsOfAColumn(t *testing.T) {
 	}
 	// The help's columns, drawn by the same function.
 	hs.press("esc", "?")
-	for _, s := range hs.root().top().(*helpView).sections {
+	for _, s := range hs.root().top().(*helpView).sections() {
 		for c, col := range columnsOf(s.hints, 23) {
 			lines := helpLines(col, keyWidth(col))
 			starts := map[int]bool{}

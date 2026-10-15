@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -368,4 +370,99 @@ func TestViewKeyHelpFrame(t *testing.T) {
 	hs := viewKeyHarness(t, 120, 40)
 	hs.press("?")
 	hs.golden()
+}
+
+// askingSession is a session that records the rights Can is asked, and
+// answers every one no while down is set, as when the API does not
+// answer.
+type askingSession struct {
+	*kubetest.Session
+	mu    sync.Mutex
+	asked []right
+	down  bool
+}
+
+func (s *askingSession) Can(ctx context.Context, verb string, res kube.Resource, sub, ns string) bool {
+	s.mu.Lock()
+	s.asked = append(s.asked, right{verb: verb, group: res.GVR.Group, resource: res.GVR.Resource, sub: sub})
+	down := s.down
+	s.mu.Unlock()
+	return !down && s.Session.Can(ctx, verb, res, sub, ns)
+}
+
+// takeAsked returns the rights asked since the last call.
+func (s *askingSession) takeAsked() []right {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.asked
+	s.asked = nil
+	return out
+}
+
+// A table asks each right once, however many keys need it: Delete and
+// Kill both need delete on pods in a table of pods, d, y and Shell get.
+func TestEachRightIsAskedOnce(t *testing.T) {
+	sess := &askingSession{Session: newSession()}
+	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
+	hs := newShellHarness(t, sess, newShellTerm(), 200, 30)
+	rightsWant(t, hs, []string{"Delete", "Kill", "Edit", "Describe", "Shell", "Logs"}, nil)
+	asked := sess.takeAsked()
+	want := []right{
+		{verb: "delete", resource: "pods"},
+		{verb: "get", resource: "pods"},
+		{verb: "update", resource: "pods"},
+		{verb: "get", resource: "pods", sub: "log"},
+		{verb: "create", resource: "pods", sub: "exec"},
+	}
+	for _, r := range want {
+		if n := len(slices.DeleteFunc(slices.Clone(asked), func(a right) bool { return a != r })); n != 1 {
+			t.Errorf("%+v was asked %d times", r, n)
+		}
+	}
+	if len(asked) != len(want) {
+		t.Errorf("asked %+v, want %+v", asked, want)
+	}
+}
+
+// A help that is open when the answers come shows the keys they bind.
+func TestHelpShowsKeysBoundAfterItOpened(t *testing.T) {
+	sess := newSession()
+	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
+	sess.SetTable(query("deployments", "default"), simpleTable("web"))
+	hs := newHarness(t, sess, 120, 40)
+	hs.hold = func(msg tea.Msg) bool { _, ok := msg.(rightsMsg); return ok }
+	hs.command("deployments")
+	hs.press("?")
+	if hs.title() != "Help" {
+		t.Fatalf("the title is %q", hs.title())
+	}
+	hs.notFrame("Delete", "Scale")
+	hs.release(hs.held...)
+	hs.wantFrame("Delete", "Scale", "Describe")
+}
+
+// ctrl-r asks the rights again: a question the API did not answer was
+// answered no, and the keys come when it answers. The keys the table
+// has stay while it asks.
+func TestReadAgainAsksTheRightsAgain(t *testing.T) {
+	sess := &askingSession{Session: newSession(), down: true}
+	sess.SetTable(query("pods", "default"), podsNamed("web-1"))
+	hs := newHarness(t, sess, 200, 30)
+	if got := rightsKeys(hs); len(got) > 0 {
+		t.Errorf("the pods bind %q when the API did not answer", got)
+	}
+	sess.mu.Lock()
+	sess.down = false
+	sess.mu.Unlock()
+	hs.press("ctrl+r")
+	rightsWant(t, hs, []string{"Delete", "Kill", "Describe"}, nil)
+
+	hs.hold = func(msg tea.Msg) bool { _, ok := msg.(rightsMsg); return ok }
+	hs.press("ctrl+r")
+	if len(hs.held) != 1 {
+		t.Fatalf("%d answers are held", len(hs.held))
+	}
+	rightsWant(t, hs, []string{"Delete", "Kill", "Describe"}, nil)
+	hs.release(hs.held...)
+	rightsWant(t, hs, []string{"Delete", "Kill", "Describe"}, nil)
 }

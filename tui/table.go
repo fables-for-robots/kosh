@@ -14,6 +14,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/fables-for-robots/kosh/keys"
 	"github.com/fables-for-robots/kosh/kube"
@@ -200,9 +201,9 @@ type tableView struct {
 	// rights are the session's answers to the needs of the bindings
 	// that apply to the table, for its namespace: nil until they are in,
 	// and no binding with a need is bound until then. rightsGen numbers
-	// the asking, so that the answers of a namespace the table has left
-	// are dropped.
-	rights    map[need]bool
+	// the asking, so that the answers of a namespace the table has left,
+	// or of an asking since asked again, are dropped.
+	rights    map[right]bool
 	rightsGen int
 }
 
@@ -240,41 +241,44 @@ func (v *tableView) Init() tea.Cmd { return tea.Batch(v.openWatch(), v.askRights
 type rightsMsg struct {
 	id      int64
 	gen     int
-	allowed map[need]bool
+	allowed map[right]bool
 }
 
-// askRights forgets the table's answers and asks the session, in a
-// command, for every need of every binding that applies to the table by
-// its kind, in the table's namespace: all at once, for each is a request
-// to the API the first time. The session keeps its answers, so a second
-// table of the same kind and namespace asks the API nothing.
+// askRights asks the session, in a command, for every right that a
+// binding applying to the table by its kind needs, in the table's
+// namespace: each right once, and all at once, for each is a request to
+// the API the first time. The session keeps its answers, so a second
+// table of the same kind and namespace asks the API nothing. The
+// answers the table has stay until the new ones are in: whoever changes
+// the namespace forgets them first.
 func (v *tableView) askRights() tea.Cmd {
-	v.rights = nil
 	v.rightsGen++
 	if v.plain {
 		return nil
 	}
-	var needs []need
-	for _, b := range applying(v.q.Resource, v.grant) {
+	res := v.q.Resource
+	var rights []right
+	for _, b := range applying(res, v.grant) {
 		for _, n := range b.Needs {
-			if !slices.Contains(needs, n) {
-				needs = append(needs, n)
+			if r := n.right(res); !slices.Contains(rights, r) {
+				rights = append(rights, r)
 			}
 		}
 	}
-	sess, res, ns, id, gen := v.e.sess, v.q.Resource, v.rightsNamespace(), v.id, v.rightsGen
+	sess, ns, id, gen := v.e.sess, v.rightsNamespace(), v.id, v.rightsGen
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
 		defer cancel()
-		answers := make([]bool, len(needs))
+		answers := make([]bool, len(rights))
 		var wg sync.WaitGroup
-		for i, n := range needs {
-			wg.Go(func() { answers[i] = sess.Can(ctx, n.Verb, n.resource(res), n.Sub, ns) })
+		for i, r := range rights {
+			of := kube.Resource{GVR: schema.GroupVersionResource{Group: r.group, Resource: r.resource}}
+			wg.Go(func() { answers[i] = sess.Can(ctx, r.verb, of, r.sub, ns) })
 		}
 		wg.Wait()
-		allowed := make(map[need]bool, len(needs))
-		for i, n := range needs {
-			allowed[n] = answers[i]
+		allowed := make(map[right]bool, len(rights))
+		for i, r := range rights {
+			allowed[r] = answers[i]
 		}
 		return rightsMsg{id: id, gen: gen, allowed: allowed}
 	}
@@ -293,7 +297,7 @@ func (v *tableView) rightsNamespace() string {
 
 // can reports whether the session's answers meet n; before they are in,
 // nothing is.
-func (v *tableView) can(n need) bool { return v.rights[n] }
+func (v *tableView) can(n need) bool { return v.rights[n.right(v.q.Resource)] }
 
 // openWatch opens the watch of the query in a command, and reads it.
 func (v *tableView) openWatch() tea.Cmd {

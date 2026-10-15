@@ -353,6 +353,7 @@ func (v *tableView) useShortcut(i int) tea.Cmd {
 	v.prev, v.fresh = nil, map[rowKey]fresh{}
 	v.marks, v.lastMark = map[rowKey]bool{}, nil
 	v.cursor, v.cursorKey, v.top = 0, nil, 0
+	v.rights = nil // of the namespace left
 	v.rebuild()
 	return tea.Batch(v.openWatch(), v.askRights(), func() tea.Msg { return useNamespaceMsg{ns} })
 }

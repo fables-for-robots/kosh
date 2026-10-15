@@ -172,9 +172,8 @@ type need struct {
 	Resource *kube.Resource // nil: the table's
 }
 
-// The resources that needs name besides the table's own. A need is a
-// key of the answers a table keeps, so each resource is one pointer that
-// every need of it shares; Can reads only its group and resource.
+// The resources that needs name besides the table's own. Can reads
+// only their group and resource.
 var (
 	needPods        = &kube.Resource{GVR: render.Pods, Kind: "Pod", Namespaced: true}
 	needSecrets     = &kube.Resource{GVR: render.Secrets, Kind: "Secret", Namespaced: true}
@@ -191,6 +190,20 @@ func (n need) resource(res kube.Resource) kube.Resource {
 		return *n.Resource
 	}
 	return res
+}
+
+// right is what a need asks of the session in a table: the verb, the
+// group and resource, and the subresource. Two needs of one right, as
+// Delete's delete and Kill's delete on pods in a table of pods, are one
+// question.
+type right struct {
+	verb, group, resource, sub string
+}
+
+// right returns the right n asks for in a table of res.
+func (n need) right(res kube.Resource) right {
+	r := n.resource(res)
+	return right{verb: n.Verb, group: r.GVR.Group, resource: r.GVR.Resource, sub: n.Sub}
 }
 
 var bindings []binding
