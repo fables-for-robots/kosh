@@ -243,7 +243,8 @@ reading of the list (at start and every change), as the ServiceAccount:
   kosh:role:<namespace>:<role>`.
 - Every binding kosh makes carries the label
   `app.kubernetes.io/managed-by: kosh` and the annotation
-  `kosh.fables-for-robots.dev/role: <Kind>/<namespace>/<name>`.
+  `kosh.fables-for-robots.dev/role: ClusterRole/<name>` or
+  `Role/<namespace>/<name>`.
 - A binding that exists with the right `roleRef` and subject is left as
   it is; one with another `roleRef` is replaced (a `roleRef` cannot be
   changed); one with other subjects has its subjects set.
@@ -254,11 +255,13 @@ reading of the list (at start and every change), as the ServiceAccount:
   sessions, and deleted after the sessions of the keys that lost them
   have been ended, so that no session acts without its binding and none
   acts with a binding it should have lost.
-- A reconcile that fails (the ServiceAccount may not, the API is down) is
-  logged (`ERROR "the bindings of the key list could not be made"`),
-  retried every 30 seconds until it works, and the list takes effect
-  regardless: a session whose binding is missing gets the API's
-  refusals.
+- A reconcile that fails (the ServiceAccount may not, the API is down,
+  a Role's namespace does not exist) is logged once
+  (`ERROR "the bindings of the key list could not be made"`, with the
+  reason), retried every 30 seconds until it works, and logged once more
+  when it does (`INFO "the bindings of the key list are made"`); the
+  list takes effect regardless: a session whose binding is missing gets
+  the API's refusals.
 - A role named in the list that does not exist is logged at every
   reading (§1.5); the binding is made all the same.
 
@@ -350,10 +353,11 @@ the table and no keys.)
   what kosh's ServiceAccount needs at the least: `impersonate` on
   `users` and `groups`; `get`, `list`, `create`, `update`, `delete` on
   `clusterrolebindings` and `rolebindings` (`rbac.authorization.k8s.io`);
-  and the right to bind the roles the list names (`bind` on `clusterroles`
-  and `roles`, or the roles' own rights — Kubernetes refuses a binding
-  by a subject that has neither); plus discovery, which every
-  authenticated subject has. A ServiceAccount that can impersonate any
+  `get` on `clusterroles` and `roles`, so that a role that does not
+  exist can be told from one that does (§1.5); and the right to bind the
+  roles the list names (`bind` on `clusterroles` and `roles`, or the
+  roles' own rights — Kubernetes refuses a binding by a subject that has
+  neither); plus discovery, which every authenticated subject has. A ServiceAccount that can impersonate any
   user and bind any role is as powerful as the roles it binds, so the
   default is honest.
 - The chart's `authorizedKeys` comment and NOTES say the name's form.
