@@ -148,8 +148,13 @@ func (b *Bindings) Run(ctx context.Context) {
 		if !failed {
 			continue
 		}
-		_ = b.locked(ctx, b.timeout, b.makeRetry, &b.makeFailure)
+		madeErr := b.locked(ctx, b.timeout, b.makeRetry, &b.makeFailure)
 		_ = b.locked(ctx, b.timeout, b.prune, &b.pruneFailure)
+		// A role whose binding failed answered nothing at the reading:
+		// now that the bindings are made, the roles are asked again.
+		if madeErr == nil {
+			b.WarnEditors(ctx)
+		}
 	}
 }
 

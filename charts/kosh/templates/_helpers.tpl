@@ -20,10 +20,11 @@ The name of this kosh among those that serve the cluster, which kosh puts
 in its groups and bindings (kosh serve --instance): the namespace and the
 release, which no other release has together. A release's name and a
 namespace are lower-case letters, digits, "-" and "."; cut to 63, the end
-may be a "-" or a ".", which is taken off.
+may be a run of "-" or ".", which is taken off: kosh refuses an instance
+that does not begin and end with a letter or a digit.
 */}}
 {{- define "kosh.instance" -}}
-{{- printf "%s-%s" .Release.Namespace .Release.Name | trunc 63 | trimSuffix "-" | trimSuffix "." }}
+{{- regexReplaceAll "[-.]+$" (printf "%s-%s" .Release.Namespace .Release.Name | trunc 63) "" }}
 {{- end }}
 
 {{- define "kosh.chart" -}}

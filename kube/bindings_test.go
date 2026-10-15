@@ -865,3 +865,39 @@ func TestWarnEditorsWithoutTheNamespaceOrTheAPI(t *testing.T) {
 		t.Errorf("a role is warned of on an error: %+v", recs)
 	}
 }
+
+// A role whose binding failed to be made is asked nothing at the
+// reading: it has no rights yet. When a retry of Run makes the binding,
+// the roles are asked again, so that a role that may edit the key list
+// is warned of without waiting for the next reading.
+func TestRunWarnsEditorsAfterARetry(t *testing.T) {
+	editCluster := keys.Role{Kind: keys.KindClusterRole, Name: "edit"}
+	log := newAuditLog()
+	e, r := reviewEnv(t, Options{Log: log.logger(), Namespace: "kosh"})
+	b := NewBindings(e.c, func() []keys.RoleKeys {
+		return []keys.RoleKeys{{Role: editCluster, Keys: []string{keyOf(editCluster)}}}
+	}, log.logger())
+	b.retry = 5 * time.Millisecond
+	r.allowFor("kosh:kosh:clusterrole:edit", authorizationv1.ResourceAttributes{Verb: "update", Resource: "configmaps", Namespace: "kosh"})
+	var creates atomic.Int32
+	e.typed.PrependReactor("create", "clusterrolebindings", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if creates.Add(1) == 1 {
+			return true, nil, apierrors.NewServiceUnavailable("not yet")
+		}
+		return false, nil, nil
+	})
+	b.MakeNow()
+	b.PruneNow()
+	if n := len(log.with(msgMayEditList)); n != 0 {
+		t.Fatalf("%d warnings before any retry", n)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.Run(ctx)
+	}()
+	eventually(t, "the warning after the retry", func() bool { return len(log.with(msgMayEditList)) == 1 })
+	cancel()
+	<-done
+}

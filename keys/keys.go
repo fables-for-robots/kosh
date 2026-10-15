@@ -82,7 +82,7 @@ func (r Role) Group(instance string) string {
 const DefaultInstance = "kosh"
 
 // instanceName is what an instance's name may be made of.
-var instanceName = regexp.MustCompile(`^[a-z0-9.-]{1,63}$`)
+var instanceName = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$`)
 
 // CheckInstance returns why name cannot name a kosh instance, or nil: it
 // is a path segment without ":", of lower-case letters, digits, "." and
@@ -90,7 +90,7 @@ var instanceName = regexp.MustCompile(`^[a-z0-9.-]{1,63}$`)
 // groups and bindings.
 func CheckInstance(name string) error {
 	if !instanceName.MatchString(name) || name == "." || name == ".." {
-		return fmt.Errorf("the instance %q is not a name: lower-case letters, digits, . and -, 63 at most, not . or ..", name)
+		return fmt.Errorf("the instance %q is not a name: lower-case letters, digits, . and -, 63 at most, beginning and ending with a letter or a digit", name)
 	}
 	return nil
 }

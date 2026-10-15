@@ -202,7 +202,9 @@ func TestCheckInstance(t *testing.T) {
 			t.Errorf("%q: %v", good, err)
 		}
 	}
-	for _, bad := range []string{"", ".", "..", "a:b", "a/b", "Kosh", "a b", "a_b", strings.Repeat("a", 64), "é"} {
+	// A name that begins or ends with - or . is refused too: the label
+	// that carries it on a binding would be.
+	for _, bad := range []string{"", ".", "..", "a:b", "a/b", "Kosh", "a b", "a_b", strings.Repeat("a", 64), "é", "x-", "-x", "x.", ".x", "a-.", strings.Repeat("a", 62) + "-"} {
 		if err := CheckInstance(bad); err == nil {
 			t.Errorf("%q is taken for an instance's name", bad)
 		}
