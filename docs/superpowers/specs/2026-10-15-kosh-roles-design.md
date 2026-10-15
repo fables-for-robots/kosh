@@ -149,7 +149,8 @@ refusal.
 **The `admin` warning.** The ClusterRole `admin` exists in every cluster
 and is the namespaced administrator's role, meant for RoleBindings: bound
 cluster-wide it grants every namespaced resource in every namespace and
-nothing cluster-scoped (no nodes, no namespaces, no CRDs). A list from
+little of the cluster's own (no nodes, no CRDs, no cluster-wide RBAC;
+it can read the namespaces). A list from
 v0.3/v0.4 names `…/admin`, which v0.5.0 reads as that ClusterRole, not as
 `cluster-admin`. kosh logs, at every reading of a list that has a
 `…/admin` ClusterRole key, `WARN "a key's role is the ClusterRole admin,
@@ -214,7 +215,9 @@ The pollers and the usage watch of `2026-10-14-kosh-metrics-design.md`
 are per `(role, kind)` the same way, with the role's user; `view` has the
 metrics (metrics-server aggregates its reader into `view`), a Role cannot
 grant `nodes`, so a Role-bound session has the columns of pods and
-containers and no header lines.
+containers and no header lines. A ClusterRole the API refuses the list of
+the nodes (`view`, `edit`, `admin`) has no header lines either, rather
+than lines that stay `n/a`; the log says so once for the role.
 
 ### 3.5 What is asked, and `Can`
 
@@ -229,7 +232,9 @@ Can(ctx context.Context, verb string, res Resource, subresource, namespace strin
 ```
 
 `canFor` is 2 minutes; a reading of the key list that changes the key's
-role ends the session anyway (§6). The answer for `namespace == ""` of a
+role ends the session anyway (§6). `ctrl-r` on a table has the session
+forget its answers to the table's rights (`Reader.ForgetRights(res,
+namespace)`), so that a binding made, or a role changed, since shows. The answer for `namespace == ""` of a
 namespaced resource is the cluster-wide one (`SelfSubjectAccessReview`
 with no namespace), which is what `<0> all` needs.
 

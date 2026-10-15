@@ -158,8 +158,9 @@ ssh-ed25519 AAAAC3Nza... mic92/key-1/cluster-admin
 - **`/admin` is the ClusterRole `admin`**, not `cluster-admin`. Every
   cluster has it, as the role of a namespace's administrator, meant to be
   bound in a namespace: bound across the cluster, as a key's name binds
-  it, it grants every namespaced resource of every namespace and nothing
-  of the cluster's own, no nodes, no namespaces, no CRDs. Before 0.5.0,
+  it, it grants every namespaced resource of every namespace, and of the
+  cluster's own little: it can read the namespaces, but has no nodes, no
+  CRDs and no cluster-wide RBAC. Before 0.5.0,
   `/admin` meant full access; kosh warns `a key's role is the ClusterRole
   admin, which is not cluster-admin: before 0.5.0 /admin meant full
   access`, with the keys, whenever it reads a list that has one. Full
@@ -176,17 +177,30 @@ ssh-ed25519 AAAAC3Nza... mic92/key-1/cluster-admin
   first line's name and role, and a later line of it with another role is
   rejected. A certificate is not accepted.
 - **kosh makes the bindings** the list needs, as its ServiceAccount, at
-  start and whenever the list changes. For each ClusterRole the list
-  names, a ClusterRoleBinding `kosh:clusterrole:<role>` binds it to the
-  group `kosh:clusterrole:<role>`; for each Role, a RoleBinding
-  `kosh:role:<role>` in its namespace binds it to the group
-  `kosh:role:<namespace>:<role>`. Each has the label
-  `app.kubernetes.io/managed-by: kosh` and the annotation
+  start and whenever the list changes. Each kosh that serves a cluster is
+  an *instance*, named by `kosh serve --instance` (the chart passes
+  `<namespace>-<release>`, so `kosh-kosh` for the release `kosh` in the
+  namespace `kosh`; the default is `kosh`), and its name is in each of
+  its groups and bindings. For each ClusterRole the list names, a
+  ClusterRoleBinding `kosh:<instance>:clusterrole:<role>` binds it to the
+  group `kosh:<instance>:clusterrole:<role>`; for each Role, a
+  RoleBinding `kosh:<instance>:role:<role>` in its namespace binds it to
+  the group `kosh:<instance>:role:<namespace>:<role>`. Each has the
+  labels `app.kubernetes.io/managed-by: kosh` and
+  `kosh.fables-for-robots.dev/instance: <instance>`, and the annotation
   `kosh.fables-for-robots.dev/role: ClusterRole/view` (or
-  `Role/team-a/edit`). A binding with the label that the list no longer
-  needs is deleted, and kosh writes no other RBAC; a binding at kosh's
-  name whose `managed-by` label names another tool is left as it is, and
-  kosh says so once.
+  `Role/team-a/edit`). A binding with both labels, this instance's, that
+  the list no longer needs is deleted, and kosh writes no other RBAC:
+  several koshes, two releases or a `kosh serve` beside a deployed one,
+  share a cluster without touching each other's bindings. A binding at
+  kosh's name that a cluster administrator made by hand is taken over
+  when it binds just what kosh would, and otherwise left as it is; one
+  whose `managed-by` label names another tool is left as it is; either
+  is said once.
+- The groups are ordinary Kubernetes groups: a cluster administrator who
+  puts another subject in one, by a binding of their own or by an
+  authenticator's groups (an OIDC groups claim without a prefix, say),
+  gives it the same role.
 - A role that does not exist is bound all the same, so that its keys
   have its rights the moment it is made; until then they have none, and
   kosh warns `the role of a key does not exist`, with the role and its
@@ -224,8 +238,20 @@ refuses each request by the role.
   `team-a` has `<ctrl-d> Delete` there and not in `default`. `d`, `y` and
   `x` need `get` on the object, `l` and `p` `get` on `pods/log`, a shell
   `create` on `pods/exec`. A session keeps each answer for two minutes;
-  a question the API server did not answer leaves its key unbound, and
-  `ctrl-r` asks it again.
+  `ctrl-r` reads the table again and asks the API server again, so that a
+  binding made or a role changed since shows at once.
+- **Whoever can change the key list can give any key any role** kosh's
+  ServiceAccount may bind, `cluster-admin` among them: the list is the
+  access control. A key whose role may write ConfigMaps in kosh's
+  namespace, as the ClusterRoles `edit` and `admin` may everywhere, can
+  edit the list and so grant itself anything. Keep kosh in a namespace of
+  its own that only cluster administrators may write. At every reading
+  of the list kosh asks the API server, as each role but `cluster-admin`,
+  whether it may `update` or `patch` `configmaps` there, and warns `a
+  key's role may edit the key list, and so grant itself any role`, with
+  the role and its keys. kosh knows its namespace from its pod, or from
+  `--namespace` when it runs elsewhere; without either it checks
+  nothing.
 - **Where the role lacks a right, the table says so**, with the API's
   refusal (`forbidden`), as it says any refusal. `view` cannot read
   Secrets, so a `view` key has neither their table nor their contents.
@@ -238,8 +264,9 @@ refuses each request by the role.
   by kosh's ServiceAccount impersonating `kosh:<key name>`: the audit
   event's `user` is the ServiceAccount and its `impersonatedUser` the key.
   The lists that fill a cache shared by a role's sessions are made as the
-  role, as `kosh:clusterrole:<role>` or `kosh:role:<namespace>:<role>`,
-  not as whichever key opened it.
+  role, as `kosh:<instance>:clusterrole:<role>` or
+  `kosh:<instance>:role:<namespace>:<role>`, not as whichever key opened
+  it.
 
 kosh's own log names the key, with the role at the start of a session,
 and has a line for every action:
@@ -281,12 +308,15 @@ A ServiceAccount that may impersonate anyone and bind any role is as
 powerful as `cluster-admin`, and the default says so plainly. With a
 narrower ClusterRole, kosh can bind only the roles it has `bind` on or
 whose every right it has itself; for any other, kosh logs that the
-bindings could not be made, and the role's keys get the API's refusals.
+bindings could not be made, and the role's keys get the API's refusals,
+unless a cluster administrator makes that binding by hand at kosh's
+name.
 
 For the CPU and memory of [Metrics](#metrics), a key's role needs `get`
 and `list` on `pods` and `nodes` in the group `metrics.k8s.io`, and for
 the header's lines also `list` and `watch` on `nodes` (core), which
-`view` does not give.
+`view`, `edit` and `admin` do not give: their keys' headers have no
+`CPU:` and `MEM:` lines.
 
 ## Using it
 
@@ -352,11 +382,11 @@ kosh shows the CPU and memory it measures, as k9s does, read every 15
 seconds:
 
 ```
-Key:     alice/edit   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <d> Describe
-Cluster: v1.33.1      <1> default   <shift-a> Sort Age      </> Filter        <y> YAML
-kosh:    v0.4.0                     <shift-s> Sort Status   <space> Mark      <l> Logs
-CPU:     12% ↑                      <shift-o> Sort Column   <shift-j> Owner   <p> Logs Previous
-MEM:     47%                        <ctrl-w> Wide           <?> Help          <s> Shell
+Key:     alice/cluster-admin   <0> all       <shift-n> Sort Name     <ctrl-z> Faults   <d> Describe
+Cluster: v1.33.1               <1> default   <shift-a> Sort Age      </> Filter        <y> YAML
+kosh:    v0.5.0                              <shift-s> Sort Status   <space> Mark      <l> Logs
+CPU:     12% ↑                               <shift-o> Sort Column   <shift-j> Owner   <p> Logs Previous
+MEM:     47%                                 <ctrl-w> Wide           <?> Help          <s> Shell
 ```
 
 - **The header** has the lines `CPU:` and `MEM:`: what the nodes use
@@ -389,23 +419,30 @@ removal, in sessions already open.
   did not cover (`CPU/A` and `MEM/A` are the node's own);
 - in a percentage of requests or limits that are 0;
 - in every cell but a node's `CPU/A` and `MEM/A` (the node's own), and
-  in both lines, while the API is served and the reading fails. When
-  the key's role may not read it, that lasts; kosh's log says `metrics
-  could not be read` once for the role and the kind, with why, and
-  `metrics can be read again` when a reading works again. When metrics-server is down or its
-  APIService is not available, it lasts until kosh next looks for the
-  API, within 5 minutes; then the columns and the lines go, as without
-  metrics-server, and come back within 5 minutes of its return;
-- in both lines while kosh may not list the nodes, whose allocatable
-  the percentages are of; kosh's log says `the nodes cannot be listed`
-  once for the session, with why;
+  in both lines, while the API is served and the reading fails. When the
+  key's role may not read it, that lasts; kosh's log says `metrics could
+  not be read` once for the role and the kind, with why, and `metrics
+  can be read again` when a reading works again. When metrics-server is
+  down or its APIService is not available, it lasts until kosh next
+  looks for the API, within 5 minutes; then the columns and the lines
+  go, as without metrics-server, and come back within 5 minutes of its
+  return;
+- in both lines while the nodes, whose allocatable the percentages are
+  of, cannot be listed for another reason than the role's; kosh's log
+  says `the nodes cannot be listed` once for the session, with why;
 - in the lines until the first reading has come.
+
+A key whose role the API server refuses the list of the nodes, as it
+refuses `view`, `edit` and `admin`, has no `CPU:` and `MEM:` lines at
+all; kosh's log says `the role may not list the nodes` once for the
+role.
 
 kosh reads the metrics as the key's role, once for all the sessions of
 the role: a role narrower than `cluster-admin` needs `get` and `list` on
 `pods` and `nodes` in the group `metrics.k8s.io`, which metrics-server's
 own manifest adds to `view`, `edit` and `admin`; and, for the header's
-lines, `list` and `watch` on `nodes` (core), which `view` does not have.
+lines, `list` and `watch` on `nodes` (core), which none of those three
+has.
 kosh reads the nodes for the header only while the cluster serves the
 metrics API. A Role cannot grant nodes, which are of no namespace: a key
 with a Role has the columns of its pods and their containers, and no
@@ -448,21 +485,26 @@ list:
 - **Every name must end in a role.** A line whose name does not is
   rejected and gives no access, and so is a key with no comment, which
   0.4 took for a read-only key named by its fingerprint.
+- **A name that already ends in `/<word>` now names a role.** 0.4 read
+  `deploy/edit`, `ops/admin` or `ci/view` as a read-only key's name;
+  0.5.0 reads each as the ClusterRole after its last `/`, which may give
+  it more than read-only did. Look for such names before upgrading.
 - **`/admin` is the ClusterRole `admin`, not `cluster-admin`.** A list of
   0.4 names its admins `…/admin`; read by 0.5.0 it gives them every
-  namespaced resource and nothing of the cluster's own (no nodes, no
-  namespaces, no CRDs), and kosh warns of it. Name them `…/cluster-admin`
-  for what they had.
+  namespaced resource and little of the cluster's own (no nodes, no
+  CRDs, no cluster-wide RBAC), and kosh warns of it. Name them
+  `…/cluster-admin` for what they had.
 - **A read-only key becomes `…/view`.** `view` has no action keys, as a
   read-only key had none, and does not read Secrets: neither their
   contents, which read-only hid too, nor their table. It reads less than
   read-only did in other ways as well (roles and their bindings, for
-  one), and the header's `CPU:` and `MEM:` lines need `list` on `nodes`,
-  which it lacks.
+  one), and its header has no `CPU:` and `MEM:` lines, which need `list`
+  on `nodes`.
 
 kosh's ServiceAccount needs the rights in [What a key can do](#what-a-key-can-do);
 the chart's default, `cluster-admin`, has them. kosh then makes the
-bindings of the roles itself.
+bindings of the roles itself. Read [What a key can do](#what-a-key-can-do)
+on who may edit the key list before giving a key `edit` or `admin`.
 
 ## Not yet
 

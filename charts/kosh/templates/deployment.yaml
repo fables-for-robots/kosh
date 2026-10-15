@@ -63,6 +63,8 @@ spec:
             {{- end }}
             - --state-dir=/var/lib/kosh
             - --authorized-keys=/etc/kosh/authorized_keys
+            - --instance={{ include "kosh.instance" . }}
+            - --namespace={{ .Release.Namespace }}
           {{- if or .Values.ssh.enabled (and .Values.iroh.enabled .Values.iroh.port) }}
           ports:
             {{- if .Values.ssh.enabled }}

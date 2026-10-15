@@ -841,10 +841,13 @@ where it differs from them, this section is what is built. The plan's
   design; `/admin` is the ClusterRole `admin`. A session is its key:
   kosh's ServiceAccount impersonates `kosh:<key name>` in the role's
   group, caches are per role, and kosh makes and prunes the bindings of
-  the roles the list names. Read-only keys are gone with §12, and a
-  key's actions are the ones its role allows, asked of the API server.
-  The chart's `rbac.clusterRole` stays; what the ServiceAccount needs at
-  the least is §7 of that design.
+  the roles the list names, with the name of the kosh instance
+  (`--instance`; the chart's is `<namespace>-<release>`) in every group
+  and binding, so that several koshes share a cluster. Read-only keys
+  are gone with §12, and a key's actions are the ones its role allows,
+  asked of the API server. A role that may edit the key list's
+  ConfigMap is warned of. The chart's `rbac.clusterRole` stays; what the
+  ServiceAccount needs at the least is §7 of that design.
 
 ## Appendix A: the columns
 

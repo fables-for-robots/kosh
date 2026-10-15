@@ -97,7 +97,7 @@ eq secret Deployment "$C.volumeMounts[] | select(.name == \"keys\") | .readOnly"
 eq secret Deployment "$C.volumeMounts[] | select(.name == \"keys\") | .subPath" null "keys without subPath"
 eq secret Deployment ".spec.template.metadata.annotations" null "no checksum annotation"
 eq secret Deployment "$D.hostNetwork" null "no host network"
-eq secret Deployment "$C.args | join(\" \")" "serve --ssh-listen=:2222 --iroh=true --iroh-relay=true --iroh-mdns=true --state-dir=/var/lib/kosh --authorized-keys=/etc/kosh/authorized_keys" "arguments"
+eq secret Deployment "$C.args | join(\" \")" "serve --ssh-listen=:2222 --iroh=true --iroh-relay=true --iroh-mdns=true --state-dir=/var/lib/kosh --authorized-keys=/etc/kosh/authorized_keys --instance=default-kosh --namespace=default" "arguments"
 eq secret ClusterRoleBinding .roleRef.name cluster-admin "binds cluster-admin"
 eq secret ClusterRoleBinding .metadata.name kosh-cluster-admin "the binding is named for cluster-admin"
 count secret PersistentVolumeClaim 0
@@ -132,6 +132,10 @@ HOSTNET_NOTE="iroh.hostNetwork puts the pod on the node's network: SSH listens o
 [ "$(notes hostnetwork | grep -cF "$HOSTNET_NOTE")" = 1 ] || fail "hostnetwork: NOTES.txt does not say what the host network costs"
 echo "ok   the notes say what the host network costs"
 [ "$(notes secret | grep -c hostNetwork)" = 0 ] || fail "secret: NOTES.txt speaks of the host network without it"
+notes secret | grep -qF "Whoever can change the key list can give any key any of those roles." ||
+  fail "secret: NOTES.txt does not say who may grant any role"
+notes secret | grep -qF "default-kosh" || fail "secret: NOTES.txt does not name the instance"
+echo "ok   the notes say who may grant any role, and name the instance"
 echo "ok   no word of the host network without it"
 
 # --- no-ssh
@@ -160,6 +164,22 @@ got=$(yq 'select(.kind == "ConfigMap") | .data.authorized_keys' "$OUT/keys.yaml"
 [ "$got" = "$want" ] || fail "keys: authorized_keys differs from authorizedKeys"
 echo "ok   authorized_keys is exactly the text"
 eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("/cluster-admin$"))) | length' 1 "one /cluster-admin line"
+eq keys ConfigMap '.data.authorized_keys | split("\n") | map(select(test("/view$"))) | length' 1 "one /view line"
+
+# --- the instance: the namespace and the release, cut to 63 without a
+# "-" or "." at the end. A namespace of 62 and a release of 53, the most
+# Helm takes, are cut after the "-" between them, which goes.
+long_ns=$(printf 'n%.0s' $(seq 61))x
+long_release=$(printf 'r%.0s' $(seq 53))
+helm template "$long_release" "$CHART" --namespace "$long_ns" -f "$CI/secret-values.yaml" >"$OUT/instance.yaml" ||
+  fail "instance: helm template"
+instance=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].args[] | select(test("^--instance="))' "$OUT/instance.yaml")
+instance=${instance#--instance=}
+[ "${#instance}" -le 63 ] || fail "instance: '$instance' is ${#instance} characters"
+[[ "$instance" =~ ^[a-z0-9.-]+$ ]] && [[ "$instance" != *- ]] && [[ "$instance" != *. ]] ||
+  fail "instance: '$instance' is not an instance's name"
+[ "$instance" = "${long_ns}" ] || fail "instance: '$instance', want the namespace cut at its end, '$long_ns'"
+echo "ok   the instance of the longest names is $instance"
 
 # --- narrow-rbac
 render narrow-rbac

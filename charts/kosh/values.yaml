@@ -16,7 +16,9 @@ imagePullSecrets: []
 # role to the keys that name it. A line without a role, with an option,
 # or whose role or namespace is not a Kubernetes name, is rejected. Note
 # that /admin is the ClusterRole admin, not cluster-admin. Changing the
-# list does not restart kosh, which follows the file.
+# list does not restart kosh, which follows the file. Whoever may edit
+# this list, or the ConfigMap it is in, may give any key any role: keep
+# the release's namespace writable by cluster administrators alone.
 authorizedKeys: ""
 
 ssh:
